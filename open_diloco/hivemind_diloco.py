@@ -340,6 +340,7 @@ class DiLoCoOptimizer(Optimizer):
         all_reduce_strategy: AllReduceStrategy = AllReduceStrategy.WAIT_FOR_ALL,
         timeout_waiting_for_peers: float | None = None,
         matchmaking_time: Optional[float] = 15.0,
+        lora: bool | None = False,
         **kwargs,
     ):
         self._check_kwargs(kwargs)
@@ -361,6 +362,8 @@ class DiLoCoOptimizer(Optimizer):
         self.timeout_waiting_for_peers = timeout_waiting_for_peers
 
         params = list(params)
+        if lora:
+            params = [p for p in params if p.requires_grad]
         # if params is a generator (like model.parameters()) it would be consumed by the first optimizer
         # since we have two optimizers, we need to persist the params to a list
         self.num_inner_steps = num_inner_steps

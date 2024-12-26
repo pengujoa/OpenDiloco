@@ -60,10 +60,34 @@ from open_diloco.utils import (
     register_metrics_hooks,
 )
 
+from peft import get_peft_model, LoraConfig, TaskType
+
 
 TIMEOUT_NCCL_MINUTES = os.environ.get("TIMEOUT_NCCL_MINUTES", 120)
 TARGET_LAYER_ACTIVATIONS = ["self_attn", "lm_head"]
 TEST_VOCAB_SIZE = 1024
+
+
+lora_config = LoraConfig(
+    task_type=TaskType.CAUSAL_LM,    # CAUSAL_LM is for language generation tasks
+    inference_mode=False,           # Enable training mode
+    r=8,                            # LoRA rank
+    lora_alpha=32,                  # Scaling factor
+    lora_dropout=0.1                # Dropout rate
+)
+
+# Function to compare the number of parameters before/after adapt lora
+def print_trainable_parameters(model):
+    trainable_params = 0
+    all_param = 0
+    for _, param in model.named_parameters():
+        all_param += param.numel()
+        if param.requires_grad:
+            trainable_params += param.numel()
+    # print(model)
+    print(
+        f"trainable params: {trainable_params} || all params: {all_param} || trainable%: {100 * trainable_params / all_param:.2f}"
+    )
 
 
 # Function to initialize the distributed process group
@@ -128,7 +152,7 @@ class Config(BaseConfig):
     fake_data: bool = False
     max_steps: int | None = None
     # Lora
-    lora: bool
+    lora: bool | None = False
 
 
 def get_dataloader(tokenizer, world_size, rank, local_rank, config: Config) -> StatefulDataLoader:
@@ -173,7 +197,17 @@ def get_dataloader(tokenizer, world_size, rank, local_rank, config: Config) -> S
 def get_model(config: Config) -> LlamaForCausalLM:
     # Load model
     config_model = LlamaConfig.from_pretrained(config.path_model, attn_implementation=config.attn_implementation)
-    return LlamaForCausalLM.from_pretrained(pretrained_model_name_or_path=config.path_model, config=config_model)
+    model = LlamaForCausalLM.from_pretrained(pretrained_model_name_or_path=config.path_model, config=config_model)
+    
+    # cyshin
+    if config.lora:
+        print_trainable_parameters(model)
+        peft_model = get_peft_model(model, lora_config)
+        print_trainable_parameters(peft_model)
+        return peft_model
+    else:
+        print_trainable_parameters(model)
+        return model
 
 
 def train(config: Config):
@@ -296,6 +330,7 @@ def train(config: Config):
             verbose=True,
             all_reduce_strategy=config.hv.all_reduce_strategy,
             timeout_waiting_for_peers=config.hv.timeout_waiting_for_peers,
+            lora=config.lora,
         )
 
         diloco_args.update(get_compression_kwargs(config.hv.hivemind_compression))
