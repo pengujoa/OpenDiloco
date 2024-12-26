@@ -151,9 +151,24 @@ class Config(BaseConfig):
     hv: HvConfig | None = None  # if no hv config then hivemind is disabled
     fake_data: bool = False
     max_steps: int | None = None
+    # Node-specific GPU configuration
+    node_gpu_counts: List[int] = []  # List to store GPU counts per node
     # Lora
     lora: bool | None = False
 
+    @validator("node_gpu_counts")
+    def validate_node_gpu_counts(cls, value, values):      
+        hv = values.get('hv')
+        if len(value) > 1 & hv is None:
+            raise ValueError("hv configuration must be provided to validate node_gpu_counts.")
+        
+        if len(value) != hv.galaxy_size:
+            raise ValueError("Number of nodes must be equal to hv.galaxy_size.")
+        
+        if not all(isinstance(count, int) and count > 0 for count in value):
+            raise ValueError("All node GPU counts must be positive integers.")
+        
+        return value
 
 def get_dataloader(tokenizer, world_size, rank, local_rank, config: Config) -> StatefulDataLoader:
     if config.fake_data:
