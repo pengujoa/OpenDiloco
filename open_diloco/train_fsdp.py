@@ -152,7 +152,7 @@ class Config(BaseConfig):
     fake_data: bool = False
     max_steps: int | None = None
     # Node-specific GPU configuration
-    node_gpu_counts: List[int] = []  # List to store GPU counts per node
+    node_gpu_counts: list[int] = []  # List to store GPU counts per node
     # Lora
     lora: bool | None = False
 
