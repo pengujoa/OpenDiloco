@@ -127,6 +127,8 @@ class Config(BaseConfig):
     hv: HvConfig | None = None  # if no hv config then hivemind is disabled
     fake_data: bool = False
     max_steps: int | None = None
+    # Lora
+    lora: bool
 
 
 def get_dataloader(tokenizer, world_size, rank, local_rank, config: Config) -> StatefulDataLoader:
