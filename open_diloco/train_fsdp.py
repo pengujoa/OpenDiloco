@@ -13,7 +13,7 @@ from contextlib import nullcontext
 import datetime
 from typing import Any, Literal
 
-from pydantic import model_validator
+from pydantic import model_validator, validator, Field
 import torch
 from pydantic_config import parse_argv, BaseConfig
 from datasets import load_dataset
@@ -45,7 +45,7 @@ from open_diloco.ckpt_utils import (
     load_checkpoint,
     save_checkpoint,
 )
-from open_diloco.hivemind_diloco import AllReduceStrategy, DiLoCoOptimizer
+from hivemind_diloco import AllReduceStrategy, DiLoCoOptimizer
 from open_diloco.utils import WandbLogger, DummyLogger
 
 from hivemind.dht.dht import DHT
@@ -152,23 +152,31 @@ class Config(BaseConfig):
     fake_data: bool = False
     max_steps: int | None = None
     # Node-specific GPU configuration
-    node_gpu_counts: list[int] = []  # List to store GPU counts per node
+    node_gpu_counts: list[int] = Field(..., description="List of GPU counts per node. Must be provided.") # List to store GPU counts per node
     # Lora
     lora: bool | None = False
 
-    @validator("node_gpu_counts")
-    def validate_node_gpu_counts(cls, value, values):      
+    @validator("node_gpu_counts",  pre=True)
+    def validate_node_gpu_counts(cls, value, values):
+        if isinstance(value, str):
+            try:
+                value = [int(item) for item in value.split(",")]  
+            except ValueError:
+                raise ValueError("All elements in node_gpu_counts must be integers.")
+            
         hv = values.get('hv')
-        if len(value) > 1 & hv is None:
-            raise ValueError("hv configuration must be provided to validate node_gpu_counts.")
-        
-        if len(value) != hv.galaxy_size:
+
+        if len(value) > 1 and hv is None:
+            raise ValueError("hv configuration must be provided for multi-node training.")
+
+        if hv and len(value) != hv.galaxy_size:
             raise ValueError("Number of nodes must be equal to hv.galaxy_size.")
-        
+
         if not all(isinstance(count, int) and count > 0 for count in value):
             raise ValueError("All node GPU counts must be positive integers.")
-        
+
         return value
+    
 
 def get_dataloader(tokenizer, world_size, rank, local_rank, config: Config) -> StatefulDataLoader:
     if config.fake_data:
@@ -190,10 +198,11 @@ def get_dataloader(tokenizer, world_size, rank, local_rank, config: Config) -> S
         ]
 
         if config.hv is not None:
+            print("MY RANK: ", sum(config.node_gpu_counts[:rank]) + local_rank)
             train_dataset = split_dataset_by_node(
                 tokenized_datasets,
-                world_size=config.hv.galaxy_size * world_size,
-                rank=config.hv.world_rank * world_size + local_rank,
+                world_size=sum(config.node_gpu_counts),
+                rank=sum(config.node_gpu_counts[:rank]) + local_rank,
             )
 
         else:
