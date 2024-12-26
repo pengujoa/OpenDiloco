@@ -198,11 +198,12 @@ def get_dataloader(tokenizer, world_size, rank, local_rank, config: Config) -> S
         ]
 
         if config.hv is not None:
-            print("MY RANK: ", sum(config.node_gpu_counts[:rank]) + local_rank)
+            print("MY LOCAL RANK: ", local_rank)
+            print("MY RANK: ", sum(config.node_gpu_counts[:config.hv.world_rank]) + local_rank)
             train_dataset = split_dataset_by_node(
                 tokenized_datasets,
                 world_size=sum(config.node_gpu_counts),
-                rank=sum(config.node_gpu_counts[:rank]) + local_rank,
+                rank=sum(config.node_gpu_counts[:config.hv.world_rank]) + local_rank,
             )
 
         else:
