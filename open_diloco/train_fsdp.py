@@ -223,16 +223,7 @@ def get_model(config: Config) -> LlamaForCausalLM:
     # Load model
     config_model = LlamaConfig.from_pretrained(config.path_model, attn_implementation=config.attn_implementation)
     model = LlamaForCausalLM.from_pretrained(pretrained_model_name_or_path=config.path_model, config=config_model)
-    
-    # cyshin
-    if config.lora:
-        print_trainable_parameters(model)
-        peft_model = get_peft_model(model, lora_config)
-        print_trainable_parameters(peft_model)
-        return peft_model
-    else:
-        print_trainable_parameters(model)
-        return model
+    return model
 
 
 def train(config: Config):
@@ -282,6 +273,29 @@ def train(config: Config):
     train_dataloader = get_dataloader(tokenizer, world_size, rank, local_rank, config)
 
     model = get_model(config)
+    # print("BASE MODEL")
+    # for name, param in base_model.named_parameters():
+    #     print(f"{name}: requires_grad={param.requires_grad}")
+    # print("PEFT MODEL")
+    # for name, param in model.named_parameters():
+    #     print(f"{name}: requires_grad={param.requires_grad}")
+    
+    # keys1 = set(name for name, _ in base_model.named_parameters())
+    # keys2 = set(name for name, _ in model.named_parameters())
+
+    # only_in_model1 = keys1 - keys2
+    # only_in_model2 = keys2 - keys1
+
+    # print("🔹 Keys only in model1:", len(keys1))
+    # for key in only_in_model1:
+    #     print(key)
+    
+    # print("\n🔸 Keys only in model2:", len(keys2))
+    # for key in only_in_model2:
+    #     print(key)
+    
+    # print("\n✅ Comparison complete!")
+
     model = model.to(local_rank)
 
     half_precision = config.precision == "fp16-mixed" or config.precision == "bf16-mixed"
@@ -326,6 +340,10 @@ def train(config: Config):
             # This is because the DiLoCoOptimizer makes a copy of the model parameters for the state averager which is hard to update later
             # We also need to do this on follower workers so that the world_messenger has friends to talk to when it does its two loads
             # Otherwise the world messenger will get lonely and hang
+            # params = list(model.parameters())
+            # if lora:
+            #     params = [p for p in params if p.requires_grad]
+            # fake_optimizer = inner_optimizer(params)
             fake_optimizer = inner_optimizer(model.parameters())
             last_loss = load_checkpoint(
                 checkpoint_path=os.path.join(resume_path, get_diloco_rank_dir_name(config.hv.world_rank)),
@@ -385,6 +403,9 @@ def train(config: Config):
             start_step = scheduler.last_epoch
         else:
             start_step = 0
+        if config.lora:
+            model = get_peft_model(model, lora_config)
+            print_trainable_parameters(model)
 
     else:
         optimizer = inner_optimizer(model.parameters())
@@ -401,6 +422,9 @@ def train(config: Config):
             start_step = scheduler.last_epoch
         else:
             start_step = 0
+        if config.lora:
+            model = get_peft_model(model, lora_config)
+            print_trainable_parameters(model)
 
     if resume_from_ckpt:
         log(f"Resumed from checkpoint at step {start_step} with loss {last_loss}")
