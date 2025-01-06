@@ -30,6 +30,8 @@ from hivemind.optim.optimizer import logger
 from hivemind.optim.progress_tracker import LocalTrainingProgress
 
 from open_diloco.utils import found_inf_grad
+# cyshin
+import logging
 
 
 class DiLoCoStateAverager(TrainingStateAverager):
@@ -148,12 +150,45 @@ class DiLoCoGradAverager(DecentralizedAverager):
         :param wait: if True, await for the step to finish (or fail), otherwise run all-reduce in background
         """
         if control is None:
+            # cyshin
+            time_0_schedule_step = time.perf_counter()
             control = self.schedule_step(timeout=timeout, **kwargs)
-
+            time_1_schedule_step = time.perf_counter()
+            logger.log(
+                logging.INFO,
+                f"Time taken for schedule_step: {time_1_schedule_step - time_0_schedule_step} sec",
+            )
+        # cyshin
+        time_0_compute_and_load_pseudo_grad = time.perf_counter()
         self.compute_and_load_pseudo_grad_into_averager()
-        control.allow_allreduce()
+        time_1_compute_and_load_pseudo_grad = time.perf_counter()
+        logger.log(
+            logging.INFO,
+            f"Time taken for compute_and_load_pseudo_grad: {time_1_compute_and_load_pseudo_grad - time_0_compute_and_load_pseudo_grad} sec",
+        )
 
-        return control.result(timeout) if wait else control
+        # cyshin
+        time_0_allow_allreduce = time.perf_counter()
+        control.allow_allreduce()
+        time_1_allow_allreduce = time.perf_counter()
+        logger.log(
+            logging.INFO,
+            f"Time taken for allow_allreduce: {time_1_allow_allreduce - time_0_allow_allreduce} sec",
+        )
+
+        # return control.result(timeout) if wait else control
+        if wait:
+            time_0_control_result = time.perf_counter()
+            return_value = control.result(timeout)
+            time_1_control_result = time.perf_counter()
+            logger.log(
+                logging.INFO,
+                f"Time taken for control_result: {time_1_control_result - time_0_control_result} sec",
+            )
+            return return_value
+        else: 
+            return control
+        
 
     @torch.no_grad()
     def compute_and_load_pseudo_grad_into_averager(self):
@@ -164,7 +199,14 @@ class DiLoCoGradAverager(DecentralizedAverager):
                 # opt_param is the param that will be all_reduce, it is suppose to be on cpu
                 # main_param is the param that has been updated by the inner optimizer, it is suppose to be on gpu
                 grad = opt_param.data - main_param.detach().to(opt_param.device)
+                # cyshin
+                time_0_averaged_grad_copy = time.perf_counter()
                 averaged_grad.copy_(grad, non_blocking=True)
+                time_1_averaged_grad_copy = time.perf_counter()
+                logger.log(
+                    logging.INFO,
+                    f"Time taken for averaged_grad_copy: {time_1_averaged_grad_copy - time_0_averaged_grad_copy} sec",
+                )
 
     def notify_used_averaged_gradients(self):
         """Notify averager that the results of a previous averaging round are accounted for"""
@@ -340,7 +382,6 @@ class DiLoCoOptimizer(Optimizer):
         all_reduce_strategy: AllReduceStrategy = AllReduceStrategy.WAIT_FOR_ALL,
         timeout_waiting_for_peers: float | None = None,
         matchmaking_time: Optional[float] = 15.0,
-        lora: bool | None = False,
         **kwargs,
     ):
         self._check_kwargs(kwargs)
@@ -362,8 +403,9 @@ class DiLoCoOptimizer(Optimizer):
         self.timeout_waiting_for_peers = timeout_waiting_for_peers
 
         params = list(params)
-        if lora:
-            params = [p for p in params if p.requires_grad]
+        # cyshin
+        params = [p for p in params if p.requires_grad]
+        
         # if params is a generator (like model.parameters()) it would be consumed by the first optimizer
         # since we have two optimizers, we need to persist the params to a list
         self.num_inner_steps = num_inner_steps
@@ -376,6 +418,8 @@ class DiLoCoOptimizer(Optimizer):
             self.inner_optimizer = inner_optimizer
         elif isinstance(inner_optimizer, Callable):
             self.inner_optimizer = inner_optimizer(params=params)
+            # cyshin
+            # called here
         else:
             raise TypeError(
                 f"Expected inner_optimizer to be TorchOptimizer or OptimizerFactory, got {type(inner_optimizer)}"
@@ -653,7 +697,7 @@ class DiLoCoOptimizer(Optimizer):
             assert self.state_averager.custom_gradients, "custom gradient must be enable for syncing pseudo gradients"
 
             logger.info(f"Try outer optimizer step at  {self.tracker.real_step} step")
-
+            time_0_state_averager_step = time.perf_counter()
             self.state_averager.step(
                 increment_epoch=True,
                 wait_for_trigger=None,
@@ -665,6 +709,11 @@ class DiLoCoOptimizer(Optimizer):
                 averaging_control=(self.scheduled_state if should_average_state else None),
                 averaging_opts=(dict(timeout=self.averaging_timeout) if should_average_state else None),
                 zero_grad=False,  # zero grad should be done outside of diloco
+            )
+            time_1_state_averager_step = time.perf_counter()
+            logger.log(
+                self.status_loglevel,
+                f"Time taken for state_averager_step: {time_1_state_averager_step - time_0_state_averager_step} sec",
             )
 
             if not should_average_state and self.scheduled_state is not None and not self.scheduled_state.done():
@@ -678,7 +727,14 @@ class DiLoCoOptimizer(Optimizer):
             if not self.client_mode:
                 self.state_averager.state_sharing_priority = self.local_epoch
 
+            # cyshin
+            time_0_update_main_param = time.perf_counter()
             self.update_main_param_after_outer_step()
+            time_1_update_main_param = time.perf_counter()
+            logger.log(
+                self.status_loglevel,
+                f"Time taken for update_main_param: {time_1_update_main_param - time_0_update_main_param} sec",
+            )
             logger.log(self.status_loglevel, f"Transitioning to epoch {self.local_epoch}")
 
     def _make_progress_tracker(self, target_batch_size: int, **kwargs) -> DiloCoProgressTracker:
@@ -731,7 +787,7 @@ class DiLoCoOptimizer(Optimizer):
             eta_seconds = self.tracker.estimated_next_update_time
 
         if eta_seconds <= self.matchmaking_time:
-            if (
+            if ( 
                 self.scheduled_diloco_grads is None
                 or self.scheduled_diloco_grads.triggered
                 or self.scheduled_diloco_grads.done()

@@ -223,6 +223,10 @@ def get_model(config: Config) -> LlamaForCausalLM:
     # Load model
     config_model = LlamaConfig.from_pretrained(config.path_model, attn_implementation=config.attn_implementation)
     model = LlamaForCausalLM.from_pretrained(pretrained_model_name_or_path=config.path_model, config=config_model)
+    if config.lora:
+        print_trainable_parameters(model)
+        model = get_peft_model(model, lora_config)
+        print_trainable_parameters(model)
     return model
 
 
@@ -403,9 +407,9 @@ def train(config: Config):
             start_step = scheduler.last_epoch
         else:
             start_step = 0
-        if config.lora:
-            model = get_peft_model(model, lora_config)
-            print_trainable_parameters(model)
+        # if config.lora:
+        #     model = get_peft_model(model, lora_config)
+        #     print_trainable_parameters(model)
 
     else:
         optimizer = inner_optimizer(model.parameters())
@@ -422,9 +426,9 @@ def train(config: Config):
             start_step = scheduler.last_epoch
         else:
             start_step = 0
-        if config.lora:
-            model = get_peft_model(model, lora_config)
-            print_trainable_parameters(model)
+        # if config.lora:
+        #     model = get_peft_model(model, lora_config)
+        #     print_trainable_parameters(model)
 
     if resume_from_ckpt:
         log(f"Resumed from checkpoint at step {start_step} with loss {last_loss}")
