@@ -200,13 +200,13 @@ class DiLoCoGradAverager(DecentralizedAverager):
                 # main_param is the param that has been updated by the inner optimizer, it is suppose to be on gpu
                 grad = opt_param.data - main_param.detach().to(opt_param.device)
                 # cyshin
-                time_0_averaged_grad_copy = time.perf_counter()
+                # time_0_averaged_grad_copy = time.perf_counter()
                 averaged_grad.copy_(grad, non_blocking=True)
-                time_1_averaged_grad_copy = time.perf_counter()
-                logger.log(
-                    logging.INFO,
-                    f"Time taken for averaged_grad_copy: {time_1_averaged_grad_copy - time_0_averaged_grad_copy} sec",
-                )
+                # time_1_averaged_grad_copy = time.perf_counter()
+                # logger.log(
+                #     logging.INFO,
+                #     f"Time taken for averaged_grad_copy: {time_1_averaged_grad_copy - time_0_averaged_grad_copy} sec",
+                # )
 
     def notify_used_averaged_gradients(self):
         """Notify averager that the results of a previous averaging round are accounted for"""
