@@ -35,7 +35,7 @@ from torch.distributed.fsdp import (
 )
 from torch.distributed.device_mesh import init_device_mesh
 
-from open_diloco.ckpt_utils import (
+from ckpt_utils import (
     CKPT_PREFIX,
     CkptConfig,
     check_checkpoint_path_access,
