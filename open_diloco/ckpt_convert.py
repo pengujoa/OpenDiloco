@@ -35,6 +35,17 @@ import datetime
 from functools import partial
 import fsspec
 
+from peft import get_peft_model, LoraConfig, TaskType
+lora_config = LoraConfig(
+    task_type=TaskType.CAUSAL_LM,    # CAUSAL_LM is for language generation tasks
+    inference_mode=False,           # Enable training mode
+    r=8,                            # LoRA rank
+    lora_alpha=32,                  # Scaling factor
+    lora_dropout=0.1                # Dropout rate
+)
+
+lora_ckpt_test = False
+
 TIMEOUT_NCCL_MINUTES = os.environ.get("TIMEOUT_NCCL_MINUTES", 120)
 GLOBAL_STATE_FILE = "global_state_dict.pt"
 CKPT_PREFIX = "model_step"
@@ -46,8 +57,7 @@ torch.cuda.set_device(int(os.environ["LOCAL_RANK"]))
 
 local_rank = int(os.environ["LOCAL_RANK"])
 world_size = int(os.environ["WORLD_SIZE"])
-# rank = int(os.environ["RANK"])
-rank = 0
+rank = int(os.environ["RANK"])
 
 sharding_strategy = ShardingStrategy.NO_SHARD
 
@@ -87,6 +97,10 @@ data_loader = StatefulDataLoader(
 #  model = get_model(config)
 config_model = LlamaConfig.from_pretrained("PrimeIntellect/llama-1b-fresh", attn_implementation="sdpa")
 model = LlamaForCausalLM.from_pretrained(pretrained_model_name_or_path="PrimeIntellect/llama-1b-fresh", config=config_model)
+
+# lora
+if lora_ckpt_test:
+    model = get_peft_model(model, lora_config)
 
 model = model.to(local_rank)
 
@@ -131,7 +145,13 @@ def scheduler_fn(opt):
     )
 
 resume_from_ckpt = True
-resume_path = "~/cy/OpenDiloco/open_diloco/model_step_24000/diloco_rank_" + str(rank)
+
+#path
+if lora_ckpt_test:
+    resume_path = "~/cy/OpenDiloco/open_diloco/model_step_24000_cnvt/diloco_rank_0"
+else:
+    resume_path = "~/cy/OpenDiloco/open_diloco/model_step_24000/diloco_rank_0"
+
 checkpoint_path = resume_path
 
 optimizer = inner_optimizer(model.parameters())
@@ -142,10 +162,34 @@ fs_storage_reader = dcp.FsspecReader(checkpoint_path)
 
 model_state_dict, optimizer_state_dict = get_state_dict(model, optimizer)
 
-dcp_state_dict = {
-    "model": model_state_dict,
-    "optimizer": optimizer_state_dict,
-}
+# cy
+if lora_ckpt_test:
+    model_state_dict_cnvt = {}
+    optimizer_state_dict_cnvt = {"state":{}, "param_groups":[]}
+    for key, value in model_state_dict.items():
+        if "lora" in key:
+            pass
+        else:
+            model_state_dict_cnvt[key] = value
+    
+    for key, value in optimizer_state_dict["state"].items():
+        if "lora" in key:
+            pass
+        else:
+            optimizer_state_dict_cnvt["state"][key] = value
+
+    dcp_state_dict = {
+        "model": model_state_dict_cnvt,
+        # "optimizer": optimizer_state_dict_cnvt,
+    }
+else:
+    dcp_state_dict = {
+        "model": model_state_dict,
+        "optimizer": optimizer_state_dict,
+    }
+
+# print(dcp_state_dict["optimizer"]["state"].keys())
+# print(dcp_state_dict["optimizer"]["param_groups"])
 
 dcp.load(dcp_state_dict, storage_reader=fs_storage_reader)
 
@@ -156,41 +200,70 @@ set_state_dict(
     optim_state_dict=optimizer_state_dict,
 )
 
-if data_loader is not None:
-    with fsspec.open(os.path.join(checkpoint_path, f"__{rank}_0.pt"), "rb") as f:
-        rank_state_dict = torch.load(f)
-    data_loader.load_state_dict(rank_state_dict["data_loader"])
+if lora_ckpt_test:
+    pass
+else:
+    if data_loader is not None:
+        with fsspec.open(os.path.join(checkpoint_path, f"__{rank}_0.pt"), "rb") as f:
+            rank_state_dict = torch.load(f)
+        data_loader.load_state_dict(rank_state_dict["data_loader"])
 
-with fsspec.open(os.path.join(checkpoint_path, GLOBAL_STATE_FILE), "rb") as f:
-    global_state_dict = torch.load(f)
+# with fsspec.open(os.path.join(checkpoint_path, GLOBAL_STATE_FILE), "rb") as f:
+#     global_state_dict = torch.load(f)
 
-# 2. Load global states
-outer_optimizer = None
-if scheduler is not None:
-    scheduler.load_state_dict(global_state_dict["scheduler"])
-    optimizer.param_groups[0]["lr"] = scheduler.get_last_lr()[0]
-if outer_optimizer is not None:
-    outer_optimizer.load_state_dict(global_state_dict["outer_optimizer"])
-if scaler is not None:
-    scaler.load_state_dict(global_state_dict["scaler"])
+# # 2. Load global states
+# outer_optimizer = None
+# if scheduler is not None:
+#     scheduler.load_state_dict(global_state_dict["scheduler"])
+#     optimizer.param_groups[0]["lr"] = scheduler.get_last_lr()[0]
+# if outer_optimizer is not None:
+#     outer_optimizer.load_state_dict(global_state_dict["outer_optimizer"])
+# if scaler is not None:
+#     scaler.load_state_dict(global_state_dict["scaler"])
 
-# save
-fs_storage_writer = dcp.FsspecWriter(checkpoint_path, sync_files=False)
+
+# ##################
+# # save
+if lora_ckpt_test:
+    checkpoint_save_path = "~/cy/OpenDiloco/open_diloco/model_step_24000_cnvt_dummy/diloco_rank_0"
+else:
+    checkpoint_save_path = "~/cy/OpenDiloco/open_diloco/model_step_24000_cnvt/diloco_rank_0"
+
+fs_storage_writer = dcp.FsspecWriter(checkpoint_save_path, sync_files=False)
+
+
+# cy
+# print(len(dcp_state_dict["model"].keys()))
+# for key in dcp_state_dict["model"].keys():
+#     print(dcp_state_dict["model"][key])
 
 model_state_dict, optimizer_state_dict = get_state_dict(model, optimizer)
+model_state_dict_cnvt = {}
+
+for key, value in model_state_dict.items():
+    new_key = "base_model.model." + key
+    if "q_proj" in new_key:
+        new_key = new_key.replace("q_proj", "q_proj.base_layer")
+    if "v_proj" in new_key:
+        new_key = new_key.replace("v_proj", "v_proj.base_layer")
+    model_state_dict_cnvt[new_key] = value    
+
 dcp_state_dict = {
-    "model": model_state_dict,
+    "model": model_state_dict_cnvt,
     "optimizer": optimizer_state_dict,
 }
-dcp.save(dcp_state_dict, storage_writer=fs_storage_writer)
 
-checkpoint_save_path = "~/cy/OpenDiloco/open_diloco/model_step_24000_new/diloco_rank_" + str(rank)
+print(dcp_state_dict["model"].keys())
+
+dcp.save(dcp_state_dict, storage_writer=fs_storage_writer)
 
 if data_loader is not None:
     rank_state_dict = {}
     rank_state_dict["data_loader"] = data_loader.state_dict()
     with fsspec.open(os.path.join(checkpoint_save_path, f"__{rank}_0.pt"), "wb") as f:
         torch.save(rank_state_dict, f)
+
+# ##################
 
 # if not save_global_state:
 #     return
