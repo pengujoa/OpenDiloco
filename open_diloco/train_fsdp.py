@@ -353,6 +353,7 @@ def train(config: Config):
                 checkpoint_path=os.path.join(resume_path, get_diloco_rank_dir_name(config.hv.world_rank)),
                 model=model,
                 optimizer=fake_optimizer,
+                lora=config.lora
             )
             del fake_optimizer
 
@@ -403,8 +404,12 @@ def train(config: Config):
                 outer_optimizer=optimizer.state_averager.optimizer,
                 scaler=scaler,
                 data_loader=train_dataloader,
+                lora=config.lora,
             )
-            start_step = scheduler.last_epoch
+            if config.lora:
+                start_step = 0
+            else:
+                start_step = scheduler.last_epoch
         else:
             start_step = 0
         # if config.lora:
@@ -422,6 +427,7 @@ def train(config: Config):
                 scheduler=scheduler,
                 scaler=scaler,
                 data_loader=train_dataloader,
+                lora=config.lora,
             )
             start_step = scheduler.last_epoch
         else:

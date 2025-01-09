@@ -108,6 +108,7 @@ def load_checkpoint(
     outer_optimizer: torch.optim.Optimizer | None = None,
     scaler: torch.cuda.amp.GradScaler | None = None,
     data_loader: StatefulDataLoader | None = None,
+    lora: bool | None = False,
 ) -> float:
     """Load the model and optimizer state from a checkpoint folder
 
@@ -127,10 +128,25 @@ def load_checkpoint(
     fs_storage_reader = dcp.FsspecReader(checkpoint_path)
 
     model_state_dict, optimizer_state_dict = get_state_dict(model, optimizer)
-    dcp_state_dict = {
-        "model": model_state_dict,
-        "optimizer": optimizer_state_dict,
-    }
+    
+    if lora:
+        model_state_dict_cnvt = {}
+        optimizer_state_dict_cnvt = {"state":{}, "param_groups":[]}
+        for key, value in model_state_dict.items():
+            if "lora" in key:
+                pass
+            else:
+                model_state_dict_cnvt[key] = value
+
+        dcp_state_dict = {
+            "model": model_state_dict_cnvt,
+        }
+    else:
+        dcp_state_dict = {
+            "model": model_state_dict,
+            "optimizer": optimizer_state_dict,
+        }
+
     dcp.load(dcp_state_dict, storage_reader=fs_storage_reader)
     set_state_dict(
         model,
@@ -143,17 +159,20 @@ def load_checkpoint(
             rank_state_dict = torch.load(f)
         data_loader.load_state_dict(rank_state_dict["data_loader"])
 
-    # 2. Load global states
-    with fsspec.open(os.path.join(checkpoint_path, GLOBAL_STATE_FILE), "rb") as f:
-        global_state_dict = torch.load(f)
-    if scheduler is not None:
-        scheduler.load_state_dict(global_state_dict["scheduler"])
-        optimizer.param_groups[0]["lr"] = scheduler.get_last_lr()[0]
-    if outer_optimizer is not None:
-        outer_optimizer.load_state_dict(global_state_dict["outer_optimizer"])
-    if scaler is not None:
-        scaler.load_state_dict(global_state_dict["scaler"])
-    return global_state_dict["loss"]
+    if lora:
+        return 0
+    else:
+        # 2. Load global states
+        with fsspec.open(os.path.join(checkpoint_path, GLOBAL_STATE_FILE), "rb") as f:
+            global_state_dict = torch.load(f)
+        if scheduler is not None:
+            scheduler.load_state_dict(global_state_dict["scheduler"])
+            optimizer.param_groups[0]["lr"] = scheduler.get_last_lr()[0]
+        if outer_optimizer is not None:
+            outer_optimizer.load_state_dict(global_state_dict["outer_optimizer"])
+        if scaler is not None:
+            scaler.load_state_dict(global_state_dict["scaler"])
+        return global_state_dict["loss"]
 
 
 def filter_ckpt_files(f):
