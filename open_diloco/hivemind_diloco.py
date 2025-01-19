@@ -120,7 +120,9 @@ class DiLoCoGradAverager(DecentralizedAverager):
                     param.grad = torch.zeros_like(param)
                 yield param.grad
 
-    def schedule_step(self, scheduled_time: Optional[DHTExpiration] = None, **kwargs) -> StepControl:
+    # def schedule_step(self, scheduled_time: Optional[DHTExpiration] = None, **kwargs) -> StepControl:
+    def schedule_step(self, scheduled_time: Optional[DHTExpiration] = None, stridx = "", **kwargs) -> StepControl:
+
         """
         Begin matchmaking: look for a group of peers and prepare for averaging gradients at a specified time.
 
@@ -130,16 +132,21 @@ class DiLoCoGradAverager(DecentralizedAverager):
         :returns: step_control - a handle that can be passed into GradientAverager.step to use the pre-scheduled group
         :note: in the current implementation, each step_control can only be used in one step.
         """
+        
         assert kwargs.get("weight") is None, "setting weight in schedule_step is not supported"
-        return super().step(scheduled_time=scheduled_time, wait=False, require_trigger=True, **kwargs)
+        # cyshin
+        # return super().step(scheduled_time=scheduled_time, wait=False, require_trigger=True, **kwargs)
+        return super().step(scheduled_time=scheduled_time, wait=False, require_trigger=True, stridx=stridx, **kwargs)
 
     def step(
         self,
         control: Optional[StepControl] = None,
         timeout: Optional[float] = None,
         wait: bool = True,
-        **kwargs,
+        stridx: str = "",
+        **kwargs,        
     ):
+        print("diloco_grad_averager.step", stridx)
         """
         Average accumulated gradients with peers, optionally load averaged gradients and reset accumulators
 
@@ -152,7 +159,7 @@ class DiLoCoGradAverager(DecentralizedAverager):
         if control is None:
             # cyshin
             time_0_schedule_step = time.perf_counter()
-            control = self.schedule_step(timeout=timeout, **kwargs)
+            control = self.schedule_step(timeout=timeout, stridx="test", **kwargs)
             time_1_schedule_step = time.perf_counter()
             logger.log(
                 logging.INFO,
@@ -179,6 +186,7 @@ class DiLoCoGradAverager(DecentralizedAverager):
         # return control.result(timeout) if wait else control
         if wait:
             time_0_control_result = time.perf_counter()
+            print("control result call")
             return_value = control.result(timeout)
             time_1_control_result = time.perf_counter()
             logger.log(
@@ -589,19 +597,24 @@ class DiLoCoOptimizer(Optimizer):
             self.tracker.report_local_progress(self.local_epoch, samples_accumulated=new_samples_accumulated)
 
             self._maybe_schedule_state_averaging()
+            print("call self._maybe_schedule_gradient_averaging()")
             self._maybe_schedule_gradient_averaging()
 
             if scaler is not None:
+                print("call scaler.step(self.inner_optimizer)")
                 scaler.step(self.inner_optimizer)
                 if found_inf_grad(self.inner_optimizer, scaler):
                     logger.log(self.status_loglevel, f"Found inf grad at step {self.tracker.real_step}")
             else:
+                print("call self.inner_optimizer.step(closure=closure)")
                 self.inner_optimizer.step(closure=closure)
 
             if self.state_averager.scheduler_inner_optimizer:
+                print("call self.state_averager.scheduler_inner_optimizer.step()")
                 self.state_averager.scheduler_inner_optimizer.step()
 
         if self.tracker.ready_to_update_epoch:
+            print("call  self._update_global_epoch()")
             self._update_global_epoch()
 
         return loss
@@ -664,7 +677,7 @@ class DiLoCoOptimizer(Optimizer):
                 time_0 = time.perf_counter()
 
                 self.diloco_grad_averager.step(
-                    wait=True, timeout=self.averaging_timeout, control=self.scheduled_diloco_grads
+                    wait=True, timeout=self.averaging_timeout, control=self.scheduled_diloco_grads, stridx="_update_global_epoch"
                 )
                 time_1 = time.perf_counter()
                 logger.log(
@@ -795,5 +808,7 @@ class DiLoCoOptimizer(Optimizer):
                 or self.scheduled_diloco_grads.done()
             ):
                 eta_seconds = max(eta_seconds, self.diloco_grad_averager.matchmaking_kwargs["min_matchmaking_time"])
-                logger.log(self.status_loglevel, f"Pre-scheduling gradient averaging round in {eta_seconds:.2f} sec")
-                self.scheduled_diloco_grads = self.diloco_grad_averager.schedule_step(timeout=self.averaging_timeout)
+                logger.log(self.status_loglevel, f"May be Pre-scheduling gradient averaging round in {eta_seconds:.2f} sec")
+                # cyshin
+                # self.scheduled_diloco_grads = self.diloco_grad_averager.schedule_step(timeout=self.averaging_timeout)
+                self.scheduled_diloco_grads = self.diloco_grad_averager.schedule_step(timeout=self.averaging_timeout, stridx="maybe")
