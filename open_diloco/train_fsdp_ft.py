@@ -130,7 +130,8 @@ class Config(BaseConfig):
     torch_compile: bool = True
     attn_implementation: str = "sdpa"
     # Data
-    dataset_name_or_path: str = "allenai/c4"
+    # dataset_name_or_path: str = "allenai/c4"
+    dataset_name_or_path: str = "qiaojin/PubMedQA"
     seq_length: int = 1024
     c4_tiny: bool = False
     num_workers: int = 4
@@ -182,20 +183,44 @@ def get_dataloader(tokenizer, world_size, rank, local_rank, config: Config) -> S
     if config.fake_data:
         train_dataset = FakeTokenizedDataset(config.seq_length, TEST_VOCAB_SIZE)
     else:
-        ds = load_dataset(config.dataset_name_or_path, "en", streaming=True)
+        # ds = load_dataset(config.dataset_name_or_path, "en", streaming=True)
+        dataset_dict = load_dataset(config.dataset_name_or_path, "pqa_artificial", streaming=True)
+        print(dataset_dict.keys())
+        ds = dataset_dict["train"]
+
+        # def tokenize_function(data):
+        #     outputs = tokenizer(
+        #         data["text"],
+        #         truncation=True,
+        #         max_length=config.seq_length,
+        #         padding="max_length",
+        #     )
+        #     return outputs
+        label_mapping = {"yes": 0, "no": 1, "maybe": 2}
 
         def tokenize_function(data):
+            inputs = [f"Question: {q} Context: {c}" for q, c in zip(data["question"], data["context"])]
             outputs = tokenizer(
-                data["text"],
+                inputs,
                 truncation=True,
                 max_length=config.seq_length,
                 padding="max_length",
             )
+            # outputs["labels"] = tokenizer( 
+            #     data["final_decision"],  # `final_decision`은 레이블 필드
+            #     truncation=True,
+            #     max_length=config.seq_length,
+            #     padding="max_length",
+            # )["input_ids"]
+            outputs["labels"] = [label_mapping[ans] for ans in data["final_decision"]]  # 변환된 값 사용
+
             return outputs
 
-        tokenized_datasets = ds.map(tokenize_function, batched=True, remove_columns=["text", "timestamp", "url"])[
-            "train"
-        ]
+
+        # tokenized_datasets = ds.map(tokenize_function, batched=True, remove_columns=["text", "timestamp", "url"])[
+        #     "train"
+        # ]
+        tokenized_datasets = ds.map(tokenize_function, batched=True, remove_columns=["question", "context", "long_answer", "final_decision"])
 
         if config.hv is not None:
             print("MY LOCAL RANK: ", local_rank)
