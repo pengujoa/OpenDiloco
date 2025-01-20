@@ -155,7 +155,7 @@ def load_checkpoint(
         model_state_dict=model_state_dict,
         optim_state_dict=optimizer_state_dict,
     )
-    if lora & dataset!="allenai/c4":
+    if lora & (dataset!="allenai/c4"):
         pass
     else:
         if data_loader is not None:
