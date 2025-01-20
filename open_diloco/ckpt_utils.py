@@ -109,6 +109,7 @@ def load_checkpoint(
     scaler: torch.cuda.amp.GradScaler | None = None,
     data_loader: StatefulDataLoader | None = None,
     lora: bool | None = False,
+    dataset: str | None = "allenai/c4"
 ) -> float:
     """Load the model and optimizer state from a checkpoint folder
 
@@ -154,10 +155,13 @@ def load_checkpoint(
         model_state_dict=model_state_dict,
         optim_state_dict=optimizer_state_dict,
     )
-    if data_loader is not None:
-        with fsspec.open(os.path.join(checkpoint_path, f"__{rank}_0.pt"), "rb") as f:
-            rank_state_dict = torch.load(f)
-        data_loader.load_state_dict(rank_state_dict["data_loader"])
+    if lora & dataset!="allenai/c4":
+        pass
+    else:
+        if data_loader is not None:
+            with fsspec.open(os.path.join(checkpoint_path, f"__{rank}_0.pt"), "rb") as f:
+                rank_state_dict = torch.load(f)
+            data_loader.load_state_dict(rank_state_dict["data_loader"])
 
     if lora:
         return 0
