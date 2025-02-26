@@ -242,8 +242,10 @@ def get_dataloader(tokenizer, world_size, rank, local_rank, config: Config) -> S
 
 def get_model(config: Config) -> LlamaForCausalLM:
     # Load model
-    config_model = LlamaConfig.from_pretrained(config.path_model, attn_implementation=config.attn_implementation)
+    config_model = LlamaConfig.from_pretrained(config.path_model, use_cache=False, rope_scaling={"rope_type": "default"}, attn_implementation=config.attn_implementation)
+    # config_model = LlamaConfig.from_pretrained(config.path_model, use_cache=False)
     model = LlamaForCausalLM.from_pretrained(pretrained_model_name_or_path=config.path_model, config=config_model)
+    model.train()
     if config.lora:
         print_trainable_parameters(model)
         model = get_peft_model(model, lora_config)
@@ -303,100 +305,12 @@ def train(config: Config):
 
     # cyshin: PP coding
     ########################
-    import math
-    from accelerate.utils import (
-        calculate_maximum_sizes,
-        convert_bytes,
-        copy_tensor_to_devices,
-        ignorant_find_batch_size,
-        infer_auto_device_map,
-        is_pippy_available,
-        pad_input_tensors,
-        send_to_device,
-    )
-    from accelerate.state import PartialState
+    from accelerate import inference as inf
 
     print(model)
     print("num_hidden_layers", model.config.num_hidden_layers)
-
-    def generate_device_map(model, num_processes: int = 1, no_split_module_classes=None, max_memory: dict = None):
-        """
-        Calculates the device map for `model` with an offset for PiPPy
-        """
-        if num_processes == 1:
-            return infer_auto_device_map(model, no_split_module_classes=no_split_module_classes, clean_result=False)
-        if max_memory is None:
-            model_size, shared = calculate_maximum_sizes(model)
-
-            # Split into `n` chunks for each GPU
-            memory = (model_size + shared[0]) / num_processes
-            memory = convert_bytes(memory)
-            value, ending = memory.split(" ")
-
-            # Add a chunk to deal with potential extra shared memory instances
-            memory = math.ceil(float(value)) * 1.1
-            memory = f"{memory} {ending}"
-            max_memory = {i: memory for i in range(num_processes)}
-        device_map = infer_auto_device_map(
-            model,
-            max_memory=max_memory,
-            no_split_module_classes=no_split_module_classes,
-            clean_result=False,
-        )
-        return device_map
-
-    num_chunks = world_size
-    no_split_module_classes = None
-    state = PartialState()
-
-    example_batch = next(iter(train_dataloader)).to(local_rank)
-    
-    # print("batch key len",len(batch))
-    # print("batch input_ids len",len(batch["input_ids"]))
-    # print("batch attention_mask len",len(batch["attention_mask"]))
-    # print("batch labels len",len(batch["labels"]))
-
-    # for idx, input_idses in enumerate(batch["attention_mask"]):
-    #     print("attention_mask:",idx,len(input_idses))
-
-    # print("batch.shape",batch.keys)
-
-    device_map = generate_device_map(model, num_chunks, no_split_module_classes=no_split_module_classes)
-    # split_points = ["model.layers.15"]
-    split_points = []
-    for i in range(1, num_chunks):
-        split_points.append(next(k for k, v in device_map.items() if v == i))
-    print(split_points)
-    model.hf_split_points = split_points
-
-    def build_pipeline(model, split_points, example_batch, num_chunks):
-        """
-        Attaches the split points to the model based on `self.device_map` and generates a `PipelineStage`. Requires passing
-        in needed `args` and `kwargs` as the model needs on the CPU.
-
-        Users can pass in custom `num_chunks` as an optional hyper-parameter. By default will use
-        `AcceleratorState.num_processes`
-        """
-        # Note: We import here to reduce import time from general modules, and isolate outside dependencies
-        from torch.distributed.pipelining import ScheduleGPipe, SplitPoint, pipeline
-
-        # We need to annotate the split points in the model for PiPPy
-        state = PartialState()
-        split_spec = {split_point: SplitPoint.BEGINNING for split_point in split_points}
-
-        pipe = pipeline(
-            model,
-            mb_args=(example_batch["input_ids"],),
-            split_spec=split_spec,
-        )
-
-        print(pipe)
-        stage = pipe.build_stage(state.local_process_index, device=state.device)
-        schedule = ScheduleGPipe(stage, num_chunks)
-
-        return schedule
-    
-    stage = build_pipeline(model, split_points, example_batch, num_chunks)
+    example_batch = next(iter(train_dataloader)).to(local_rank)   
+    model = inf.prepare_pippy(model, split_points="auto",example_args=(example_batch["input_ids"],),num_chunks=world_size,)
 
     ########################
 
