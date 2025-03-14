@@ -131,7 +131,7 @@ class Config(BaseConfig):
     torch_compile: bool = True
     attn_implementation: str = "sdpa"
     # Data
-    dataset_name_or_path: str = "allenai/c4"    
+    dataset_name_or_path: str = "allenai/c4"
     seq_length: int = 1024
     c4_tiny: bool = False
     num_workers: int = 4
@@ -199,10 +199,12 @@ def get_dataloader(tokenizer, world_size, rank, local_rank, config: Config) -> S
         ]
 
         if config.hv is not None:
+            print("MY LOCAL RANK: ", local_rank)
+            print("MY RANK: ", sum(config.node_gpu_counts[:config.hv.world_rank]) + local_rank)
             train_dataset = split_dataset_by_node(
                 tokenized_datasets,
-                world_size=config.hv.galaxy_size * world_size,
-                rank=config.hv.world_rank * world_size + local_rank,
+                world_size=sum(config.node_gpu_counts),
+                rank=sum(config.node_gpu_counts[:config.hv.world_rank]) + local_rank,
             )
 
         else:
@@ -244,9 +246,9 @@ def train(config: Config):
     assert batch_size % config.per_device_train_batch_size == 0
     gradient_accumulation_steps = batch_size // config.per_device_train_batch_size
 
-    # if config.hv is not None:
-    #     sharding_strategy = ShardingStrategy.NO_SHARD
-    #     log("Hivemind is used, ShardingStrategy.NO_SHARD is used")
+    if config.hv is not None:
+        sharding_strategy = ShardingStrategy.NO_SHARD
+        log("Hivemind is used, ShardingStrategy.NO_SHARD is used")
 
     resume_from_ckpt, resume_path = get_resume_info(config.ckpt)
 
@@ -322,7 +324,6 @@ def train(config: Config):
     #     use_orig_params=config.torch_compile,
     #     device_mesh=device_mesh,
     # )
-
     if config.torch_compile:
         model = torch.compile(model)
 
@@ -458,163 +459,160 @@ def train(config: Config):
 
     log_activations = {}
 
-    real_step = start_step
-    for epoch in range(100):        
-        train_dataloader = get_dataloader(tokenizer, world_size, rank, local_rank, config)
-        log(f"Epoch {epoch + 1}/{100} started.")
-        for step, batch in enumerate(iterable=train_dataloader, start=start_step * gradient_accumulation_steps):
-            real_step = real_step + (step + 1) // gradient_accumulation_steps
-            is_accumulating = bool((step + 1) % gradient_accumulation_steps)
+    for step, batch in enumerate(iterable=train_dataloader, start=start_step * gradient_accumulation_steps):
+        real_step = (step + 1) // gradient_accumulation_steps
+        is_accumulating = bool((step + 1) % gradient_accumulation_steps)
 
-            logging_activations_steps = (
-                config.log_activations_steps is not None and real_step % config.log_activations_steps == 0
+        logging_activations_steps = (
+            config.log_activations_steps is not None and real_step % config.log_activations_steps == 0
+        )
+
+        if logging_activations_steps:
+            handles = register_metrics_hooks(
+                model, TARGET_LAYER_ACTIVATIONS, log_activations, gradient_accumulation_steps
             )
 
-            if logging_activations_steps:
-                handles = register_metrics_hooks(
-                    model, TARGET_LAYER_ACTIVATIONS, log_activations, gradient_accumulation_steps
-                )
+        for key in batch.keys():
+            batch[key] = batch[key].to("cuda")
 
-            for key in batch.keys():
-                batch[key] = batch[key].to("cuda")
+        # cyshin: disable FSDP
+        # with model.no_sync() if is_accumulating else nullcontext():
+        outputs = model(**batch)
+        loss = outputs.loss / gradient_accumulation_steps
 
-            # with model.no_sync() if is_accumulating else nullcontext():
-            outputs = model(**batch)
-            loss = outputs.loss / gradient_accumulation_steps
+        loss_batch += loss.detach()
 
-            loss_batch += loss.detach()
+        scaler.scale(loss).backward()
 
-            scaler.scale(loss).backward()
+        if logging_activations_steps:
+            for handle in handles:
+                handle.remove()
 
-            if logging_activations_steps:
-                for handle in handles:
-                    handle.remove()
+        if not is_accumulating:
+            if world_messenger_hv:
+                scaler.unscale_(optimizer=optimizer.inner_optimizer)
+            else:
+                scaler.unscale_(optimizer=optimizer)
 
-            if not is_accumulating:
-                if world_messenger_hv:
-                    scaler.unscale_(optimizer=optimizer.inner_optimizer)
-                else:
-                    scaler.unscale_(optimizer=optimizer)
+            # cyshin: disable FSDP
+            model.clip_grad_norm_(1.0)  # gradient clipping
 
-                # cyshin: disable FSDP
-                # model.clip_grad_norm_(1.0)  # gradient clipping
+            if world_messenger_hv:
+                optimizer.step(scaler=scaler)
 
-                if world_messenger_hv:
-                    optimizer.step(scaler=scaler)
+                # todo(sami): refactor to use built in pytorch mechanism to handle scaler manually
+                # should allow to just do scaler.step(optimizer)
+            else:
+                scaler.step(optimizer)
 
-                    # todo(sami): refactor to use built in pytorch mechanism to handle scaler manually
-                    # should allow to just do scaler.step(optimizer)
-                else:
-                    scaler.step(optimizer)
+            scaler.update()
 
-                scaler.update()
+            scheduler.step()
+            optimizer.zero_grad()
 
-                scheduler.step()
-                optimizer.zero_grad()
+            if config.hv is not None:
+                if int(real_step) % config.hv.local_steps == 0:
+                    for param in model.parameters():
+                        torch.distributed.broadcast(param.data, src=0)
+
+            if rank == 0:
+                total_samples = real_step * config.total_batch_size
+                effective_step = real_step
 
                 if config.hv is not None:
-                    if int(real_step) % config.hv.local_steps == 0:
-                        for param in model.parameters():
-                            torch.distributed.broadcast(param.data, src=0)
+                    # Note that this assumes that we have the right amount of worker since t0.
+                    # Not robust to off/on ramping
+                    effective_step = real_step * config.hv.galaxy_size
+                    total_samples = real_step * config.total_batch_size * config.hv.galaxy_size
 
-                if rank == 0:
-                    total_samples = real_step * config.total_batch_size
-                    effective_step = real_step
+                metrics = {
+                    "Loss": loss_batch.item(),
+                    "step": real_step,
+                    "lr": [group["lr"] for group in optimizer.param_groups][0],
+                    "Perplexity": torch.exp(loss_batch).item(),
+                    "effective_step": effective_step,  # at each step the we have compute total_batch_size. Independent of the number of GPUs
+                    "total_samples": total_samples,
+                    "time_taken": time.time() - current_time,
+                    "tokens_per_second": config.seq_length * config.total_batch_size / (time.time() - current_time),
+                }
 
-                    if config.hv is not None:
-                        # Note that this assumes that we have the right amount of worker since t0.
-                        # Not robust to off/on ramping
-                        effective_step = real_step * config.hv.galaxy_size
-                        total_samples = real_step * config.total_batch_size * config.hv.galaxy_size
+                if world_messenger_hv:
+                    outer_lr = [group["lr"] for group in optimizer.state_averager.optimizer.param_groups][0]
+                    num_peers = optimizer.tracker.global_progress.num_peers
 
-                    metrics = {
-                        "Loss": loss_batch.item(),
-                        "step": real_step,
-                        "lr": [group["lr"] for group in optimizer.param_groups][0],
-                        "Perplexity": torch.exp(loss_batch).item(),
-                        "effective_step": effective_step,  # at each step the we have compute total_batch_size. Independent of the number of GPUs
-                        "total_samples": total_samples,
-                        "time_taken": time.time() - current_time,
-                        "tokens_per_second": config.seq_length * config.total_batch_size / (time.time() - current_time),
-                    }
+                    max_num_peers = max(max_num_peers, num_peers)
 
-                    if world_messenger_hv:
-                        outer_lr = [group["lr"] for group in optimizer.state_averager.optimizer.param_groups][0]
-                        num_peers = optimizer.tracker.global_progress.num_peers
+                    if num_peers == 0:
+                        num_peers = 1
 
-                        max_num_peers = max(max_num_peers, num_peers)
+                    metrics["outer_lr"] = outer_lr
+                    metrics["num_peers"] = num_peers
 
-                        if num_peers == 0:
-                            num_peers = 1
+                if logging_activations_steps:
+                    metrics.update(log_activations)
+                    log_activations = {}
 
-                        metrics["outer_lr"] = outer_lr
-                        metrics["num_peers"] = num_peers
-
-                    if logging_activations_steps:
-                        metrics.update(log_activations)
-                        log_activations = {}
-
-                    if world_messenger_hv and num_peers < max_num_peers:
-                        log(message=f"Lost a diloco worker, num_peers: {num_peers}, galaxy_size: {config.hv.galaxy_size}")
-                        if config.hv.fail_rank_drop:
-                            raise ValueError(
-                                f"Lost a diloco worker, num_peers: {num_peers}, galaxy_size: {config.hv.galaxy_size}"
-                            )
-
-                    current_time = time.time()
-
-                    metric_logger.log(metrics)
-
-                    if config.hv is None:
-                        log(
-                            f"step: {real_step}, loss: {loss_batch.item()}, lr {[group['lr'] for group in optimizer.param_groups][0]}"
+                if world_messenger_hv and num_peers < max_num_peers:
+                    log(message=f"Lost a diloco worker, num_peers: {num_peers}, galaxy_size: {config.hv.galaxy_size}")
+                    if config.hv.fail_rank_drop:
+                        raise ValueError(
+                            f"Lost a diloco worker, num_peers: {num_peers}, galaxy_size: {config.hv.galaxy_size}"
                         )
 
-                # Save checkpoint every 'checkpoint_interval' steps
-                if config.ckpt.interval is not None and real_step % config.ckpt.interval == 0:
-                    log(f"saving at step {real_step}, step {step+1}")
-                    ckpt_path = os.path.join(config.ckpt.path, f"{CKPT_PREFIX}_{int(real_step)}")
+                current_time = time.time()
 
-                    if config.hv:
-                        ckpt_path = os.path.join(ckpt_path, get_diloco_rank_dir_name(config.hv.world_rank))
+                metric_logger.log(metrics)
 
-                    if world_messenger_hv:
-                        assert isinstance(optimizer, DiLoCoOptimizer)
-                        with optimizer.tracker.pause_updates():
-                            save_checkpoint(
-                                checkpoint_path=ckpt_path,
-                                model=model,
-                                optimizer=optimizer.inner_optimizer,
-                                scheduler=scheduler,
-                                outer_optimizer=optimizer.state_averager.optimizer,
-                                loss=loss_batch.item(),
-                                scaler=scaler,
-                                data_loader=train_dataloader,
-                                save_global_state=True,
-                            )
-                    else:
+                if config.hv is None:
+                    log(
+                        f"step: {real_step}, loss: {loss_batch.item()}, lr {[group['lr'] for group in optimizer.param_groups][0]}"
+                    )
+
+            # Save checkpoint every 'checkpoint_interval' steps
+            if config.ckpt.interval is not None and real_step % config.ckpt.interval == 0:
+                log(f"saving at step {real_step}, step {step+1}")
+                ckpt_path = os.path.join(config.ckpt.path, f"{CKPT_PREFIX}_{int(real_step)}")
+
+                if config.hv:
+                    ckpt_path = os.path.join(ckpt_path, get_diloco_rank_dir_name(config.hv.world_rank))
+
+                if world_messenger_hv:
+                    assert isinstance(optimizer, DiLoCoOptimizer)
+                    with optimizer.tracker.pause_updates():
                         save_checkpoint(
                             checkpoint_path=ckpt_path,
                             model=model,
-                            optimizer=optimizer,
+                            optimizer=optimizer.inner_optimizer,
                             scheduler=scheduler,
+                            outer_optimizer=optimizer.state_averager.optimizer,
                             loss=loss_batch.item(),
                             scaler=scaler,
                             data_loader=train_dataloader,
-                            save_global_state=rank == 0,
+                            save_global_state=True,
                         )
+                else:
+                    save_checkpoint(
+                        checkpoint_path=ckpt_path,
+                        model=model,
+                        optimizer=optimizer,
+                        scheduler=scheduler,
+                        loss=loss_batch.item(),
+                        scaler=scaler,
+                        data_loader=train_dataloader,
+                        save_global_state=rank == 0,
+                    )
 
-                    if local_rank == 0:
-                        # only the rank 0 deletes the checkpoints
-                        if config.ckpt.topk is not None:
-                            ckpt_deleted = delete_old_checkpoints(config.ckpt.path, config.ckpt.topk)
-                            if ckpt_deleted:
-                                log(f"Deleted old checkpoints: {ckpt_deleted}")
+                if local_rank == 0:
+                    # only the rank 0 deletes the checkpoints
+                    if config.ckpt.topk is not None:
+                        ckpt_deleted = delete_old_checkpoints(config.ckpt.path, config.ckpt.topk)
+                        if ckpt_deleted:
+                            log(f"Deleted old checkpoints: {ckpt_deleted}")
 
-                loss_batch = 0
+            loss_batch = 0
 
-                if config.max_steps is not None and real_step >= config.max_steps:
-                    break
+            if config.max_steps is not None and real_step >= config.max_steps:
+                break
 
     log("Training completed.")
     if rank == 0:
