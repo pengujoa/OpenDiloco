@@ -246,9 +246,10 @@ def train(config: Config):
     assert batch_size % config.per_device_train_batch_size == 0
     gradient_accumulation_steps = batch_size // config.per_device_train_batch_size
 
-    if config.hv is not None:
-        sharding_strategy = ShardingStrategy.NO_SHARD
-        log("Hivemind is used, ShardingStrategy.NO_SHARD is used")
+    # cyshin: disable FSDP
+    # if config.hv is not None:
+    #     sharding_strategy = ShardingStrategy.NO_SHARD
+    #     log("Hivemind is used, ShardingStrategy.NO_SHARD is used")
 
     resume_from_ckpt, resume_path = get_resume_info(config.ckpt)
 
