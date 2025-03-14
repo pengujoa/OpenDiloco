@@ -28,11 +28,12 @@ from transformers import (
     LlamaForCausalLM,
     get_cosine_schedule_with_warmup,
 )
-from torch.distributed.fsdp import (
-    FullyShardedDataParallel as FSDP,
-    ShardingStrategy,
-    MixedPrecision,
-)
+# cyshin: disable FSDP
+# from torch.distributed.fsdp import (
+#     FullyShardedDataParallel as FSDP,
+#     ShardingStrategy,
+#     MixedPrecision,
+# )
 from torch.distributed.device_mesh import init_device_mesh
 
 from ckpt_utils import (
@@ -130,8 +131,7 @@ class Config(BaseConfig):
     torch_compile: bool = True
     attn_implementation: str = "sdpa"
     # Data
-    # dataset_name_or_path: str = "allenai/c4"
-    dataset_name_or_path: str = "qiaojin/PubMedQA"
+    dataset_name_or_path: str = "allenai/c4"    
     seq_length: int = 1024
     c4_tiny: bool = False
     num_workers: int = 4
@@ -270,9 +270,9 @@ def train(config: Config):
     assert batch_size % config.per_device_train_batch_size == 0
     gradient_accumulation_steps = batch_size // config.per_device_train_batch_size
 
-    if config.hv is not None:
-        sharding_strategy = ShardingStrategy.NO_SHARD
-        log("Hivemind is used, ShardingStrategy.NO_SHARD is used")
+    # if config.hv is not None:
+    #     sharding_strategy = ShardingStrategy.NO_SHARD
+    #     log("Hivemind is used, ShardingStrategy.NO_SHARD is used")
 
     resume_from_ckpt, resume_path = get_resume_info(config.ckpt)
 
@@ -331,22 +331,24 @@ def train(config: Config):
     half_precision_dtype = torch.bfloat16 if config.precision == "bf16-mixed" else torch.float16
     scaler = torch.cuda.amp.GradScaler(enabled=config.precision == "fp16-mixed")
 
-    if sharding_strategy in [
-        ShardingStrategy._HYBRID_SHARD_ZERO2,
-        ShardingStrategy.HYBRID_SHARD,
-    ]:
-        local_world_size = int(os.environ["LOCAL_WORLD_SIZE"])
-        nnodes = world_size // local_world_size
-        device_mesh = init_device_mesh("cuda", (nnodes, local_world_size), mesh_dim_names=("global", "local"))
-    else:
-        device_mesh = None
-    model = FSDP(
-        model,
-        sharding_strategy=sharding_strategy,
-        mixed_precision=MixedPrecision(param_dtype=half_precision_dtype) if half_precision else None,
-        use_orig_params=config.torch_compile,
-        device_mesh=device_mesh,
-    )
+    # cyshin: disable FSDP
+    # if sharding_strategy in [
+    #     ShardingStrategy._HYBRID_SHARD_ZERO2,
+    #     ShardingStrategy.HYBRID_SHARD,
+    # ]:
+    #     local_world_size = int(os.environ["LOCAL_WORLD_SIZE"])
+    #     nnodes = world_size // local_world_size
+    #     device_mesh = init_device_mesh("cuda", (nnodes, local_world_size), mesh_dim_names=("global", "local"))
+    # else:
+    #     device_mesh = None
+    # model = FSDP(
+    #     model,
+    #     sharding_strategy=sharding_strategy,
+    #     mixed_precision=MixedPrecision(param_dtype=half_precision_dtype) if half_precision else None,
+    #     use_orig_params=config.torch_compile,
+    #     device_mesh=device_mesh,
+    # )
+
     if config.torch_compile:
         model = torch.compile(model)
 
@@ -502,13 +504,13 @@ def train(config: Config):
             for key in batch.keys():
                 batch[key] = batch[key].to("cuda")
 
-            with model.no_sync() if is_accumulating else nullcontext():
-                outputs = model(**batch)
-                loss = outputs.loss / gradient_accumulation_steps
+            # with model.no_sync() if is_accumulating else nullcontext():
+            outputs = model(**batch)
+            loss = outputs.loss / gradient_accumulation_steps
 
-                loss_batch += loss.detach()
+            loss_batch += loss.detach()
 
-                scaler.scale(loss).backward()
+            scaler.scale(loss).backward()
 
             if logging_activations_steps:
                 for handle in handles:
@@ -520,7 +522,8 @@ def train(config: Config):
                 else:
                     scaler.unscale_(optimizer=optimizer)
 
-                model.clip_grad_norm_(1.0)  # gradient clipping
+                # cyshin: disable FSDP
+                # model.clip_grad_norm_(1.0)  # gradient clipping
 
                 if world_messenger_hv:
                     optimizer.step(scaler=scaler)
