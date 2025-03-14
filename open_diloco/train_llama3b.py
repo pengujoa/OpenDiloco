@@ -496,7 +496,7 @@ def train(config: Config):
                 scaler.unscale_(optimizer=optimizer)
 
             # cyshin: disable FSDP
-            model.clip_grad_norm_(1.0)  # gradient clipping
+            # model.clip_grad_norm_(1.0)  # gradient clipping
 
             if world_messenger_hv:
                 optimizer.step(scaler=scaler)
