@@ -1,5 +1,4 @@
 """
-
 to test quickly do 
 torchrun --nproc_per_node=2 \
         train_fsdp.py --per-device-train-batch-size 8 --total-batch-size 128 --lr 1e-2 --path-model ../tests/models/llama-2m-fresh \
@@ -156,6 +155,8 @@ class Config(BaseConfig):
     node_gpu_counts: list[int] = Field(..., description="List of GPU counts per node. Must be provided.") # List to store GPU counts per node
     # Lora
     lora: bool | None = False
+    # Gradient checkpointing
+    enable_gradient_checkpointing: bool = False
 
     @validator("node_gpu_counts",  pre=True)
     def validate_node_gpu_counts(cls, value, values):
@@ -279,6 +280,10 @@ def train(config: Config):
     train_dataloader = get_dataloader(tokenizer, world_size, rank, local_rank, config)
 
     model = get_model(config)
+    # cyshin: gradient_checkpointing
+    if config.enable_gradient_checkpointing:
+        model.config.use_cache = False
+        model.gradient_checkpointing_enable()
     # print("BASE MODEL")
     # for name, param in base_model.named_parameters():
     #     print(f"{name}: requires_grad={param.requires_grad}")
@@ -290,7 +295,7 @@ def train(config: Config):
     # keys2 = set(name for name, _ in model.named_parameters())
 
     # only_in_model1 = keys1 - keys2
-    # only_in_model2 = keys2 - keys1
+    # only_in_model2 = keys2 - keys1e
 
     # print("🔹 Keys only in model1:", len(keys1))
     # for key in only_in_model1:

@@ -242,10 +242,9 @@ def get_dataloader(tokenizer, world_size, rank, local_rank, config: Config) -> S
 
 def get_model(config: Config) -> LlamaForCausalLM:
     # Load model
-    config_model = LlamaConfig.from_pretrained(config.path_model, use_cache=False, rope_scaling={"rope_type": "default"}, attn_implementation=config.attn_implementation)
-    # config_model = LlamaConfig.from_pretrained(config.path_model, use_cache=False)
+    # config_model = LlamaConfig.from_pretrained(config.path_model, use_cache=False, rope_scaling={"rope_type": "default"}, attn_implementation=config.attn_implementation)
+    config_model = LlamaConfig.from_pretrained(config.path_model, use_cache=False)
     model = LlamaForCausalLM.from_pretrained(pretrained_model_name_or_path=config.path_model, config=config_model)
-    model.train()
     if config.lora:
         print_trainable_parameters(model)
         model = get_peft_model(model, lora_config)
@@ -267,11 +266,6 @@ def train(config: Config):
 
     assert batch_size % config.per_device_train_batch_size == 0
     gradient_accumulation_steps = batch_size // config.per_device_train_batch_size
-
-    # cyshin: diable FSDP
-    # if config.hv is not None:
-    #     sharding_strategy = ShardingStrategy.NO_SHARD
-    #     log("Hivemind is used, ShardingStrategy.NO_SHARD is used")
 
     resume_from_ckpt, resume_path = get_resume_info(config.ckpt)
 
@@ -303,40 +297,33 @@ def train(config: Config):
     model = get_model(config)
     model = model.to(local_rank)
 
-    # cyshin: PP coding
+    # cyshin: PP codes
     ########################
-    from accelerate import inference as inf
 
+    # print("num_hidden_layers", model.config.num_hidden_layers)
     print(model)
-    print("num_hidden_layers", model.config.num_hidden_layers)
-    example_batch = next(iter(train_dataloader)).to(local_rank)   
-    model = inf.prepare_pippy(model, split_points="auto",example_args=(example_batch["input_ids"],),num_chunks=world_size,)
+    example_batch = next(iter(train_dataloader))
+    print(example_batch)
+    mb_kwargs = {
+        "input_ids": example_batch["input_ids"],
+        "attention_mask": example_batch["attention_mask"],
+        "labels": example_batch["labels"]
+    }    
+    
+    pipe = pipeline(
+        module=model,    # 분할할 모델
+        mb_args=(),          # positional 인자가 없다면 빈 튜플
+        mb_kwargs=mb_kwargs, # 준비한 keyword 인자 전달
+        split_spec={
+            "model.layers.10.mlp": SplitPoint.BEGINNING,
+        }
+    )
 
     ########################
 
     half_precision = config.precision == "fp16-mixed" or config.precision == "bf16-mixed"
     half_precision_dtype = torch.bfloat16 if config.precision == "bf16-mixed" else torch.float16
     scaler = torch.cuda.amp.GradScaler(enabled=config.precision == "fp16-mixed")
-
-    # cyshin: diable FSDP
-    # if sharding_strategy in [
-    #     ShardingStrategy._HYBRID_SHARD_ZERO2,
-    #     ShardingStrategy.HYBRID_SHARD,
-    # ]:
-    #     local_world_size = int(os.environ["LOCAL_WORLD_SIZE"])
-    #     nnodes = world_size // local_world_size
-    #     device_mesh = init_device_mesh("cuda", (nnodes, local_world_size), mesh_dim_names=("global", "local"))
-    # else:
-    #     device_mesh = None
-
-    # cyshin: disable FSDP
-    # model = FSDP(
-    #     model,
-    #     sharding_strategy=sharding_strategy,
-    #     mixed_precision=MixedPrecision(param_dtype=half_precision_dtype) if half_precision else None,
-    #     use_orig_params=config.torch_compile,
-    #     device_mesh=device_mesh,
-    # )
 
     if config.torch_compile:
         model = torch.compile(model)
