@@ -103,14 +103,13 @@ def ddp_setup():
     torch.cuda.set_device(int(os.environ["LOCAL_RANK"]))
 
 # cyshin: pp setup
-global rank, device, pp_group, stage_index, num_stages
+global device, pp_group, stage_index, num_stages
 def pp_setup():
-   global rank, device, pp_group, stage_index, num_stages
+   global device, pp_group, stage_index, num_stages
    rank = int(os.environ["LOCAL_RANK"])
    world_size = int(os.environ["WORLD_SIZE"])
    device = torch.device(f"cuda:{rank}") if torch.cuda.is_available() else torch.device("cpu")
    dist.init_process_group()
-   return device
 
    # This group can be a sub-group in the N-D parallel case
    pp_group = dist.new_group()
@@ -253,7 +252,8 @@ def get_model(config: Config) -> LlamaForCausalLM:
     return model
 
 
-def train(config: Config, device):
+def train(config: Config):
+    global device, pp_group, stage_index, num_stages
     sharding_strategy = get_sharding_strategy(config.sharding_strategy)
     local_rank = int(os.environ["LOCAL_RANK"])
     world_size = int(os.environ["WORLD_SIZE"])
@@ -299,58 +299,66 @@ def train(config: Config, device):
     # model = model.to(device).train()
 
     #########
-    if rank == 0:
+    if stage_index == 0:
     # prepare the first stage model
         print(len(model.model.layers))
         del model.model.layers[11:21]
-        # for i in range(11, 21):
-        #     print(model.model.layers[i])
-        #     # del model.model.layers[i]
         model.model.norm = None
-        model.model.layers.rotary_emb = None
+        model.model.rotary_emb = None
+        model.lm_head = None
         model.output = None
         print(model)
 
-    elif rank == 1:
+    elif stage_index == 1:
     # prepare the second stage model
-        for i in range(4):
-            del model.layers[str(i)]
-        model.tok_embeddings = None
+        del model.model.layers[0:11]
+        model.embed_tokens = None
+        print(model)
+    
+    stage = PipelineStage(
+        model,
+        stage_index,
+        num_stages,
+        device,
+    )
+    
+    schedule = ScheduleGPipe(stage, n_microbatches=batch_size)
+
 
     #########
 
     # cyshin: PP codes
     ########################
 
-    # print("num_hidden_layers", model.config.num_hidden_layers)
-    print(model)
-    example_batch = next(iter(train_dataloader)).to(device)
-    print(example_batch)
-    mb_kwargs = {
-        "input_ids": example_batch["input_ids"],
-        "attention_mask": example_batch["attention_mask"],
-        "labels": example_batch["labels"]
-    }    
+    # # print("num_hidden_layers", model.config.num_hidden_layers)
+    # print(model)
+    # example_batch = next(iter(train_dataloader)).to(device)
+    # print(example_batch)
+    # mb_kwargs = {
+    #     "input_ids": example_batch["input_ids"],
+    #     "attention_mask": example_batch["attention_mask"],
+    #     "labels": example_batch["labels"]
+    # }    
     
+    # # pipe = pipeline(
+    # #     module=model,    # 분할할 모델
+    # #     mb_args=(),          # positional 인자가 없다면 빈 튜플
+    # #     mb_kwargs=mb_kwargs, # 준비한 keyword 인자 전달
+    # #     split_spec={
+    # #         "model.layers.10": SplitPoint.BEGINNING,
+    # #     }
+    # # )
+
     # pipe = pipeline(
     #     module=model,    # 분할할 모델
-    #     mb_args=(),          # positional 인자가 없다면 빈 튜플
-    #     mb_kwargs=mb_kwargs, # 준비한 keyword 인자 전달
+    #     mb_args=(example_batch["input_ids"],
+    #             example_batch["attention_mask"],
+    #             # example_batch["labels"],          # positional 인자가 없다면 빈 튜플
+    #     ),
     #     split_spec={
     #         "model.layers.10": SplitPoint.BEGINNING,
     #     }
     # )
-
-    pipe = pipeline(
-        module=model,    # 분할할 모델
-        mb_args=(example_batch["input_ids"],
-                example_batch["attention_mask"],
-                # example_batch["labels"],          # positional 인자가 없다면 빈 튜플
-        ),
-        split_spec={
-            "model.layers.10": SplitPoint.BEGINNING,
-        }
-    )
 
     ########################
 
@@ -666,7 +674,7 @@ if __name__ == "__main__":
     # However, in development, we want to know that we broke torch compile
     torch._dynamo.config.suppress_errors = "PRIME_INTELLECT_DEV" not in os.environ
     torch.set_float32_matmul_precision("high")
-    device = pp_setup()
+    pp_setup()
     config = Config(**parse_argv())
-    train(config, device)
+    train(config)
     destroy_process_group()
