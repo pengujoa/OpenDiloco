@@ -32,6 +32,7 @@ from hivemind.optim.progress_tracker import LocalTrainingProgress
 from open_diloco.utils import found_inf_grad
 # cyshin
 import logging
+from pydantic.v1 import BaseModel, StrictBool, StrictFloat, confloat, conint
 
 
 class DiLoCoStateAverager(TrainingStateAverager):
@@ -219,9 +220,22 @@ class DiLoCoGradAverager(DecentralizedAverager):
         self._new_averaged_grads = False
 
 
+# cyshin
+# class DiLoCoLocalTrainingProgress(LocalTrainingProgress):
+#     peer_id: bytes
+#     epoch: conint(ge=0, strict=True)
+#     samples_accumulated: conint(ge=0, strict=True)
+#     samples_per_second: confloat(ge=0.0, strict=True)
+#     time: StrictFloat
+#     client_mode: StrictBool
+#     target_batch_size: conint(ge=0, strict=True)
+
+
 class DiloCoProgressTracker(ProgressTracker):
     global_progress: GlobalTrainingProgress
     local_progress: LocalTrainingProgress
+    # cyshin
+    # local_progress: DiLoCoLocalTrainingProgress
 
     def __init__(self, batch_size: int, num_inner_steps: int, **kwargs):
         self.batch_size = batch_size
@@ -254,7 +268,19 @@ class DiloCoProgressTracker(ProgressTracker):
     @property
     def real_step(self) -> int:
         return self.local_step + self.local_progress.epoch * self.batch_size
-
+    
+    # cyshin
+    # def _get_local_progress(self, local_epoch: int, samples_accumulated: int):
+    #     return DiLoCoLocalTrainingProgress(
+    #         peer_id=self.dht.peer_id.to_bytes(),
+    #         epoch=local_epoch,
+    #         samples_accumulated=samples_accumulated,
+    #         samples_per_second=self.performance_ema.samples_per_second,
+    #         time=get_dht_time(),
+    #         client_mode=self.client_mode,
+    #         target_batch_size=self.batch_size * self.num_inner_steps
+    #     )
+    
     def _parse_swarm_progress_data(self, metadata: TrainingProgressSchema) -> GlobalTrainingProgress:
         """Read performance statistics reported by peers, estimate progress towards next batch
         This function is copy paste from hivemind. Only difference is that if fix the ETA estimation.
@@ -265,6 +291,8 @@ class DiloCoProgressTracker(ProgressTracker):
             logger.log(self.status_loglevel, f"Found no active peers: {metadata}")
             samples_remaining_to_next_epoch = max(0, self.target_batch_size - self.local_progress.samples_accumulated)
             local_eta_next_epoch = samples_remaining_to_next_epoch / self.performance_ema.samples_per_second
+
+            # print("return here 1")
 
             return GlobalTrainingProgress(
                 self.local_progress.epoch,
@@ -292,16 +320,26 @@ class DiloCoProgressTracker(ProgressTracker):
 
         total_samples_accumulated = 0
         total_samples_per_second = self.performance_ema.eps
+        # print("total_samples_per_second:", total_samples_per_second)
 
         estimated_time_to_next_epoch = 0
 
         for peer in valid_peer_entries:
+            # print("peer", peer)
             total_samples_per_second += peer.samples_per_second
             if peer.epoch == global_epoch:
-                samples_remaining_to_next_epoch = max(0, self.target_batch_size - peer.samples_accumulated)
+                # cyshin
+                # print("peer.target_batch_size:", peer.target_batch_size)
+                # print("peer.samples_accumulated:", peer.samples_accumulated)                
+                # samples_remaining_to_next_epoch = max(0, self.target_batch_size - peer.samples_accumulated)
+                samples_remaining_to_next_epoch = max(0, peer.target_batch_size - peer.samples_accumulated)
+                # print("samples_remaining_to_next_epoch:", samples_remaining_to_next_epoch)
+                # print("peer.samples_per_second:", peer.samples_per_second)
                 local_eta_next_epoch = samples_remaining_to_next_epoch / peer.samples_per_second
+                # print("local_eta_next_epoch:", local_eta_next_epoch)
 
                 estimated_time_to_next_epoch = max(estimated_time_to_next_epoch, local_eta_next_epoch)
+                # print("estimated_time_to_next_epoch:", estimated_time_to_next_epoch)
 
             # note: we deliberately count only valid peers for samples_accumulated, but all peers for performance;
             # the rationale behind this is that outdated peers will synchronize and begin contributing shortly.
@@ -318,6 +356,8 @@ class DiloCoProgressTracker(ProgressTracker):
             self.status_loglevel,
             f"{self.prefix} has taken {self.local_step} local steps. Peers: {num_peers}, epoch: {self.local_progress.epoch}, steps: {self.real_step}. ETA: {estimated_time_to_next_epoch:.2f}",
         )
+
+        # print("return here 2")
 
         return GlobalTrainingProgress(
             global_epoch,
