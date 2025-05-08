@@ -13,8 +13,9 @@ from contextlib import nullcontext
 import datetime
 from typing import Any, Literal
 
-from pydantic import model_validator, validator, Field
+from pydantic import field_validator, Field
 import torch
+from typing import List, Union
 from pydantic_config import parse_argv, BaseConfig
 from datasets import load_dataset
 from datasets.distributed import split_dataset_by_node
@@ -116,13 +117,14 @@ class HvConfig(BaseConfig):
     galaxy_size: int
     fail_rank_drop: bool = False  # fail if we lose a diloco worker
 
-    @model_validator(mode="before")
-    def cast_str_to_list(cls, values: dict[str, Any]) -> dict[str, Any]:
-        """This allow to only pass a string and it will still be cast as a list"""
-        for arg_name in ["initial_peers", "host_maddrs", "announce_maddrs"]:
-            if arg_name in values.keys() and isinstance(values[arg_name], str):
-                values[arg_name] = [values[arg_name]]
-        return values
+    
+    @field_validator('initial_peers', mode='before')
+    def _parse_str_to_str_list(cls, v: Union[str, List[str]]) -> List[str]:
+        # 이미 리스트면 그대로 반환
+        if isinstance(v, list):
+            return v
+        # 문자열인 경우 쉼표로 분할해 리스트로 변환
+        return [item.strip() for item in v.strip('[]').split(',') if item.strip()]
 
 
 class Config(BaseConfig):
@@ -156,33 +158,19 @@ class Config(BaseConfig):
     # Lora
     lora: bool | None = False
 
-    @validator("node_gpu_counts",  pre=True)
-    def validate_node_gpu_counts(cls, value, values):
-        if isinstance(value, str):
-            try:
-                value = [int(item) for item in value.split(",")]  
-            except ValueError:
-                raise ValueError("All elements in node_gpu_counts must be integers.")
-            
-        hv = values.get('hv')
-
-        if len(value) > 1 and hv is None:
-            raise ValueError("hv configuration must be provided for multi-node training.")
-
-        if hv and len(value) != hv.galaxy_size:
-            raise ValueError("Number of nodes must be equal to hv.galaxy_size.")
-
-        if not all(isinstance(count, int) and count > 0 for count in value):
-            raise ValueError("All node GPU counts must be positive integers.")
-
-        return value
+    @field_validator('node_gpu_counts', mode='before')
+    def _parse_str_to_int_list(cls, v):
+        if isinstance(v, list):
+            return v
+        items = v.strip('[]').split(',')
+        return [int(item) for item in items if item.strip()]
     
-
+    
 def get_dataloader(tokenizer, world_size, rank, local_rank, config: Config) -> StatefulDataLoader:
     if config.fake_data:
         train_dataset = FakeTokenizedDataset(config.seq_length, TEST_VOCAB_SIZE)
     else:
-        ds = load_dataset(config.dataset_name_or_path, "en", streaming=True)
+        ds = load_dataset(config.dataset_name_or_path, "en", streaming=True, trust_remote_code=True)
 
         def tokenize_function(data):
             outputs = tokenizer(
@@ -221,8 +209,8 @@ def get_dataloader(tokenizer, world_size, rank, local_rank, config: Config) -> S
 
 def get_model(config: Config) -> LlamaForCausalLM:
     # Load model
-    config_model = LlamaConfig.from_pretrained(config.path_model, attn_implementation=config.attn_implementation)
-    model = LlamaForCausalLM.from_pretrained(pretrained_model_name_or_path=config.path_model, config=config_model)
+    config_model = LlamaConfig.from_pretrained(config.path_model, attn_implementation=config.attn_implementation, resume_download=True)
+    model = LlamaForCausalLM.from_pretrained(pretrained_model_name_or_path=config.path_model, config=config_model, resume_download=True)
     if config.lora:
         print_trainable_parameters(model)
         model = get_peft_model(model, lora_config)
@@ -271,7 +259,7 @@ def train(config: Config):
         check_checkpoint_path_access(config.ckpt.path, rank, config.hv.world_rank if config.hv else None)
 
     # DataLoader preparation
-    tokenizer = AutoTokenizer.from_pretrained("mistralai/Mistral-7B-v0.1", use_fast=True)
+    tokenizer = AutoTokenizer.from_pretrained("mistralai/Mistral-7B-v0.1", use_fast=True, resume_download=True)
     tokenizer.pad_token = "</s>"  # Ensure pad token is set for models that need it
 
     train_dataloader = get_dataloader(tokenizer, world_size, rank, local_rank, config)
