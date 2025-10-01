@@ -3,6 +3,8 @@ import time
 from typing import Callable, Iterator, List, Optional, Union
 import numpy as np
 
+import os
+from datetime import datetime
 import torch
 
 from hivemind.averaging.averager import DecentralizedAverager
@@ -109,6 +111,7 @@ class DiLoCoGradAverager(DecentralizedAverager):
             dht=dht,
             prefix=prefix,
             client_mode=False,
+            classstr="gradaverager",
             **kwargs,
         )
 
@@ -121,7 +124,6 @@ class DiLoCoGradAverager(DecentralizedAverager):
                     param.grad = torch.zeros_like(param)
                 yield param.grad
 
-    # def schedule_step(self, scheduled_time: Optional[DHTExpiration] = None, **kwargs) -> StepControl:
     def schedule_step(self, scheduled_time: Optional[DHTExpiration] = None, **kwargs) -> StepControl:
 
         """
@@ -135,8 +137,6 @@ class DiLoCoGradAverager(DecentralizedAverager):
         """
         
         assert kwargs.get("weight") is None, "setting weight in schedule_step is not supported"
-        # cyshin
-        # return super().step(scheduled_time=scheduled_time, wait=False, require_trigger=True, **kwargs)
         return super().step(scheduled_time=scheduled_time, wait=False, require_trigger=True, **kwargs)
 
     def step(
@@ -188,6 +188,7 @@ class DiLoCoGradAverager(DecentralizedAverager):
             print("control result call")
             return_value = control.result(timeout)
             time_1_control_result = time.perf_counter()
+            print(datetime.now().strftime("[%Y-%m-%d %H:%M:%S.%f]"), f"Time taken for control_result: {time_1_control_result - time_0_control_result} sec")
             logger.log(
                 logging.INFO,
                 f"Time taken for control_result: {time_1_control_result - time_0_control_result} sec",
@@ -206,36 +207,16 @@ class DiLoCoGradAverager(DecentralizedAverager):
                 # opt_param is the param that will be all_reduce, it is suppose to be on cpu
                 # main_param is the param that has been updated by the inner optimizer, it is suppose to be on gpu
                 grad = opt_param.data - main_param.detach().to(opt_param.device)
-                # cyshin
-                # time_0_averaged_grad_copy = time.perf_counter()
                 averaged_grad.copy_(grad, non_blocking=True)
-                # time_1_averaged_grad_copy = time.perf_counter()
-                # logger.log(
-                #     logging.INFO,
-                #     f"Time taken for averaged_grad_copy: {time_1_averaged_grad_copy - time_0_averaged_grad_copy} sec",
-                # )
 
     def notify_used_averaged_gradients(self):
         """Notify averager that the results of a previous averaging round are accounted for"""
         self._new_averaged_grads = False
 
 
-# cyshin
-# class DiLoCoLocalTrainingProgress(LocalTrainingProgress):
-#     peer_id: bytes
-#     epoch: conint(ge=0, strict=True)
-#     samples_accumulated: conint(ge=0, strict=True)
-#     samples_per_second: confloat(ge=0.0, strict=True)
-#     time: StrictFloat
-#     client_mode: StrictBool
-#     target_batch_size: conint(ge=0, strict=True)
-
-
 class DiloCoProgressTracker(ProgressTracker):
     global_progress: GlobalTrainingProgress
     local_progress: LocalTrainingProgress
-    # cyshin
-    # local_progress: DiLoCoLocalTrainingProgress
 
     def __init__(self, batch_size: int, num_inner_steps: int, **kwargs):
         self.batch_size = batch_size
@@ -269,18 +250,6 @@ class DiloCoProgressTracker(ProgressTracker):
     def real_step(self) -> int:
         return self.local_step + self.local_progress.epoch * self.batch_size
     
-    # cyshin
-    # def _get_local_progress(self, local_epoch: int, samples_accumulated: int):
-    #     return DiLoCoLocalTrainingProgress(
-    #         peer_id=self.dht.peer_id.to_bytes(),
-    #         epoch=local_epoch,
-    #         samples_accumulated=samples_accumulated,
-    #         samples_per_second=self.performance_ema.samples_per_second,
-    #         time=get_dht_time(),
-    #         client_mode=self.client_mode,
-    #         target_batch_size=self.batch_size * self.num_inner_steps
-    #     )
-    
     def _parse_swarm_progress_data(self, metadata: TrainingProgressSchema) -> GlobalTrainingProgress:
         """Read performance statistics reported by peers, estimate progress towards next batch
         This function is copy paste from hivemind. Only difference is that if fix the ETA estimation.
@@ -291,8 +260,6 @@ class DiloCoProgressTracker(ProgressTracker):
             logger.log(self.status_loglevel, f"Found no active peers: {metadata}")
             samples_remaining_to_next_epoch = max(0, self.target_batch_size - self.local_progress.samples_accumulated)
             local_eta_next_epoch = samples_remaining_to_next_epoch / self.performance_ema.samples_per_second
-
-            # print("return here 1")
 
             return GlobalTrainingProgress(
                 self.local_progress.epoch,
@@ -320,26 +287,16 @@ class DiloCoProgressTracker(ProgressTracker):
 
         total_samples_accumulated = 0
         total_samples_per_second = self.performance_ema.eps
-        # print("total_samples_per_second:", total_samples_per_second)
-
+        
         estimated_time_to_next_epoch = 0
 
         for peer in valid_peer_entries:
-            # print("peer", peer)
             total_samples_per_second += peer.samples_per_second
             if peer.epoch == global_epoch:
-                # cyshin
-                # print("peer.target_batch_size:", peer.target_batch_size)
-                # print("peer.samples_accumulated:", peer.samples_accumulated)                
-                # samples_remaining_to_next_epoch = max(0, self.target_batch_size - peer.samples_accumulated)
                 samples_remaining_to_next_epoch = max(0, peer.target_batch_size - peer.samples_accumulated)
-                # print("samples_remaining_to_next_epoch:", samples_remaining_to_next_epoch)
-                # print("peer.samples_per_second:", peer.samples_per_second)
                 local_eta_next_epoch = samples_remaining_to_next_epoch / peer.samples_per_second
-                # print("local_eta_next_epoch:", local_eta_next_epoch)
 
                 estimated_time_to_next_epoch = max(estimated_time_to_next_epoch, local_eta_next_epoch)
-                # print("estimated_time_to_next_epoch:", estimated_time_to_next_epoch)
 
             # note: we deliberately count only valid peers for samples_accumulated, but all peers for performance;
             # the rationale behind this is that outdated peers will synchronize and begin contributing shortly.
@@ -356,8 +313,6 @@ class DiloCoProgressTracker(ProgressTracker):
             self.status_loglevel,
             f"{self.prefix} has taken {self.local_step} local steps. Peers: {num_peers}, epoch: {self.local_progress.epoch}, steps: {self.real_step}. ETA: {estimated_time_to_next_epoch:.2f}",
         )
-
-        # print("return here 2")
 
         return GlobalTrainingProgress(
             global_epoch,
@@ -540,9 +495,13 @@ class DiLoCoOptimizer(Optimizer):
 
     def _make_gradient_averager(self, **kwargs) -> DiLoCoGradAverager:
         assert hasattr(self, "state_averager"), "must initialize state averager first"
+        print("call _make_gradient_averager")
         grad_averager = DiLoCoGradAverager(
             dht=self.dht,
             prefix=f"{self.run_id}_grad_averager",
+            # cyshin
+            target_group_size=4,
+            bandwidth=100, 
             main_parameters=self.state_averager.main_parameters,
             offloaded_optimizer=self.state_averager.optimizer,
             min_matchmaking_time=self.matchmaking_time,
@@ -639,7 +598,7 @@ class DiLoCoOptimizer(Optimizer):
             self._maybe_schedule_gradient_averaging()
 
             if scaler is not None:
-                print("call scaler.step(self.inner_optimizer)")
+                print(datetime.now().strftime("[%Y-%m-%d %H:%M:%S.%f]"), "call scaler.step(self.inner_optimizer)")
                 scaler.step(self.inner_optimizer)
                 if found_inf_grad(self.inner_optimizer, scaler):
                     logger.log(self.status_loglevel, f"Found inf grad at step {self.tracker.real_step}")
@@ -718,6 +677,7 @@ class DiLoCoOptimizer(Optimizer):
                     wait=True, timeout=self.averaging_timeout, control=self.scheduled_diloco_grads
                 )
                 time_1 = time.perf_counter()
+                print(datetime.now().strftime("[%Y-%m-%d %H:%M:%S.%f]"), f"Time taken for gradient all reduce: {time_1 - time_0} sec")
                 logger.log(
                     self.status_loglevel,
                     f"Time taken for gradient all reduce: {time_1 - time_0} sec",
@@ -848,5 +808,4 @@ class DiLoCoOptimizer(Optimizer):
                 eta_seconds = max(eta_seconds, self.diloco_grad_averager.matchmaking_kwargs["min_matchmaking_time"])
                 logger.log(self.status_loglevel, f"May be Pre-scheduling gradient averaging round in {eta_seconds:.2f} sec")
                 # cyshin
-                # self.scheduled_diloco_grads = self.diloco_grad_averager.schedule_step(timeout=self.averaging_timeout)
                 self.scheduled_diloco_grads = self.diloco_grad_averager.schedule_step(timeout=self.averaging_timeout)

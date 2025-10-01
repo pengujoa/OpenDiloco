@@ -170,7 +170,9 @@ def get_dataloader(tokenizer, world_size, rank, local_rank, config: Config) -> S
     if config.fake_data:
         train_dataset = FakeTokenizedDataset(config.seq_length, TEST_VOCAB_SIZE)
     else:
-        ds = load_dataset(config.dataset_name_or_path, "en", streaming=True, trust_remote_code=True)
+        # dataset NFS로 copy 해오면서 전체 디렉토리 복사 한게 아니어서 이렇게 설정
+        # ds = load_dataset(config.dataset_name_or_path, "en", streaming=True, trust_remote_code=True)
+        ds = load_dataset(config.dataset_name_or_path, "default", streaming=True, trust_remote_code=True)
 
         def tokenize_function(data):
             outputs = tokenizer(
