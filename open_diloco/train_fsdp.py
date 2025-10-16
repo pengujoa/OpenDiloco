@@ -8,13 +8,16 @@ torchrun --nproc_per_node=2 \
 
 from functools import partial
 import os
+import socket
 import time
+import math
 from contextlib import nullcontext
 import datetime
-from typing import Any, Literal
+from typing import Any, Literal, Dict
 
 from pydantic import field_validator, Field
 import torch
+import torch.nn as nn
 from typing import List, Union
 from pydantic_config import parse_argv, BaseConfig
 from datasets import load_dataset
@@ -50,6 +53,7 @@ from hivemind_diloco import AllReduceStrategy, DiLoCoOptimizer
 from open_diloco.utils import WandbLogger, DummyLogger
 
 from hivemind.dht.dht import DHT
+from hivemind.utils import get_dht_time
 from hivemind.utils.networking import log_visible_maddrs
 from hivemind.optim.optimizer import logger
 
@@ -220,6 +224,78 @@ def get_model(config: Config) -> LlamaForCausalLM:
     return model
 
 
+
+def measure_steps_per_second(dev):
+    DUMMY_BATCH_SIZE = 256
+    DUMMY_INPUT_DIM = 4096
+    DUMMY_HIDDEN_DIM = 8192
+    DUMMY_OUTPUT_DIM = 4096
+
+    WARMUP_STEPS = 20
+    BENCHMARK_STEPS = 500
+    
+    model = nn.Sequential(
+        nn.Linear(DUMMY_INPUT_DIM, DUMMY_HIDDEN_DIM),
+        nn.ReLU(),
+        nn.Linear(DUMMY_HIDDEN_DIM, DUMMY_OUTPUT_DIM),
+    ).to(dev, dtype=torch.float16)
+    
+    optimizer = torch.optim.Adam(model.parameters())
+    loss_fn = nn.CrossEntropyLoss()
+    
+    inputs = torch.randn(DUMMY_BATCH_SIZE, DUMMY_INPUT_DIM, device=dev, dtype=torch.float16)
+    targets = torch.randint(0, DUMMY_OUTPUT_DIM, (DUMMY_BATCH_SIZE,), device=dev)
+
+    for _ in range(WARMUP_STEPS):
+        optimizer.zero_grad()
+        outputs = model(inputs)
+        loss = loss_fn(outputs, targets)
+        loss.backward()
+        optimizer.step()
+    torch.cuda.synchronize(dev)
+
+    start = torch.cuda.Event(enable_timing=True)
+    end = torch.cuda.Event(enable_timing=True)
+    
+    start.record()
+    for _ in range(BENCHMARK_STEPS):
+        optimizer.zero_grad()
+        outputs = model(inputs)
+        loss = loss_fn(outputs, targets)
+        loss.backward()
+        optimizer.step()
+    end.record()
+    
+    torch.cuda.synchronize(dev)
+    
+    elapsed_ms = start.elapsed_time(end)
+    elapsed_sec = elapsed_ms / 1000
+    steps_per_sec = BENCHMARK_STEPS / elapsed_sec
+    
+    return steps_per_sec
+
+
+def read_speeds(dht: DHT, key: str) -> Dict[str, float]:
+    res = dht.get(key, latest=True)
+    root = unwrap(res) if res else None
+    speeds: Dict[str, float] = {}
+    if isinstance(root, dict):
+        for k, v in root.items():
+            p = unwrap(v)
+            if isinstance(p, dict):
+                if "steps_per_sec" in p and isinstance(p["steps_per_sec"], (int, float)):
+                    speeds[k] = float(p["steps_per_sec"])
+                elif "v" in p and isinstance(p["v"], (int, float)):
+                    speeds[k] = float(p["v"])
+                elif "step_time_s" in p and isinstance(p["step_time_s"], (int, float)) and p["step_time_s"] > 0:
+                    speeds[k] = 1.0 / float(p["step_time_s"])
+    return speeds
+
+
+def unwrap(v):
+    return getattr(v, "value", v)
+
+
 def train(config: Config):
     sharding_strategy = get_sharding_strategy(config.sharding_strategy)
     local_rank = int(os.environ["LOCAL_RANK"])
@@ -249,6 +325,14 @@ def train(config: Config):
         log("hivemind diloco enabled")
 
     if world_messenger_hv:
+        GPU = int(os.getenv("LOCAL_RANK", "0"))
+        PUBLISH_INTERVAL = 10.0
+        TTL = 30.0
+        RUN_ID = "OpenDiLoCo"
+
+        torch.cuda.set_device(GPU)
+        gpu_name = torch.cuda.get_device_name(GPU)
+
         dht = DHT(
             start=True,
             initial_peers=config.hv.initial_peers,
@@ -256,6 +340,55 @@ def train(config: Config):
             announce_maddrs=config.hv.announce_maddrs,
         )
         log_visible_maddrs(dht.get_visible_maddrs(), only_p2p=False)
+
+        # 1) key
+        key = f"{RUN_ID}:speed"
+        # 2) subkey
+        worker_id = f"{socket.gethostname()}-pid{os.getpid()}-gpu{GPU}"
+        # 3) value
+        steps_per_sec = measure_steps_per_second(GPU)
+        now = get_dht_time()        
+        payload = {
+            "steps_per_sec": float(steps_per_sec), 
+            "ts": now, 
+            "host": socket.gethostname(), 
+            "gpu_id": GPU,
+            "gpu_name": gpu_name
+        }
+        # 4) expiration time
+        exp = now + TTL
+        # 5) store in DHT        
+        ok = dht.store(key=key, subkey=worker_id, value=payload, expiration_time=exp)     
+        # 6) print result 
+        print(f"[publish] {worker_id} ({gpu_name}): {steps_per_sec:.2f} steps/sec ({'ok' if ok else 'fail'})")
+
+        # 1. Read speeds
+        key_speed = f"{RUN_ID}:speed"
+        speeds = read_speeds(dht, key_speed)
+        if not speeds:
+            print(f"[error] no usable speeds at '{key_speed}'. Is the publisher running?")
+            return 2
+
+        # 2. Compute H values
+        vmax = max(speeds.values())
+        print(f"v_max={vmax:.2f}  H_fast=128")
+
+        # 3. Publish results to DHT
+        key_h = f"{RUN_ID}:H"
+        now = get_dht_time()
+        exp = now + TTL
+
+        for k in sorted(speeds, key=speeds.get, reverse=True):
+            rel = speeds[k] / vmax
+            H = int(math.floor(rel * 128))
+
+            payload = {"H": H, "v": speeds[k], "rel": rel, "ts": now}
+            ok = dht.store(key=key_h, subkey=k, value=payload, expiration_time=exp)
+
+            print(f"{k:50s} v={speeds[k]:8.2f}  rel={rel:6.3f}  H={H:3d} ({'ok' if ok else 'fail'})")
+
+        print(f"[done] Published H values under key '{key_h}'")
+
 
     if local_rank == 0:
         check_checkpoint_path_access(config.ckpt.path, rank, config.hv.world_rank if config.hv else None)
