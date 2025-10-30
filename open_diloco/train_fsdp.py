@@ -224,43 +224,64 @@ def get_model(config: Config) -> LlamaForCausalLM:
     return model
 
 
-def measure_steps_per_second(dev):
-    DUMMY_BATCH_SIZE = 256
-    DUMMY_INPUT_DIM = 4096
-    DUMMY_HIDDEN_DIM = 8192
-    DUMMY_OUTPUT_DIM = 4096
-
-    WARMUP_STEPS = 20
-    BENCHMARK_STEPS = 500
+def measure_steps_per_second(dev, batch_size, model_config):
+    """
+    Measure training steps per second using actual LLM attention block.
     
-    model = nn.Sequential(
-        nn.Linear(DUMMY_INPUT_DIM, DUMMY_HIDDEN_DIM),
-        nn.ReLU(),
-        nn.Linear(DUMMY_HIDDEN_DIM, DUMMY_OUTPUT_DIM),
-    ).to(dev, dtype=torch.float16)
+    Args:
+        dev: CUDA device
+        batch_size: per-device training batch size
+        model_config: LlamaConfig object
+    """
+    WARMUP_STEPS = 5      # Reduced from 20 to minimize overhead
+    BENCHMARK_STEPS = 50  # Reduced from 500 to minimize overhead
+    SEQ_LENGTH = 1024     # Sequence length for benchmark
+    
+    # Import LlamaDecoderLayer and RoPE from transformers
+    from transformers.models.llama.modeling_llama import LlamaDecoderLayer, LlamaRotaryEmbedding
+    
+    # Create a single decoder layer (1 attention block) for benchmarking
+    model = LlamaDecoderLayer(model_config, layer_idx=0).to(dev, dtype=torch.float16)
+    
+    # Create RoPE (Rotary Position Embeddings) for position encoding
+    rotary_emb = LlamaRotaryEmbedding(config=model_config).to(dev, dtype=torch.float16)
     
     optimizer = torch.optim.Adam(model.parameters())
-    loss_fn = nn.CrossEntropyLoss()
     
-    inputs = torch.randn(DUMMY_BATCH_SIZE, DUMMY_INPUT_DIM, device=dev, dtype=torch.float16)
-    targets = torch.randint(0, DUMMY_OUTPUT_DIM, (DUMMY_BATCH_SIZE,), device=dev)
-
+    # Create dummy inputs matching LLM format
+    # hidden_states: [batch_size, seq_length, hidden_size]
+    hidden_states = torch.randn(
+        batch_size, SEQ_LENGTH, model_config.hidden_size, 
+        device=dev, dtype=torch.float16
+    )
+    
+    # Create position_ids for RoPE
+    position_ids = torch.arange(SEQ_LENGTH, device=dev).unsqueeze(0).expand(batch_size, -1)
+    
+    # Generate position embeddings (cos, sin) for RoPE
+    position_embeddings = rotary_emb(hidden_states, position_ids)
+    
+    # Warmup phase
     for _ in range(WARMUP_STEPS):
         optimizer.zero_grad()
-        outputs = model(inputs)
-        loss = loss_fn(outputs, targets)
+        outputs = model(hidden_states, position_embeddings=position_embeddings)
+        hidden_output = outputs[0]  # LlamaDecoderLayer returns tuple
+        # Simple loss: mean of outputs
+        loss = hidden_output.mean()
         loss.backward()
         optimizer.step()
     torch.cuda.synchronize(dev)
 
+    # Benchmark phase
     start = torch.cuda.Event(enable_timing=True)
     end = torch.cuda.Event(enable_timing=True)
     
     start.record()
     for _ in range(BENCHMARK_STEPS):
         optimizer.zero_grad()
-        outputs = model(inputs)
-        loss = loss_fn(outputs, targets)
+        outputs = model(hidden_states, position_embeddings=position_embeddings)
+        hidden_output = outputs[0]
+        loss = hidden_output.mean()
         loss.backward()
         optimizer.step()
     end.record()
@@ -295,6 +316,48 @@ def unwrap(v):
     return getattr(v, "value", v)
 
 
+def wait_for_all_nodes_ready(dht: DHT, galaxy_size: int, log_fn):
+    """galaxy_size만큼의 노드가 준비될 때까지 대기"""
+    log_fn("Waiting for all nodes to be ready before starting training...")
+    
+    RUN_ID = "OpenDiLoCo"
+    ready_key = f"{RUN_ID}:ready"
+    worker_id = f"{socket.gethostname()}-pid{os.getpid()}"
+    
+    # 현재 노드의 ready 상태를 DHT에 publish
+    now = get_dht_time()
+    ready_payload = {
+        "ready": True,
+        "ts": now,
+        "host": socket.gethostname()
+    }
+    exp = now + 60.0  # 60초 TTL
+    dht.store(key=ready_key, subkey=worker_id, value=ready_payload, expiration_time=exp)
+    log_fn(f"Published ready state for {worker_id}")
+    
+    # galaxy_size만큼의 노드가 준비될 때까지 대기
+    while True:
+        ready_res = dht.get(ready_key, latest=True)
+        ready_root = unwrap(ready_res) if ready_res else None
+        ready_count = 0
+        
+        if isinstance(ready_root, dict):
+            for k, v in ready_root.items():
+                p = unwrap(v)
+                if isinstance(p, dict) and p.get("ready") is True:
+                    ready_count += 1
+        
+        log_fn(f"Ready nodes: {ready_count}/{galaxy_size}")
+        
+        if ready_count >= galaxy_size:
+            log_fn(f"All {galaxy_size} nodes are ready!")
+            break
+        
+        time.sleep(2.0)  # 2초마다 확인
+    
+    log_fn("All nodes are ready. Starting training loop.")
+
+
 def train(config: Config):
     sharding_strategy = get_sharding_strategy(config.sharding_strategy)
     local_rank = int(os.environ["LOCAL_RANK"])
@@ -323,7 +386,11 @@ def train(config: Config):
     if config.hv is not None:
         log("hivemind diloco enabled")
 
-    if world_messenger_hv:      
+    if world_messenger_hv:
+        # 원래 입력으로 받은 local_steps 값 저장
+        original_local_steps = config.hv.local_steps
+        print(f"[INFO] Original local_steps from input: {original_local_steps}")
+        
         dht = DHT(
             start=True,
             initial_peers=config.hv.initial_peers,
@@ -343,8 +410,14 @@ def train(config: Config):
         torch.cuda.set_device(GPU)
         gpu_name = torch.cuda.get_device_name(GPU)
         worker_id = f"{socket.gethostname()}-pid{os.getpid()}-gpu{GPU}"
-        # 3) measure speed
-        steps_per_sec = measure_steps_per_second(GPU)
+        # 3) Load model config for benchmarking
+        model_config = LlamaConfig.from_pretrained(config.path_model, attn_implementation=config.attn_implementation, resume_download=True)
+        # 4) measure speed using actual batch size and model config
+        print(f"[{worker_id}] Starting speed profiling...")
+        profiling_start_time = time.time()
+        steps_per_sec = measure_steps_per_second(GPU, config.per_device_train_batch_size, model_config)
+        profiling_elapsed_time = time.time() - profiling_start_time
+        print(f"[{worker_id}] Speed profiling completed in {profiling_elapsed_time:.2f} seconds")
         # repeat
         while True:
             # 4) value            
@@ -370,17 +443,57 @@ def train(config: Config):
                 return 2
             if len(speeds) < config.hv.galaxy_size:
                 print(len(speeds), "speeds found, waiting for", config.hv.galaxy_size)
-                time.sleep(PUBLISH_INTERVAL)
+                # 다음 PUBLISH_INTERVAL초 단위 경계까지 대기
+                time_in_cycle = now % PUBLISH_INTERVAL
+                sleep_duration = PUBLISH_INTERVAL - time_in_cycle
+                print(f"[sync] Waiting {sleep_duration:.2f}s until next {PUBLISH_INTERVAL}s boundary")
+                time.sleep(sleep_duration)
             else:
                 break
                 
-        # 9) compute inner (local) steps
-        speed_max = max(speeds.values())
-        print(f"speed_max={speed_max:.2f}")
-        rel = steps_per_sec / speed_max          
-        config.hv.local_steps = int(math.floor(rel * 128))
+        # 9) compute inner (local) steps based on speed distribution
+        # 전체 epoch의 작업량 = 노드 개수 * 원래 local_steps
+        total_work = config.hv.galaxy_size * original_local_steps
+        print(f"[INFO] Total work per epoch: {config.hv.galaxy_size} nodes × {original_local_steps} steps = {total_work} steps")
         
-        print(f"[DEBUG] computed local_steps={config.hv.local_steps} for galaxy_size={config.hv.galaxy_size}")
+        # 모든 노드의 속도를 정렬된 리스트로 변환 (worker_id, speed)
+        sorted_speeds = sorted(speeds.items(), key=lambda x: x[1], reverse=True)  # 속도 내림차순
+        total_speed = sum(speeds.values())
+        print(f"[INFO] Total speed across all nodes: {total_speed:.2f} steps/sec")
+        
+        # 각 노드의 local_steps 할당 계산 (비례 분배)
+        allocations = {}
+        allocated_sum = 0
+        
+        for i, (wid, speed) in enumerate(sorted_speeds):
+            speed_ratio = speed / total_speed
+            if i < len(sorted_speeds) - 1:
+                # 마지막 노드가 아닌 경우 floor 사용
+                allocated_steps = int(math.floor(total_work * speed_ratio))
+                allocated_steps = max(1, allocated_steps)  # 최소 1 step 보장
+            else:
+                # 마지막 노드는 나머지를 모두 할당하여 total_work를 정확히 맞춤
+                allocated_steps = total_work - allocated_sum
+                allocated_steps = max(1, allocated_steps)  # 최소 1 step 보장
+            
+            allocations[wid] = allocated_steps
+            allocated_sum += allocated_steps
+        
+        # 현재 노드의 local_steps 설정
+        config.hv.local_steps = allocations[worker_id]
+        
+        # 검증: 모든 할당량의 합이 total_work와 일치하는지 확인
+        print(f"[INFO] Local steps allocation verification:")
+        print(f"[INFO]   - Total work: {total_work}")
+        print(f"[INFO]   - Sum of allocations: {allocated_sum}")
+        print(f"[INFO]   - Match: {allocated_sum == total_work}")
+        
+        # 현재 노드의 속도 비율
+        speed_ratio = steps_per_sec / total_speed
+        print(f"[INFO] Speed distribution-based local_steps allocation:")
+        print(f"[INFO]   - Current node speed: {steps_per_sec:.2f} steps/sec ({speed_ratio*100:.2f}%)")
+        print(f"[INFO]   - Allocated local_steps: {config.hv.local_steps}")
+        print(f"[INFO]   - Actual contribution: {config.hv.local_steps / total_work * 100:.2f}% of total work")
         print(f"[DEBUG] batch_size={batch_size}, target_batch_size will be={batch_size * config.hv.local_steps}")
     
     # Broadcast local_steps to all ranks to ensure consistency
@@ -566,6 +679,9 @@ def train(config: Config):
         max_num_peers = 0
 
     log_activations = {}
+    
+    # 모든 노드 준비 체크 플래그
+    all_nodes_ready = False
 
     for step, batch in enumerate(iterable=train_dataloader, start=start_step * gradient_accumulation_steps):
         real_step = (step + 1) // gradient_accumulation_steps
@@ -585,6 +701,12 @@ def train(config: Config):
 
         with model.no_sync() if is_accumulating else nullcontext():
             outputs = model(**batch)
+            
+            # 첫 번째 forward pass 후 모든 노드가 준비될 때까지 대기
+            if world_messenger_hv and not all_nodes_ready:
+                wait_for_all_nodes_ready(dht, config.hv.galaxy_size, log)
+                all_nodes_ready = True
+            
             loss = outputs.loss / gradient_accumulation_steps
 
             loss_batch += loss.detach()
