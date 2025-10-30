@@ -416,6 +416,8 @@ def train(config: Config):
                 lora=config.lora,
                 dataset=config.dataset_name_or_path,
             )
+            # Resume 시 local_steps가 변경되었을 수 있으므로 optimizer 내부 상태를 업데이트
+            optimizer.update_num_inner_steps(config.hv.local_steps)
             if config.lora:
                 start_step = 0
             else:

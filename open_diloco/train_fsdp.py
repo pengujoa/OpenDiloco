@@ -224,7 +224,6 @@ def get_model(config: Config) -> LlamaForCausalLM:
     return model
 
 
-
 def measure_steps_per_second(dev):
     DUMMY_BATCH_SIZE = 256
     DUMMY_INPUT_DIM = 4096
@@ -324,15 +323,7 @@ def train(config: Config):
     if config.hv is not None:
         log("hivemind diloco enabled")
 
-    if world_messenger_hv:
-        GPU = int(os.getenv("LOCAL_RANK", "0"))
-        PUBLISH_INTERVAL = 10.0
-        TTL = 30.0
-        RUN_ID = "OpenDiLoCo"
-
-        torch.cuda.set_device(GPU)
-        gpu_name = torch.cuda.get_device_name(GPU)
-
+    if world_messenger_hv:      
         dht = DHT(
             start=True,
             initial_peers=config.hv.initial_peers,
@@ -341,54 +332,65 @@ def train(config: Config):
         )
         log_visible_maddrs(dht.get_visible_maddrs(), only_p2p=False)
 
+        # Measure speeds & compute inner (local) steps
+        PUBLISH_INTERVAL = 10.0
+        TTL = 30.0
         # 1) key
+        RUN_ID = "OpenDiLoCo"
         key = f"{RUN_ID}:speed"
         # 2) subkey
+        GPU = int(os.getenv("LOCAL_RANK", "0"))
+        torch.cuda.set_device(GPU)
+        gpu_name = torch.cuda.get_device_name(GPU)
         worker_id = f"{socket.gethostname()}-pid{os.getpid()}-gpu{GPU}"
-        # 3) value
+        # 3) measure speed
         steps_per_sec = measure_steps_per_second(GPU)
-        now = get_dht_time()        
-        payload = {
-            "steps_per_sec": float(steps_per_sec), 
-            "ts": now, 
-            "host": socket.gethostname(), 
-            "gpu_id": GPU,
-            "gpu_name": gpu_name
-        }
-        # 4) expiration time
-        exp = now + TTL
-        # 5) store in DHT        
-        ok = dht.store(key=key, subkey=worker_id, value=payload, expiration_time=exp)     
-        # 6) print result 
-        print(f"[publish] {worker_id} ({gpu_name}): {steps_per_sec:.2f} steps/sec ({'ok' if ok else 'fail'})")
+        # repeat
+        while True:
+            # 4) value            
+            now = get_dht_time()        
+            payload = {
+                "steps_per_sec": float(steps_per_sec), 
+                "ts": now, 
+                "host": socket.gethostname(), 
+                "gpu_id": GPU,
+                "gpu_name": gpu_name
+            }
+            # 5) expiration time            
+            exp = now + TTL
+            # 6) store in DHT        
+            ok = dht.store(key=key, subkey=worker_id, value=payload, expiration_time=exp)     
+            # 7) print result 
+            print(f"[publish] {worker_id} ({gpu_name}): {steps_per_sec:.2f} steps/sec ({'ok' if ok else 'fail'})")
 
-        # 1. Read speeds
-        key_speed = f"{RUN_ID}:speed"
-        speeds = read_speeds(dht, key_speed)
-        if not speeds:
-            print(f"[error] no usable speeds at '{key_speed}'. Is the publisher running?")
-            return 2
-
-        # 2. Compute H values
-        vmax = max(speeds.values())
-        print(f"v_max={vmax:.2f}  H_fast=128")
-
-        # 3. Publish results to DHT
-        key_h = f"{RUN_ID}:H"
-        now = get_dht_time()
-        exp = now + TTL
-
-        for k in sorted(speeds, key=speeds.get, reverse=True):
-            rel = speeds[k] / vmax
-            H = int(math.floor(rel * 128))
-
-            payload = {"H": H, "v": speeds[k], "rel": rel, "ts": now}
-            ok = dht.store(key=key_h, subkey=k, value=payload, expiration_time=exp)
-
-            print(f"{k:50s} v={speeds[k]:8.2f}  rel={rel:6.3f}  H={H:3d} ({'ok' if ok else 'fail'})")
-
-        print(f"[done] Published H values under key '{key_h}'")
-
+            # 8) read all speeds
+            speeds = read_speeds(dht, key)
+            if not speeds:
+                print(f"[error] no usable speeds at '{key}'. Is the publisher running?")
+                return 2
+            if len(speeds) < config.hv.galaxy_size:
+                print(len(speeds), "speeds found, waiting for", config.hv.galaxy_size)
+                time.sleep(PUBLISH_INTERVAL)
+            else:
+                break
+                
+        # 9) compute inner (local) steps
+        speed_max = max(speeds.values())
+        print(f"speed_max={speed_max:.2f}")
+        rel = steps_per_sec / speed_max          
+        config.hv.local_steps = int(math.floor(rel * 128))
+        
+        print(f"[DEBUG] computed local_steps={config.hv.local_steps} for galaxy_size={config.hv.galaxy_size}")
+        print(f"[DEBUG] batch_size={batch_size}, target_batch_size will be={batch_size * config.hv.local_steps}")
+    
+    # Broadcast local_steps to all ranks to ensure consistency
+    if config.hv is not None:
+        # local_rank 0에서 계산된 값을 모든 rank에 broadcast
+        local_steps_tensor = torch.tensor([config.hv.local_steps], dtype=torch.int32, device='cuda')
+        torch.distributed.broadcast(local_steps_tensor, src=0)
+        config.hv.local_steps = int(local_steps_tensor.item())
+        print(f"[DEBUG] rank={rank}, local_rank={local_rank}: synchronized local_steps={config.hv.local_steps}")
+            
 
     if local_rank == 0:
         check_checkpoint_path_access(config.ckpt.path, rank, config.hv.world_rank if config.hv else None)
@@ -400,29 +402,6 @@ def train(config: Config):
     train_dataloader = get_dataloader(tokenizer, world_size, rank, local_rank, config)
 
     model = get_model(config)
-    # print("BASE MODEL")
-    # for name, param in base_model.named_parameters():
-    #     print(f"{name}: requires_grad={param.requires_grad}")
-    # print("PEFT MODEL")
-    # for name, param in model.named_parameters():
-    #     print(f"{name}: requires_grad={param.requires_grad}")
-    
-    # keys1 = set(name for name, _ in base_model.named_parameters())
-    # keys2 = set(name for name, _ in model.named_parameters())
-
-    # only_in_model1 = keys1 - keys2
-    # only_in_model2 = keys2 - keys1
-
-    # print("🔹 Keys only in model1:", len(keys1))
-    # for key in only_in_model1:
-    #     print(key)
-    
-    # print("\n🔸 Keys only in model2:", len(keys2))
-    # for key in only_in_model2:
-    #     print(key)
-    
-    # print("\n✅ Comparison complete!")
-
     model = model.to(local_rank)
 
     half_precision = config.precision == "fp16-mixed" or config.precision == "bf16-mixed"
@@ -468,9 +447,6 @@ def train(config: Config):
             # We also need to do this on follower workers so that the world_messenger has friends to talk to when it does its two loads
             # Otherwise the world messenger will get lonely and hang
             # params = list(model.parameters())
-            # if lora:
-            #     params = [p for p in params if p.requires_grad]
-            # fake_optimizer = inner_optimizer(params)
             fake_optimizer = inner_optimizer(model.parameters())
             last_loss = load_checkpoint(
                 checkpoint_path=os.path.join(resume_path, get_diloco_rank_dir_name(config.hv.world_rank)),
@@ -514,6 +490,12 @@ def train(config: Config):
             diloco_args["matchmaking_time"] = config.hv.matchmaking_time
 
         optimizer = DiLoCoOptimizer(**diloco_args)
+        
+        print(f"[DEBUG] DiLoCoOptimizer initialized:")
+        print(f"[DEBUG]   num_inner_steps={optimizer.num_inner_steps}")
+        print(f"[DEBUG]   batch_size_per_step={optimizer.batch_size_per_step}")
+        print(f"[DEBUG]   target_batch_size={optimizer.tracker.target_batch_size}")
+        print(f"[DEBUG]   tracker.batch_size={optimizer.tracker.batch_size}")
 
         scheduler = scheduler_fn(
             optimizer.inner_optimizer
@@ -531,15 +513,20 @@ def train(config: Config):
                 lora=config.lora,
                 dataset=config.dataset_name_or_path,
             )
+            # Resume 시 local_steps가 변경되었을 수 있으므로 optimizer 내부 상태를 업데이트
+            optimizer.update_num_inner_steps(config.hv.local_steps)
+            print(f"[DEBUG] After resume and update_num_inner_steps:")
+            print(f"[DEBUG]   num_inner_steps={optimizer.num_inner_steps}")
+            print(f"[DEBUG]   target_batch_size={optimizer.tracker.target_batch_size}")
             if config.lora:
                 start_step = 0
             else:
                 start_step = scheduler.last_epoch
         else:
             start_step = 0
-        # if config.lora:
-        #     model = get_peft_model(model, lora_config)
-        #     print_trainable_parameters(model)
+        if config.lora:
+            model = get_peft_model(model, lora_config)
+            print_trainable_parameters(model)
 
     else:
         optimizer = inner_optimizer(model.parameters())
@@ -558,9 +545,9 @@ def train(config: Config):
             start_step = scheduler.last_epoch
         else:
             start_step = 0
-        # if config.lora:
-        #     model = get_peft_model(model, lora_config)
-        #     print_trainable_parameters(model)
+        if config.lora:
+            model = get_peft_model(model, lora_config)
+            print_trainable_parameters(model)
 
     if resume_from_ckpt:
         log(f"Resumed from checkpoint at step {start_step} with loss {last_loss}")
@@ -617,7 +604,19 @@ def train(config: Config):
             model.clip_grad_norm_(1.0)  # gradient clipping
 
             if world_messenger_hv:
+                if real_step % 10 == 0:  # 10 step마다 로깅
+                    print(f"[DEBUG] Before optimizer.step at real_step={real_step}:")
+                    print(f"[DEBUG]   samples_accumulated={optimizer.tracker.local_progress.samples_accumulated}")
+                    print(f"[DEBUG]   target_batch_size={optimizer.tracker.target_batch_size}")
+                    print(f"[DEBUG]   ready_to_update_epoch={optimizer.tracker.ready_to_update_epoch}")
+                    print(f"[DEBUG]   local_step={optimizer.tracker.local_step}")
+                
                 optimizer.step(scaler=scaler)
+                
+                if real_step % 10 == 0:
+                    print(f"[DEBUG] After optimizer.step:")
+                    print(f"[DEBUG]   samples_accumulated={optimizer.tracker.local_progress.samples_accumulated}")
+                    print(f"[DEBUG]   local_step={optimizer.tracker.local_step}")
 
                 # todo(sami): refactor to use built in pytorch mechanism to handle scaler manually
                 # should allow to just do scaler.step(optimizer)
