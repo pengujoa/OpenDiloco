@@ -224,7 +224,7 @@ def get_model(config: Config) -> LlamaForCausalLM:
     return model
 
 
-def measure_steps_per_second(dev, batch_size, model_config):
+def measure_steps_per_second(dev, batch_size, model_config, precision):
     """
     Measure training steps per second using actual LLM attention block.
     
@@ -232,19 +232,28 @@ def measure_steps_per_second(dev, batch_size, model_config):
         dev: CUDA device
         batch_size: per-device training batch size
         model_config: LlamaConfig object
+        precision: precision setting ("fp16-mixed", "bf16-mixed", "32-true")
     """
     WARMUP_STEPS = 5      # Reduced from 20 to minimize overhead
     BENCHMARK_STEPS = 50  # Reduced from 500 to minimize overhead
     SEQ_LENGTH = 1024     # Sequence length for benchmark
     
+    # Determine dtype based on precision setting
+    if precision == "bf16-mixed":
+        dtype = torch.bfloat16
+    elif precision == "fp16-mixed":
+        dtype = torch.float16
+    else:  # "32-true"
+        dtype = torch.float32
+    
     # Import LlamaDecoderLayer and RoPE from transformers
     from transformers.models.llama.modeling_llama import LlamaDecoderLayer, LlamaRotaryEmbedding
     
     # Create a single decoder layer (1 attention block) for benchmarking
-    model = LlamaDecoderLayer(model_config, layer_idx=0).to(dev, dtype=torch.float16)
+    model = LlamaDecoderLayer(model_config, layer_idx=0).to(dev, dtype=dtype)
     
     # Create RoPE (Rotary Position Embeddings) for position encoding
-    rotary_emb = LlamaRotaryEmbedding(config=model_config).to(dev, dtype=torch.float16)
+    rotary_emb = LlamaRotaryEmbedding(config=model_config).to(dev, dtype=dtype)
     
     optimizer = torch.optim.Adam(model.parameters())
     
@@ -252,7 +261,7 @@ def measure_steps_per_second(dev, batch_size, model_config):
     # hidden_states: [batch_size, seq_length, hidden_size]
     hidden_states = torch.randn(
         batch_size, SEQ_LENGTH, model_config.hidden_size, 
-        device=dev, dtype=torch.float16
+        device=dev, dtype=dtype
     )
     
     # Create position_ids for RoPE
@@ -412,10 +421,10 @@ def train(config: Config):
         worker_id = f"{socket.gethostname()}-pid{os.getpid()}-gpu{GPU}"
         # 3) Load model config for benchmarking
         model_config = LlamaConfig.from_pretrained(config.path_model, attn_implementation=config.attn_implementation, resume_download=True)
-        # 4) measure speed using actual batch size and model config
-        print(f"[{worker_id}] Starting speed profiling...")
+        # 4) measure speed using actual batch size, model config, and precision
+        print(f"[{worker_id}] Starting speed profiling with precision={config.precision}...")
         profiling_start_time = time.time()
-        steps_per_sec = measure_steps_per_second(GPU, config.per_device_train_batch_size, model_config)
+        steps_per_sec = measure_steps_per_second(GPU, config.per_device_train_batch_size, model_config, config.precision)
         profiling_elapsed_time = time.time() - profiling_start_time
         print(f"[{worker_id}] Speed profiling completed in {profiling_elapsed_time:.2f} seconds")
         # repeat
