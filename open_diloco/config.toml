@@ -33,5 +33,5 @@ averaging_timeout = 1800
 skip_load_from_peers = true
 initial_peers = ["$PEER"]
 galaxy_size = 3
-world_rank = ${WORLD_RANK}
+world_rank = "${WORLD_RANK}"
 selective_layer_patterns = ["lm_head"]

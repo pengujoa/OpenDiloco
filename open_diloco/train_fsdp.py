@@ -11,6 +11,7 @@ import os
 import socket
 import time
 import math
+import re
 from contextlib import nullcontext
 import datetime
 from typing import Any, Literal, Dict
@@ -904,13 +905,45 @@ def train(config: Config):
         metric_logger.finish()
 
 
+def expand_env_vars(value: Any) -> Any:
+    """재귀적으로 딕셔너리와 리스트를 순회하며 문자열의 환경 변수를 대체합니다."""
+    if isinstance(value, dict):
+        result = {}
+        for k, v in value.items():
+            expanded = expand_env_vars(v)
+            # 특정 숫자 필드가 문자열로 남아있는 경우 변환 시도
+            if k == "world_rank" and isinstance(expanded, str) and expanded.strip().isdigit():
+                result[k] = int(expanded)
+            elif k in ["galaxy_size", "local_steps", "averaging_timeout", "interval", 
+                      "max_steps", "warmup_steps", "per_device_train_batch_size", 
+                      "total_batch_size"] and isinstance(expanded, str) and expanded.strip().isdigit():
+                result[k] = int(expanded)
+            else:
+                result[k] = expanded
+        return result
+    elif isinstance(value, list):
+        return [expand_env_vars(item) for item in value]
+    elif isinstance(value, str):
+        # 환경 변수 대체: ${VAR} 또는 $VAR 형식
+        # ${VAR} 형식 대체
+        value = re.sub(r'\$\{([^}]+)\}', lambda m: os.environ.get(m.group(1), m.group(0)), value)
+        # $VAR 형식 대체 (단어 경계 확인)
+        value = re.sub(r'\$(\w+)', lambda m: os.environ.get(m.group(1), m.group(0)), value)
+        return value
+    else:
+        return value
+
+
 def load_config_from_toml(toml_path: str) -> dict:
-    """TOML 파일에서 설정을 로드합니다."""
+    """TOML 파일에서 설정을 로드하고 환경 변수를 대체합니다."""
     if tomllib is None:
         raise ImportError("TOML support is not available. Please install 'tomli' or 'toml' package.")
     
     with open(toml_path, "rb") as f:
         config_dict = tomllib.load(f)
+    
+    # 환경 변수 대체
+    config_dict = expand_env_vars(config_dict)
     
     # TOML 파일의 중첩 구조를 그대로 유지
     # pydantic은 중첩된 딕셔너리를 자동으로 처리할 수 있음
