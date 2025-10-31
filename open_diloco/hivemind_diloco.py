@@ -78,6 +78,8 @@ class DiLoCoGradAverager(DecentralizedAverager):
         dht: DHT,
         prefix: str,
         warn: bool = True,
+        param_names: Optional[List[str]] = None,
+        selective_layer_patterns: Optional[List[str]] = None,
         **kwargs,
     ):
         if "client_mode" in kwargs:
@@ -104,6 +106,16 @@ class DiLoCoGradAverager(DecentralizedAverager):
 
         self._new_averaged_grads = False
 
+        # Selective layer update 지원
+        self.param_names = param_names
+        self.selective_layer_patterns = selective_layer_patterns
+        if selective_layer_patterns is not None and param_names is not None:
+            # 파라미터 마스크 생성: 업데이트할 레이어 패턴에 매칭되는 파라미터만 True
+            self.param_update_mask = self._create_param_mask(param_names, selective_layer_patterns)
+            logger.info(f"Selective layer update enabled: {sum(self.param_update_mask)}/{len(self.param_update_mask)} parameters will be updated")
+        else:
+            self.param_update_mask = None
+
         averaged_grads = tuple(grad for grad in self._grads_from_optimizer())
 
         super().__init__(
@@ -115,14 +127,37 @@ class DiLoCoGradAverager(DecentralizedAverager):
             **kwargs,
         )
 
+    def _create_param_mask(self, param_names: List[str], patterns: List[str]) -> List[bool]:
+        """파라미터 이름이 패턴 중 하나라도 매칭되면 True인 마스크 생성"""
+        mask = []
+        for param_name in param_names:
+            matched = False
+            for pattern in patterns:
+                # 패턴이 파라미터 이름의 시작 부분과 매칭되는지 확인
+                if pattern in param_name or param_name.startswith(pattern):
+                    matched = True
+                    break
+            mask.append(matched)
+        return mask
+
     def _grads_from_optimizer(self) -> Iterator[torch.Tensor]:
         """gradient buffers associated optimizer"""
         param_groups = self.offloaded_optimizer.param_groups
+        param_idx = 0
         for param_group in param_groups:
             for param in param_group["params"]:
                 if param.grad is None:
                     param.grad = torch.zeros_like(param)
-                yield param.grad
+                # Selective layer update가 활성화된 경우, 마스크에 따라 gradient 반환
+                if self.param_update_mask is not None:
+                    if self.param_update_mask[param_idx]:
+                        yield param.grad
+                    else:
+                        # 업데이트하지 않을 파라미터는 zero gradient 반환 (all-reduce에서 효과적으로 제외)
+                        yield torch.zeros_like(param.grad)
+                else:
+                    yield param.grad
+                param_idx += 1
 
     def schedule_step(self, scheduled_time: Optional[DHTExpiration] = None, **kwargs) -> StepControl:
 
@@ -203,11 +238,23 @@ class DiLoCoGradAverager(DecentralizedAverager):
         """compute pseudo gradient by subtracting the offloaded optimizer parameters with the main parameters and load them in the averager"""
         opt_parameters = [param for group in self.offloaded_optimizer.param_groups for param in group["params"]]
         with self.get_tensors() as averaged_grads:
+            param_idx = 0
             for opt_param, averaged_grad, main_param in zip(opt_parameters, averaged_grads, self.main_parameters):
                 # opt_param is the param that will be all_reduce, it is suppose to be on cpu
                 # main_param is the param that has been updated by the inner optimizer, it is suppose to be on gpu
-                grad = opt_param.data - main_param.detach().to(opt_param.device)
-                averaged_grad.copy_(grad, non_blocking=True)
+                if self.param_update_mask is not None:
+                    if self.param_update_mask[param_idx]:
+                        # 선택된 레이어만 pseudo gradient 계산
+                        grad = opt_param.data - main_param.detach().to(opt_param.device)
+                        averaged_grad.copy_(grad, non_blocking=True)
+                    else:
+                        # 선택되지 않은 레이어는 zero gradient로 설정 (동기화 안 함)
+                        averaged_grad.zero_()
+                else:
+                    # 모든 레이어 업데이트
+                    grad = opt_param.data - main_param.detach().to(opt_param.device)
+                    averaged_grad.copy_(grad, non_blocking=True)
+                param_idx += 1
 
     def notify_used_averaged_gradients(self):
         """Notify averager that the results of a previous averaging round are accounted for"""
@@ -384,9 +431,22 @@ class DiLoCoOptimizer(Optimizer):
         timeout_waiting_for_peers: float | None = None,
         matchmaking_time: Optional[float] = 15.0,
         lora: bool | None = False,
+        selective_layer_patterns: Optional[List[str]] = None,
+        param_names: Optional[List[str]] = None,
         **kwargs,
     ):
         self._check_kwargs(kwargs)
+        
+        # Selective layer update를 위한 파라미터 이름 수집
+        self.selective_layer_patterns = selective_layer_patterns
+        if selective_layer_patterns is not None:
+            if param_names is None:
+                # param_names가 제공되지 않으면 모델에서 직접 추출 시도
+                # 하지만 여기서는 모델에 직접 접근할 수 없으므로, 나중에 grad_averager 생성 시 전달
+                logger.warning("selective_layer_patterns is provided but param_names is None. Parameter names will be extracted from optimizer.")
+            self.param_names = param_names
+        else:
+            self.param_names = None
 
         if timeout_waiting_for_peers is not None:
             if all_reduce_strategy == AllReduceStrategy.NO_WAIT:
@@ -496,6 +556,18 @@ class DiLoCoOptimizer(Optimizer):
     def _make_gradient_averager(self, **kwargs) -> DiLoCoGradAverager:
         assert hasattr(self, "state_averager"), "must initialize state averager first"
         print("call _make_gradient_averager")
+        
+        # 파라미터 이름 추출 (selective_layer_patterns가 있는 경우)
+        param_names = None
+        if self.selective_layer_patterns is not None:
+            if self.param_names is not None:
+                param_names = self.param_names
+            else:
+                # offloaded optimizer에서 파라미터 이름 추출 시도
+                # 주의: optimizer의 파라미터는 순서가 보장되지만 이름은 직접 저장되지 않음
+                # 따라서 외부에서 param_names를 제공해야 함
+                logger.warning("Cannot extract parameter names from optimizer. Please provide param_names when using selective_layer_patterns.")
+        
         grad_averager = DiLoCoGradAverager(
             dht=self.dht,
             prefix=f"{self.run_id}_grad_averager",
@@ -511,6 +583,8 @@ class DiLoCoOptimizer(Optimizer):
             client_mode=self.client_mode,
             auxiliary=self.auxiliary,
             start=True,
+            param_names=param_names,
+            selective_layer_patterns=self.selective_layer_patterns,
             **kwargs,
         )
         return grad_averager
@@ -784,6 +858,29 @@ class DiLoCoOptimizer(Optimizer):
 
         self.state_averager.optimizer.load_state_dict(state_dict["state_dict_outer"])
         self.inner_optimizer.load_state_dict(state_dict["state_dict_inner"])
+
+    def update_num_inner_steps(self, new_num_inner_steps: int):
+        """Update num_inner_steps across all components (optimizer, state_averager, and tracker)"""
+        if new_num_inner_steps <= 0:
+            raise ValueError(f"num_inner_steps must be positive, got {new_num_inner_steps}")
+        
+        logger.info(f"Updating num_inner_steps from {self.num_inner_steps} to {new_num_inner_steps}")
+        
+        # Update DiLoCoOptimizer's num_inner_steps
+        self.num_inner_steps = new_num_inner_steps
+        
+        # Update DiLoCoStateAverager's num_inner_steps
+        self.state_averager.num_inner_steps = new_num_inner_steps
+        
+        # Update DiloCoProgressTracker's num_inner_steps and target_batch_size
+        self.tracker.num_inner_steps = new_num_inner_steps
+        new_target_batch_size = self.tracker.batch_size * new_num_inner_steps
+        self.tracker.target_batch_size = new_target_batch_size
+        
+        # Update GlobalTrainingProgress's target_batch_size
+        self.tracker.global_progress.target_batch_size = new_target_batch_size
+        
+        logger.info(f"Updated target_batch_size to {new_target_batch_size} (batch_size={self.tracker.batch_size} * num_inner_steps={new_num_inner_steps})")
 
     def update_main_param_after_outer_step(self):
         """Update the main parameters with the inner optimizer step"""
