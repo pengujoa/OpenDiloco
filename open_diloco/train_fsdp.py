@@ -14,12 +14,26 @@ import math
 from contextlib import nullcontext
 import datetime
 from typing import Any, Literal, Dict
+import sys
 
 from pydantic import field_validator, Field
 import torch
 import torch.nn as nn
 from typing import List, Union
 from pydantic_config import parse_argv, BaseConfig
+
+# TOML 파일 파싱 지원
+try:
+    import tomllib  # Python 3.11+
+except ImportError:
+    try:
+        import tomli as tomllib  # Python < 3.11
+    except ImportError:
+        try:
+            import toml as tomllib
+        except ImportError:
+            tomllib = None
+            print("Warning: TOML support not available. Install 'tomli' or 'toml' package for Python < 3.11")
 from datasets import load_dataset
 from datasets.distributed import split_dataset_by_node
 from torch.distributed import destroy_process_group, init_process_group
@@ -120,6 +134,8 @@ class HvConfig(BaseConfig):
     world_rank: int
     galaxy_size: int
     fail_rank_drop: bool = False  # fail if we lose a diloco worker
+    # Selective layer update
+    selective_layer_patterns: list[str] | None = None  # 업데이트할 레이어 패턴 목록 (예: ["model.layers.0", "model.layers.1", "lm_head"])
 
     
     @field_validator('initial_peers', mode='before')
@@ -586,6 +602,24 @@ def train(config: Config):
             ckpt_path = resume_path
 
     if world_messenger_hv:
+        # Selective layer update를 위한 파라미터 이름 추출
+        param_names = None
+        if config.hv.selective_layer_patterns is not None:
+            # 모델에서 파라미터 이름 추출 (trainable 파라미터만)
+            if config.lora:
+                # LoRA의 경우 trainable 파라미터만 추출
+                param_names = [name for name, param in model.named_parameters() if param.requires_grad]
+            else:
+                # 모든 파라미터 이름 추출
+                param_names = [name for name, _ in model.named_parameters()]
+            log(f"Extracted {len(param_names)} parameter names for selective layer update")
+            if config.hv.selective_layer_patterns:
+                matched_count = sum(
+                    1 for name in param_names 
+                    if any(pattern in name or name.startswith(pattern) for pattern in config.hv.selective_layer_patterns)
+                )
+                log(f"Patterns {config.hv.selective_layer_patterns} match {matched_count}/{len(param_names)} parameters")
+        
         diloco_args = dict(
             dht=dht,
             run_id="llama",
@@ -601,6 +635,8 @@ def train(config: Config):
             all_reduce_strategy=config.hv.all_reduce_strategy,
             timeout_waiting_for_peers=config.hv.timeout_waiting_for_peers,
             lora=config.lora,
+            selective_layer_patterns=config.hv.selective_layer_patterns,
+            param_names=param_names,
         )
 
         diloco_args.update(get_compression_kwargs(config.hv.hivemind_compression))
@@ -868,12 +904,86 @@ def train(config: Config):
         metric_logger.finish()
 
 
+def load_config_from_toml(toml_path: str) -> dict:
+    """TOML 파일에서 설정을 로드합니다."""
+    if tomllib is None:
+        raise ImportError("TOML support is not available. Please install 'tomli' or 'toml' package.")
+    
+    with open(toml_path, "rb") as f:
+        config_dict = tomllib.load(f)
+    
+    # TOML 파일의 중첩 구조를 그대로 유지
+    # pydantic은 중첩된 딕셔너리를 자동으로 처리할 수 있음
+    return config_dict
+
+
+def merge_config_args(config_file: str | None = None) -> dict:
+    """TOML 파일과 명령줄 인자를 병합합니다."""
+    # 명령줄 인자에서 --config 옵션 제거
+    original_argv = sys.argv.copy()
+    config_file_from_argv = None
+    
+    if "--config" in sys.argv:
+        config_idx = sys.argv.index("--config")
+        if config_idx + 1 < len(sys.argv):
+            config_file_from_argv = sys.argv[config_idx + 1]
+            # --config와 그 값 제거 (parse_argv에서 처리되지 않도록)
+            sys.argv.pop(config_idx + 1)
+            sys.argv.pop(config_idx)
+    
+    # 최종 config_file 결정
+    final_config_file = config_file or config_file_from_argv
+    
+    config_dict = {}
+    
+    # TOML 파일 로드
+    if final_config_file:
+        if not os.path.exists(final_config_file):
+            raise FileNotFoundError(f"Config file not found: {final_config_file}")
+        toml_config = load_config_from_toml(final_config_file)
+        config_dict = toml_config
+    
+    # 명령줄 인자 파싱
+    try:
+        argv_config = parse_argv()
+        
+        # parse_argv()가 반환한 'config' 키는 Config 클래스에 없으므로 제거
+        if 'config' in argv_config:
+            del argv_config['config']
+        
+        # 명령줄 인자가 TOML 설정을 덮어씀
+        # 하지만 중첩 구조를 고려하여 병합해야 함
+        def deep_merge(base: dict, override: dict) -> dict:
+            """중첩된 딕셔너리를 재귀적으로 병합"""
+            result = base.copy()
+            for key, value in override.items():
+                if key in result and isinstance(result[key], dict) and isinstance(value, dict):
+                    result[key] = deep_merge(result[key], value)
+                else:
+                    result[key] = value
+            return result
+        
+        if config_dict:
+            config_dict = deep_merge(config_dict, argv_config)
+        else:
+            config_dict = argv_config
+    finally:
+        # sys.argv 복원
+        sys.argv = original_argv
+    
+    return config_dict
+
+
 if __name__ == "__main__":
     # Allow eager fallback during production so that that the training runs dont die
     # However, in development, we want to know that we broke torch compile
     torch._dynamo.config.suppress_errors = "PRIME_INTELLECT_DEV" not in os.environ
     torch.set_float32_matmul_precision("high")
     ddp_setup()
-    config = Config(**parse_argv())
+    
+    # TOML 파일과 명령줄 인자 병합 (--config 옵션이 있으면 자동으로 처리)
+    config_dict = merge_config_args()
+    config = Config(**config_dict)
+    
     train(config)
     destroy_process_group()
