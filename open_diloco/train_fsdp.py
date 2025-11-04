@@ -1013,11 +1013,17 @@ if __name__ == "__main__":
     config_dict = merge_config_args()
     config = Config(**config_dict)
     
-    # Batch size 탐색 모드인 경우, 추정 후 종료
+    # Batch size 탐색 모드인 경우, 추정 후 학습 진행
     if config.find_max_batch_size:
-        find_max_batch_size_for_model(config)
-        destroy_process_group()
-        exit(0)
+        max_batch_size = find_max_batch_size_for_model(config)
+        if max_batch_size is None:
+            print("Batch size 탐색에 실패했습니다. 종료합니다.")
+            destroy_process_group()
+            exit(1)
+        
+        # 추정된 batch size를 설정에 적용
+        print(f"\n추정된 batch size ({max_batch_size})를 학습에 적용합니다.")
+        config.per_device_train_batch_size = max_batch_size
     
     train(config)
     destroy_process_group()

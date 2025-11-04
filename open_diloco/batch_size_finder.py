@@ -3,10 +3,18 @@ OoM을 발생시키지 않는 최대 batch_size를 탐색하는 모듈
 Accelerate의 메모리 추정기를 사용하여 batch size를 자동으로 찾습니다.
 """
 
-import re
-import subprocess
 from dataclasses import dataclass
 from typing import Optional
+
+try:
+    # Accelerate의 estimate 모듈에서 필요한 함수들을 import
+    from accelerate.commands.estimate import gather_data
+except ImportError:
+    try:
+        # 대안: 다른 경로에서 시도
+        from accelerate.estimator import gather_data
+    except ImportError:
+        gather_data = None
 
 
 @dataclass
@@ -18,31 +26,43 @@ class MemoryEstimate:
     training_adam_mb: float
 
 
-def parse_size_to_mb(size_str: str) -> float:
-    """크기 문자열을 MB 단위로 변환 (예: "418.18 MB" -> 418.18)"""
-    size_str = size_str.strip()
+def get_available_gpu_memory_gb(device_id: int = 0) -> float:
+    """
+    GPU의 사용 가능한 메모리를 GB 단위로 반환합니다.
     
-    # 숫자 부분 추출
-    match = re.search(r'([\d.]+)', size_str)
-    if not match:
-        return 0.0
+    Args:
+        device_id: GPU 디바이스 ID (기본값: 0)
     
-    value = float(match.group(1))
+    Returns:
+        사용 가능한 GPU 메모리 (GB)
     
-    # 단위 변환
-    if 'GB' in size_str.upper():
-        return value * 1024
-    elif 'TB' in size_str.upper():
-        return value * 1024 * 1024
-    elif 'KB' in size_str.upper():
-        return value / 1024
-    else:  # MB
-        return value
+    Raises:
+        RuntimeError: GPU를 사용할 수 없거나 메모리 정보를 가져올 수 없는 경우
+    """
+    import torch
+    
+    if not torch.cuda.is_available():
+        raise RuntimeError("CUDA를 사용할 수 없습니다.")
+    
+    # 사용 가능한 메모리 가져오기 (free, total)
+    free_memory_bytes, total_memory_bytes = torch.cuda.mem_get_info(device_id)
+    # 총 메모리를 GB로 변환하여 가용 메모리로 사용
+    available_memory_gb = total_memory_bytes / (1024 ** 3)
+    
+    if available_memory_gb <= 0:
+        raise RuntimeError(f"GPU {device_id}의 사용 가능한 메모리가 0입니다.")
+    
+    return available_memory_gb
+
+
+def bytes_to_mb(bytes_value: int | float) -> float:
+    """바이트를 MB로 변환"""
+    return bytes_value / (1024 ** 2)
 
 
 def estimate_model_memory(model_name: str, library_name: Optional[str] = None) -> dict[str, MemoryEstimate]:
     """
-    Accelerate를 사용하여 모델의 메모리 사용량을 추정합니다.
+    Accelerate의 gather_data를 사용하여 모델의 메모리 사용량을 추정합니다.
     
     Args:
         model_name: 모델 이름 (예: "bert-base-cased", "PrimeIntellect/llama-150m-fresh")
@@ -50,63 +70,80 @@ def estimate_model_memory(model_name: str, library_name: Optional[str] = None) -
     
     Returns:
         dtype별 메모리 추정 결과 딕셔너리
-    """
-    cmd = ["accelerate", "estimate-memory", model_name]
     
-    if library_name:
-        cmd.extend(["--library_name", library_name])
+    Raises:
+        ImportError: Accelerate가 설치되어 있지 않거나 gather_data를 import할 수 없는 경우
+        RuntimeError: 메모리 추정에 실패한 경우
+    """
+    if gather_data is None:
+        raise ImportError("Accelerate의 gather_data를 import할 수 없습니다. Accelerate가 설치되어 있는지 확인하세요.")
     
     try:
-        result = subprocess.run(cmd, capture_output=True, text=True, check=True)
-        output = result.stdout
+        # gather_data 호출하여 메모리 정보 수집
+        memory_data = gather_data(
+            model_name=model_name,
+            library_name=library_name,
+            trust_remote_code=False,
+        )
         
-        print(f"Accelerate 출력:\n{output}\n")
+        if not memory_data:
+            raise ValueError("메모리 추정 데이터가 비어있습니다.")
         
-        # 결과 파싱
+        # gather_data가 반환하는 데이터 구조를 파싱
         estimates = {}
-        lines = output.split('\n')
         
-        # 헤더 라인 찾기
-        header_idx = None
-        for i, line in enumerate(lines):
-            if '| dtype' in line and 'Largest Layer' in line:
-                header_idx = i
-                break
+        # gather_data의 반환 구조에 따라 처리
+        # 일반적으로 리스트나 딕셔너리 형태로 반환됩니다
+        if isinstance(memory_data, dict):
+            # 딕셔너리인 경우: dtype을 키로 사용
+            for dtype, data in memory_data.items():
+                if isinstance(data, dict):
+                    estimates[dtype] = MemoryEstimate(
+                        dtype=dtype,
+                        largest_layer_mb=bytes_to_mb(data.get("largest_layer", data.get("largest_layer_bytes", 0))),
+                        total_size_mb=bytes_to_mb(data.get("total_size", data.get("total_size_bytes", 0))),
+                        training_adam_mb=bytes_to_mb(data.get("training_adam", data.get("training_adam_bytes", 0))),
+                    )
+                elif hasattr(data, 'largest_layer') or hasattr(data, 'largest_layer_bytes'):
+                    # dataclass나 namedtuple인 경우
+                    largest = getattr(data, 'largest_layer', None) or getattr(data, 'largest_layer_bytes', 0)
+                    total = getattr(data, 'total_size', None) or getattr(data, 'total_size_bytes', 0)
+                    training = getattr(data, 'training_adam', None) or getattr(data, 'training_adam_bytes', 0)
+                    estimates[dtype] = MemoryEstimate(
+                        dtype=dtype,
+                        largest_layer_mb=bytes_to_mb(largest),
+                        total_size_mb=bytes_to_mb(total),
+                        training_adam_mb=bytes_to_mb(training),
+                    )
+        elif isinstance(memory_data, list):
+            # 리스트인 경우: 각 요소를 처리
+            for item in memory_data:
+                dtype = item.get("dtype") if isinstance(item, dict) else getattr(item, "dtype", "float32")
+                if isinstance(item, dict):
+                    estimates[dtype] = MemoryEstimate(
+                        dtype=dtype,
+                        largest_layer_mb=bytes_to_mb(item.get("largest_layer", item.get("largest_layer_bytes", 0))),
+                        total_size_mb=bytes_to_mb(item.get("total_size", item.get("total_size_bytes", 0))),
+                        training_adam_mb=bytes_to_mb(item.get("training_adam", item.get("training_adam_bytes", 0))),
+                    )
+                else:
+                    largest = getattr(item, 'largest_layer', None) or getattr(item, 'largest_layer_bytes', 0)
+                    total = getattr(item, 'total_size', None) or getattr(item, 'total_size_bytes', 0)
+                    training = getattr(item, 'training_adam', None) or getattr(item, 'training_adam_bytes', 0)
+                    estimates[dtype] = MemoryEstimate(
+                        dtype=dtype,
+                        largest_layer_mb=bytes_to_mb(largest),
+                        total_size_mb=bytes_to_mb(total),
+                        training_adam_mb=bytes_to_mb(training),
+                    )
         
-        if header_idx is None:
-            raise ValueError("메모리 추정 결과를 찾을 수 없습니다")
-        
-        # 데이터 라인 파싱
-        for i in range(header_idx + 2, len(lines)):
-            line = lines[i].strip()
-            if not line or not line.startswith('|'):
-                continue
-            
-            parts = [p.strip() for p in line.split('|')]
-            if len(parts) < 5:
-                continue
-            
-            dtype = parts[1].strip()
-            if dtype not in ['float32', 'float16', 'int8', 'int4']:
-                continue
-            
-            estimates[dtype] = MemoryEstimate(
-                dtype=dtype,
-                largest_layer_mb=parse_size_to_mb(parts[2]),
-                total_size_mb=parse_size_to_mb(parts[3]),
-                training_adam_mb=parse_size_to_mb(parts[4])
-            )
+        if not estimates:
+            raise ValueError("메모리 추정 결과를 파싱할 수 없습니다. gather_data의 반환 구조를 확인하세요.")
         
         return estimates
-    
-    except subprocess.CalledProcessError as e:
-        print(f"Accelerate 실행 오류: {e}")
-        print(f"출력: {e.stdout}")
-        print(f"오류: {e.stderr}")
-        return {}
+        
     except Exception as e:
-        print(f"메모리 추정 중 오류 발생: {e}")
-        return {}
+        raise RuntimeError(f"메모리 추정 실패: {e}")
 
 
 def calculate_max_batch_size(
@@ -115,7 +152,7 @@ def calculate_max_batch_size(
     seq_length: int,
     num_gpus: int = 1,
     precision_bits: int = 16,
-    safety_margin: float = 0.2
+    safety_margin: float = 0.05
 ) -> int:
     """
     주어진 GPU 메모리에서 실행 가능한 최대 batch size를 계산합니다.
@@ -126,7 +163,7 @@ def calculate_max_batch_size(
         seq_length: 시퀀스 길이
         num_gpus: GPU 개수
         precision_bits: 정밀도 비트 (16 또는 32)
-        safety_margin: 안전 여유율 (기본 20%)
+        safety_margin: 안전 여유율 (기본 5%)
     
     Returns:
         최대 per-device batch size
@@ -143,14 +180,11 @@ def calculate_max_batch_size(
     # batch에 할당 가능한 메모리
     batch_memory_mb = usable_memory_mb - model_memory_mb - optimizer_memory_mb
     
-    # 각 샘플의 메모리 계산 (중복 계산으로 추정)
-    # 활성화 메모리: (hidden_size * num_layers * seq_length * batch_size)
-    # 정확한 계산을 위해 추정치 사용
+    # 각 샘플의 메모리 계산
     bytes_per_param = precision_bits / 8
     estimated_memory_per_sample_mb = (model_memory_mb * bytes_per_param * seq_length) / (1000 * 1000)
     
     # 한 샘플당 약 2-4배의 활성화 메모리 고려
-    # LLM의 경우 forward pass에서 여러 중간 활성화가 필요하므로
     activation_memory_multiplier = 3.0
     total_memory_per_sample_mb = estimated_memory_per_sample_mb * activation_memory_multiplier
     
@@ -164,36 +198,51 @@ def calculate_max_batch_size(
     return max_batch_size
 
 
-def find_max_batch_size_for_model(config) -> None:
+def find_max_batch_size_for_model(config) -> int | None:
     """
-    OoM 없이 실행 가능한 최대 batch size를 탐색하고 출력합니다.
+    OoM 없이 실행 가능한 최대 batch size를 탐색하고 반환합니다.
     
     Args:
         config: Config 설정 객체
+    
+    Returns:
+        추정된 최대 per-device batch size. 실패 시 None 반환
     """
     print("=" * 80)
     print("최대 Batch Size 탐색 도구")
     print("=" * 80)
     print(f"모델: {config.path_model}")
     
+    # GPU 메모리 자동 감지
     if config.available_gpu_memory_gb is None:
-        print("오류: --available-gpu-memory-gb 옵션을 지정해야 합니다.")
-        print("예: --available-gpu-memory-gb 24.0")
-        return
+        print("\nGPU 메모리 자동 감지 중...")
+        try:
+            available_gpu_memory_gb = get_available_gpu_memory_gb(device_id=0)
+            print(f"감지된 사용 가능한 GPU 메모리: {available_gpu_memory_gb:.2f} GB")
+        except RuntimeError as e:
+            print(f"오류: GPU 메모리 자동 감지 실패: {e}")
+            print("--available-gpu-memory-gb 옵션을 수동으로 지정하세요.")
+            print("예: --available-gpu-memory-gb 24.0")
+            return None
+    else:
+        available_gpu_memory_gb = config.available_gpu_memory_gb
     
-    print(f"사용 가능한 GPU 메모리: {config.available_gpu_memory_gb} GB")
+    print(f"사용 가능한 GPU 메모리: {available_gpu_memory_gb:.2f} GB")
     print(f"시퀀스 길이: {config.seq_length}")
     print(f"정밀도: {config.precision}")
     print("=" * 80)
     
     # 1. 모델 메모리 추정
     print("\n1단계: 모델 메모리 추정 중...")
-    estimates = estimate_model_memory(config.path_model)
+    try:
+        estimates = estimate_model_memory(config.path_model)
+    except (ImportError, RuntimeError) as e:
+        print(f"메모리 추정에 실패했습니다: {e}")
+        return None
     
     if not estimates:
-        print("메모리 추정에 실패했습니다. Accelerate가 설치되어 있는지 확인하세요.")
-        print("설치: pip install accelerate")
-        return
+        print("메모리 추정 결과가 비어있습니다.")
+        return None
     
     # 2. precision에 맞는 dtype 선택
     dtype_map = {
@@ -216,7 +265,7 @@ def find_max_batch_size_for_model(config) -> None:
     print("\n2단계: 최대 batch size 계산 중...")
     max_batch = calculate_max_batch_size(
         model_memory_mb=model_memory.training_adam_mb,
-        available_gpu_memory_gb=config.available_gpu_memory_gb,
+        available_gpu_memory_gb=available_gpu_memory_gb,
         seq_length=config.seq_length,
         num_gpus=1,  # per-device 기준으로 계산
         precision_bits=precision_bits,
@@ -233,4 +282,5 @@ def find_max_batch_size_for_model(config) -> None:
     print("\n권장 batch size 설정:")
     print(f"  per_device_train_batch_size: {max_batch}")
     print("=" * 80)
-
+    
+    return max_batch
