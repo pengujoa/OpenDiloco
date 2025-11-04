@@ -79,6 +79,8 @@ from open_diloco.utils import (
     get_sharding_strategy,
     register_metrics_hooks,
 )
+from open_diloco.batch_size_finder import find_max_batch_size_for_model
+from open_diloco.speed_profiler import measure_steps_per_second
 
 from peft import get_peft_model, LoraConfig, TaskType
 
@@ -108,6 +110,72 @@ def print_trainable_parameters(model):
     print(
         f"trainable params: {trainable_params} || all params: {all_param} || trainable%: {100 * trainable_params / all_param:.2f}"
     )
+
+
+def print_all_parameter_names(model, rank: int = 0, print_all: bool = False):
+    """디버그용: 모델의 모든 파라미터 이름을 출력합니다."""
+    if rank != 0 and not print_all:
+        return
+    
+    print("\n" + "="*80)
+    print("MODEL PARAMETER NAMES (DEBUG)")
+    print("="*80)
+    
+    param_names = []
+    layer_groups = {}
+    
+    for name, param in model.named_parameters():
+        param_names.append(name)
+        # 레이어 그룹화
+        if 'layers.' in name:
+            layer_idx = name.split('layers.')[1].split('.')[0]
+            if layer_idx not in layer_groups:
+                layer_groups[layer_idx] = []
+            layer_groups[layer_idx].append(name)
+        else:
+            if 'root' not in layer_groups:
+                layer_groups['root'] = []
+            layer_groups['root'].append(name)
+    
+    print(f"\nTotal parameters: {len(param_names)}")
+    
+    # 레이어별로 그룹 출력 (숫자 순서로 정렬)
+    print("\n--- By Layer Groups ---")
+    
+    # 레이어 키를 숫자와 문자열로 분리하여 정렬
+    def sort_key(key):
+        if key == 'root':
+            return (-1, 'root')  # root는 가장 앞에
+        try:
+            return (int(key), '')  # 숫자로 변환 가능한 경우
+        except ValueError:
+            return (999999, key)  # 숫자가 아닌 경우 뒤로
+    
+    sorted_keys = sorted(layer_groups.keys(), key=sort_key)
+    
+    for layer_key in sorted_keys:
+        if layer_key == 'root':
+            print(f"\n[Root/Embedding/Head]: {len(layer_groups[layer_key])} params")
+        else:
+            print(f"\n[Layer {layer_key}]: {len(layer_groups[layer_key])} params")
+        for name in sorted(layer_groups[layer_key]):  # 각 그룹 내에서도 정렬
+            print(f"  {name}")
+    
+    # 선택적 레이어 업데이트를 위한 패턴 예시
+    print("\n--- Example Selective Layer Patterns ---")
+    print("First layer: ['model.layers.0']")
+    print("First two layers: ['model.layers.0', 'model.layers.1']")
+    print("Output head: ['lm_head']")
+    print("Embedding + Output: ['model.embed_tokens', 'lm_head']")
+    
+    # 전체 파라미터 이름 목록
+    print("\n--- All Parameter Names ---")
+    for i, name in enumerate(param_names):
+        print(f"{i+1:3d}. {name}")
+    
+    print("="*80 + "\n")
+    
+    return param_names
 
 
 # Function to initialize the distributed process group
@@ -178,6 +246,9 @@ class Config(BaseConfig):
     node_gpu_counts: list[int] = Field(..., description="List of GPU counts per node. Must be provided.") # List to store GPU counts per node
     # Lora
     lora: bool | None = False
+    # Batch size finder
+    find_max_batch_size: bool = False  # If True, estimate max batch size using Accelerate and exit
+    available_gpu_memory_gb: float | None = None  # Available GPU memory in GB for batch size estimation
 
     @field_validator('node_gpu_counts', mode='before')
     def _parse_str_to_int_list(cls, v):
@@ -239,86 +310,6 @@ def get_model(config: Config) -> LlamaForCausalLM:
         model = get_peft_model(model, lora_config)
         print_trainable_parameters(model)
     return model
-
-
-def measure_steps_per_second(dev, batch_size, model_config, precision):
-    """
-    Measure training steps per second using actual LLM attention block.
-    
-    Args:
-        dev: CUDA device
-        batch_size: per-device training batch size
-        model_config: LlamaConfig object
-        precision: precision setting ("fp16-mixed", "bf16-mixed", "32-true")
-    """
-    WARMUP_STEPS = 5      # Reduced from 20 to minimize overhead
-    BENCHMARK_STEPS = 50  # Reduced from 500 to minimize overhead
-    SEQ_LENGTH = 1024     # Sequence length for benchmark
-    
-    # Determine dtype based on precision setting
-    if precision == "bf16-mixed":
-        dtype = torch.bfloat16
-    elif precision == "fp16-mixed":
-        dtype = torch.float16
-    else:  # "32-true"
-        dtype = torch.float32
-    
-    # Import LlamaDecoderLayer and RoPE from transformers
-    from transformers.models.llama.modeling_llama import LlamaDecoderLayer, LlamaRotaryEmbedding
-    
-    # Create a single decoder layer (1 attention block) for benchmarking
-    model = LlamaDecoderLayer(model_config, layer_idx=0).to(dev, dtype=dtype)
-    
-    # Create RoPE (Rotary Position Embeddings) for position encoding
-    rotary_emb = LlamaRotaryEmbedding(config=model_config).to(dev, dtype=dtype)
-    
-    optimizer = torch.optim.Adam(model.parameters())
-    
-    # Create dummy inputs matching LLM format
-    # hidden_states: [batch_size, seq_length, hidden_size]
-    hidden_states = torch.randn(
-        batch_size, SEQ_LENGTH, model_config.hidden_size, 
-        device=dev, dtype=dtype
-    )
-    
-    # Create position_ids for RoPE
-    position_ids = torch.arange(SEQ_LENGTH, device=dev).unsqueeze(0).expand(batch_size, -1)
-    
-    # Generate position embeddings (cos, sin) for RoPE
-    position_embeddings = rotary_emb(hidden_states, position_ids)
-    
-    # Warmup phase
-    for _ in range(WARMUP_STEPS):
-        optimizer.zero_grad()
-        outputs = model(hidden_states, position_embeddings=position_embeddings)
-        hidden_output = outputs[0]  # LlamaDecoderLayer returns tuple
-        # Simple loss: mean of outputs
-        loss = hidden_output.mean()
-        loss.backward()
-        optimizer.step()
-    torch.cuda.synchronize(dev)
-
-    # Benchmark phase
-    start = torch.cuda.Event(enable_timing=True)
-    end = torch.cuda.Event(enable_timing=True)
-    
-    start.record()
-    for _ in range(BENCHMARK_STEPS):
-        optimizer.zero_grad()
-        outputs = model(hidden_states, position_embeddings=position_embeddings)
-        hidden_output = outputs[0]
-        loss = hidden_output.mean()
-        loss.backward()
-        optimizer.step()
-    end.record()
-    
-    torch.cuda.synchronize(dev)
-    
-    elapsed_ms = start.elapsed_time(end)
-    elapsed_sec = elapsed_ms / 1000
-    steps_per_sec = BENCHMARK_STEPS / elapsed_sec
-    
-    return steps_per_sec
 
 
 def read_speeds(dht: DHT, key: str) -> Dict[str, float]:
@@ -542,6 +533,10 @@ def train(config: Config):
 
     model = get_model(config)
     model = model.to(local_rank)
+
+    # 디버그: 파라미터 이름 출력 (FSDP 래핑 전에)
+    if rank == 0:
+        print_all_parameter_names(model, rank=rank)
 
     half_precision = config.precision == "fp16-mixed" or config.precision == "bf16-mixed"
     half_precision_dtype = torch.bfloat16 if config.precision == "bf16-mixed" else torch.float16
@@ -1017,6 +1012,12 @@ if __name__ == "__main__":
     # TOML 파일과 명령줄 인자 병합 (--config 옵션이 있으면 자동으로 처리)
     config_dict = merge_config_args()
     config = Config(**config_dict)
+    
+    # Batch size 탐색 모드인 경우, 추정 후 종료
+    if config.find_max_batch_size:
+        find_max_batch_size_for_model(config)
+        destroy_process_group()
+        exit(0)
     
     train(config)
     destroy_process_group()
