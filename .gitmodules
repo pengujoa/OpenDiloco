@@ -5,3 +5,6 @@
 [submodule "pydantic_config"]
 	path = pydantic_config
 	url = https://github.com/samsja/pydantic_config.git
+[submodule "max_bs"]
+	path = max_bs
+	url = https://github.com/kangtegong/max_bs.git
