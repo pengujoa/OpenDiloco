@@ -1,15 +1,33 @@
-from typing import Optional, Union
+from typing import Optional, Union, Any
 from pathlib import Path
 import os
+import sys
 
 try:
     import torch
 except ImportError:
     torch = None
 
-from max_bs import BatchEstimator, EstimationConfig, ModelConfig
-from max_bs.model_io import resolve_model_dir, extract_model_specs
-from max_bs.utils import bytes_to_gb
+# max_bs 모듈을 찾기 위해 프로젝트 루트를 sys.path에 추가
+_current_file = Path(__file__).resolve()
+_project_root = _current_file.parent.parent
+if str(_project_root) not in sys.path:
+    sys.path.insert(0, str(_project_root))
+
+# max_bs 디렉토리도 sys.path에 추가 (max_bs/max_bs/run.py에서 사용하는 방식과 동일)
+_max_bs_dir = _project_root / "max_bs"
+if str(_max_bs_dir) not in sys.path:
+    sys.path.insert(0, str(_max_bs_dir))
+
+try:
+    from max_bs import BatchEstimator, EstimationConfig, ModelConfig
+    from max_bs.model_io import resolve_model_dir, extract_model_specs
+    from max_bs.utils import bytes_to_gb
+except ImportError:
+    # fallback: max_bs.max_bs에서 직접 import
+    from max_bs.max_bs import BatchEstimator, EstimationConfig, ModelConfig
+    from max_bs.max_bs.model_io import resolve_model_dir, extract_model_specs
+    from max_bs.max_bs.utils import bytes_to_gb
 
 
 def _convert_precision(precision: str) -> str:
@@ -91,11 +109,8 @@ def find_max_batch_size_for_model(
             gpu_mem_per_device_gb = 80.0
             print(f"GPU 메모리 자동 감지 실패, 기본값 사용: {gpu_mem_per_device_gb:.2f} GB")
     
-    # 모델 디렉토리 해결
-    model_dir = resolve_model_dir(model_path)
-    
-    # 모델 스펙 추출
-    param_count, hidden_size, num_layers, seq_len_cfg = extract_model_specs(model_dir)
+    # 모델 스펙 추출 (model_path를 직접 전달, Hugging Face 모델 ID 또는 로컬 경로 모두 처리)
+    param_count, hidden_size, num_layers, seq_len_cfg = extract_model_specs(model_path)
     
     # 시퀀스 길이 결정
     if sequence_length is None:
