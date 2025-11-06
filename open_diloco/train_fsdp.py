@@ -79,8 +79,8 @@ from open_diloco.utils import (
     get_sharding_strategy,
     register_metrics_hooks,
 )
-from open_diloco.batch_size_finder import find_max_batch_size_for_model
-from open_diloco.speed_profiler import measure_steps_per_second
+from batch_size_finder import find_max_batch_size_for_model
+from speed_profiler import measure_steps_per_second
 
 from peft import get_peft_model, LoraConfig, TaskType
 
@@ -248,7 +248,6 @@ class Config(BaseConfig):
     lora: bool | None = False
     # Batch size finder
     find_max_batch_size: bool = False  # If True, estimate max batch size using Accelerate and exit
-    available_gpu_memory_gb: float | None = None  # Available GPU memory in GB for batch size estimation
 
     @field_validator('node_gpu_counts', mode='before')
     def _parse_str_to_int_list(cls, v):
@@ -1016,7 +1015,7 @@ if __name__ == "__main__":
     # Batch size 탐색 모드인 경우, 추정 후 학습 진행
     if config.find_max_batch_size:
         max_batch_size = find_max_batch_size_for_model(config)
-        if max_batch_size is None:
+        if max_batch_size is None or max_batch_size <= 0:
             print("Batch size 탐색에 실패했습니다. 종료합니다.")
             destroy_process_group()
             exit(1)
