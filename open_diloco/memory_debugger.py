@@ -68,6 +68,7 @@ class MemoryUsageTracker:
         self._leaf_modules: List[Tuple[str, torch.nn.Module]] = self._compute_leaf_modules()
         self._device = self._infer_device()
         self._last_optimizer_dtype_bytes: Dict[torch.dtype, int] = {}
+        self._last_optimizer_dtype_device_bytes: Dict[Tuple[str, str], int] = {}
 
     def _infer_device(self) -> torch.device | None:
         for param in self.model.parameters():
@@ -139,12 +140,16 @@ class MemoryUsageTracker:
             return 0, {}
         total = 0
         dtype_bytes: Dict[torch.dtype, int] = defaultdict(int)
+        dtype_device_bytes: Dict[Tuple[str, str], int] = defaultdict(int)
         for tensor in self._iter_optimizer_tensors(self.optimizer):
             bytes_used = _tensor_nbytes(tensor)
             if bytes_used <= 0:
                 continue
             total += bytes_used
             dtype_bytes[tensor.dtype] += bytes_used
+            device_type = tensor.device.type if tensor.device is not None else "unknown"
+            dtype_device_bytes[(str(tensor.dtype), device_type)] += bytes_used
+        self._last_optimizer_dtype_device_bytes = dtype_device_bytes
         return total, dtype_bytes
 
     def reset_activation_stats(self) -> None:
@@ -225,5 +230,11 @@ class MemoryUsageTracker:
 
     def optimizer_dtype_breakdown(self) -> Dict[str, float]:
         return {str(dtype): bytes_to_gb(bytes_used) for dtype, bytes_used in self._last_optimizer_dtype_bytes.items()}
+
+    def optimizer_dtype_device_breakdown(self) -> Dict[str, float]:
+        return {
+            f"{dtype}|{device}": bytes_to_gb(bytes_used)
+            for (dtype, device), bytes_used in self._last_optimizer_dtype_device_bytes.items()
+        }
 
 

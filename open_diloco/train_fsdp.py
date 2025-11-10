@@ -852,8 +852,15 @@ def train(config: Config):
                     metrics["memory/cuda_reserved_gb"] = cuda_reserved_gb
                     metrics["memory/cuda_max_allocated_gb"] = cuda_max_alloc_gb
                     optimizer_dtype_gb = memory_tracker.optimizer_dtype_breakdown()
-                    for dtype_name, gb in optimizer_dtype_gb.items():
-                        metrics[f"memory/optimizer_dtype/{dtype_name}"] = gb
+                    if optimizer_dtype_gb:
+                        for dtype_name, gb in optimizer_dtype_gb.items():
+                            metrics[f"memory/optimizer_dtype/{dtype_name}"] = gb
+                    else:
+                        metrics["memory/optimizer_dtype/none"] = 0.0
+                    optimizer_dtype_device_gb = memory_tracker.optimizer_dtype_device_breakdown()
+                    if optimizer_dtype_device_gb:
+                        for key, gb in optimizer_dtype_device_gb.items():
+                            metrics[f"memory/optimizer_dtype_device/{key}"] = gb
 
                     top_modules = memory_tracker.activation_topk()
                     if top_modules:
@@ -881,7 +888,18 @@ def train(config: Config):
                     )
                     if optimizer_dtype_gb:
                         dtype_summary = ", ".join(f"{dtype}: {gb:.3f} GB" for dtype, gb in optimizer_dtype_gb.items())
-                        log(f"Optimizer state dtype usage (step {real_step}): {dtype_summary}")
+                        device_summary = ", ".join(
+                            f"{entry}: {gb:.3f} GB" for entry, gb in optimizer_dtype_device_gb.items()
+                        )
+                        log(
+                            f"Optimizer state dtype usage (step {real_step}): {dtype_summary} "
+                            f"[by device: {device_summary}]"
+                        )
+                    else:
+                        log(
+                            f"Optimizer state dtype usage (step {real_step}): no optimizer state tensors detected yet "
+                            "(optimizer.step()가 호출되지 않았거나 상태가 GPU에 생성되지 않았을 수 있습니다)"
+                        )
 
                 if world_messenger_hv:
                     outer_lr = [group["lr"] for group in optimizer.state_averager.optimizer.param_groups][0]
