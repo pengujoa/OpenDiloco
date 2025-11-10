@@ -67,6 +67,8 @@ class MemoryUsageTracker:
         self._activation_metadata: Dict[str, Tuple[Optional[torch.dtype], Optional[Tuple[int, ...]]]] = {}
         self._leaf_modules: List[Tuple[str, torch.nn.Module]] = self._compute_leaf_modules()
         self._device = self._infer_device()
+        self._last_param_dtype_bytes: Dict[torch.dtype, int] = {}
+        self._last_grad_dtype_bytes: Dict[torch.dtype, int] = {}
         self._last_optimizer_dtype_bytes: Dict[torch.dtype, int] = {}
         self._last_optimizer_dtype_device_bytes: Dict[Tuple[str, str], int] = {}
 
@@ -83,33 +85,37 @@ class MemoryUsageTracker:
                 leaves.append((name, module))
         return leaves
 
-    def parameter_stats(self) -> Tuple[int, int, int]:
+    def parameter_stats(self) -> Tuple[int, int, int, Dict[torch.dtype, int]]:
         total = 0
         tensor_count = 0
         element_count = 0
+        dtype_bytes: Dict[torch.dtype, int] = defaultdict(int)
         for param in self.model.parameters():
             bytes_used = _tensor_nbytes(param.data)
             total += bytes_used
             tensor_count += 1
             element_count += param.data.numel()
-        return total, tensor_count, element_count
+            dtype_bytes[param.data.dtype] += bytes_used
+        self._last_param_dtype_bytes = dtype_bytes
+        return total, tensor_count, element_count, dtype_bytes
 
     def parameter_bytes(self) -> int:
-        total, _, _ = self.parameter_stats()
+        total, _, _, _ = self.parameter_stats()
         return total
 
     def parameter_tensor_count(self) -> int:
-        _, tensor_count, _ = self.parameter_stats()
+        _, tensor_count, _, _ = self.parameter_stats()
         return tensor_count
 
     def parameter_element_count(self) -> int:
-        _, _, element_count = self.parameter_stats()
+        _, _, element_count, _ = self.parameter_stats()
         return element_count
 
-    def gradient_stats(self) -> Tuple[int, int, int]:
+    def gradient_stats(self) -> Tuple[int, int, int, Dict[torch.dtype, int]]:
         total = 0
         tensor_count = 0
         element_count = 0
+        dtype_bytes: Dict[torch.dtype, int] = defaultdict(int)
         for param in self.model.parameters():
             if param.grad is None:
                 continue
@@ -117,10 +123,12 @@ class MemoryUsageTracker:
             total += bytes_used
             tensor_count += 1
             element_count += param.grad.numel()
-        return total, tensor_count, element_count
+            dtype_bytes[param.grad.dtype] += bytes_used
+        self._last_grad_dtype_bytes = dtype_bytes
+        return total, tensor_count, element_count, dtype_bytes
 
     def gradient_bytes(self) -> int:
-        total, _, _ = self.gradient_stats()
+        total, _, _, _ = self.gradient_stats()
         return total
 
     def _iter_optimizer_tensors(self, optimizer: object) -> Iterator[torch.Tensor]:
@@ -243,8 +251,8 @@ class MemoryUsageTracker:
         """
         Return the latest per-component memory usage in bytes.
         """
-        parameters_bytes, parameters_tensor_count, parameters_element_count = self.parameter_stats()
-        gradients_bytes, gradients_tensor_count, gradients_element_count = self.gradient_stats()
+        parameters_bytes, parameters_tensor_count, parameters_element_count, _ = self.parameter_stats()
+        gradients_bytes, gradients_tensor_count, gradients_element_count, _ = self.gradient_stats()
         optimizer_bytes, optimizer_dtype_bytes = self.optimizer_state_stats()
         self._last_optimizer_dtype_bytes = optimizer_dtype_bytes
         return {
@@ -269,5 +277,11 @@ class MemoryUsageTracker:
             f"{dtype}|{device}": bytes_to_gb(bytes_used)
             for (dtype, device), bytes_used in self._last_optimizer_dtype_device_bytes.items()
         }
+
+    def parameter_dtype_breakdown(self) -> Dict[str, float]:
+        return {str(dtype): bytes_to_gb(bytes_used) for dtype, bytes_used in self._last_param_dtype_bytes.items()}
+
+    def gradient_dtype_breakdown(self) -> Dict[str, float]:
+        return {str(dtype): bytes_to_gb(bytes_used) for dtype, bytes_used in self._last_grad_dtype_bytes.items()}
 
 

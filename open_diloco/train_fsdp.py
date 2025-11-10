@@ -865,6 +865,14 @@ def train(config: Config):
                     if optimizer_dtype_device_gb:
                         for key, gb in optimizer_dtype_device_gb.items():
                             metrics[f"memory/optimizer_dtype_device/{key}"] = gb
+                    param_dtype_gb = memory_tracker.parameter_dtype_breakdown()
+                    if param_dtype_gb:
+                        for dtype_name, gb in param_dtype_gb.items():
+                            metrics[f"memory/parameters_dtype/{dtype_name}"] = gb
+                    grad_dtype_gb = memory_tracker.gradient_dtype_breakdown()
+                    if grad_dtype_gb:
+                        for dtype_name, gb in grad_dtype_gb.items():
+                            metrics[f"memory/gradients_dtype/{dtype_name}"] = gb
 
                     top_modules = memory_tracker.activation_topk()
                     if top_modules:
@@ -890,6 +898,16 @@ def train(config: Config):
                             cuda_max_alloc_gb,
                         )
                     )
+                    param_dtype_summary = ", ".join(
+                        f"{dtype}: {gb:.3f} GB" for dtype, gb in memory_tracker.parameter_dtype_breakdown().items()
+                    )
+                    grad_dtype_summary = ", ".join(
+                        f"{dtype}: {gb:.3f} GB" for dtype, gb in memory_tracker.gradient_dtype_breakdown().items()
+                    )
+                    if param_dtype_summary:
+                        log(f"Parameter dtype usage (step {real_step}): {param_dtype_summary}")
+                    if grad_dtype_summary:
+                        log(f"Gradient dtype usage (step {real_step}): {grad_dtype_summary}")
                     log(
                         f"Tensor counts (step {real_step}): "
                         f"params tensors={memory_breakdown['parameters_tensor_count']} "
