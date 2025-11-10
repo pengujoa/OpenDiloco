@@ -3,12 +3,12 @@ from __future__ import annotations
 from collections import defaultdict
 from contextlib import contextmanager
 from functools import partial
-from typing import Dict, Iterable, Iterator, List, Tuple, Union
+from typing import Dict, Iterable, Iterator, List, Optional, Tuple, Union
 
 import torch
 
 
-TensorLike = Union[torch.Tensor, Tuple["TensorLike", ...], List["TensorLike"]]
+TensorLike = Union[torch.Tensor, Tuple["TensorLike", ...], List["TensorLike"], Dict[str, "TensorLike"]]
 
 
 def _tensor_nbytes(tensor: torch.Tensor | None) -> int:
@@ -24,7 +24,27 @@ def _collect_nested_bytes(obj: TensorLike) -> int:
         return _tensor_nbytes(obj)
     if isinstance(obj, (tuple, list)):
         return sum(_collect_nested_bytes(item) for item in obj)
+    if isinstance(obj, dict):
+        return sum(_collect_nested_bytes(item) for item in obj.values())
     return 0
+
+
+def _extract_first_tensor(obj: TensorLike) -> Optional[torch.Tensor]:
+    if isinstance(obj, torch.Tensor):
+        return obj
+    if isinstance(obj, (tuple, list)):
+        for item in obj:
+            tensor = _extract_first_tensor(item)
+            if tensor is not None:
+                return tensor
+        return None
+    if isinstance(obj, dict):
+        for item in obj.values():
+            tensor = _extract_first_tensor(item)
+            if tensor is not None:
+                return tensor
+        return None
+    return None
 
 
 def bytes_to_gb(value: int) -> float:
@@ -44,6 +64,7 @@ class MemoryUsageTracker:
         self.optimizer = optimizer
         self.activation_bytes: int = 0
         self._activation_by_module: Dict[str, int] = defaultdict(int)
+        self._activation_metadata: Dict[str, Tuple[Optional[torch.dtype], Optional[Tuple[int, ...]]]] = {}
         self._leaf_modules: List[Tuple[str, torch.nn.Module]] = self._compute_leaf_modules()
         self._device = self._infer_device()
 
@@ -117,6 +138,7 @@ class MemoryUsageTracker:
     def reset_activation_stats(self) -> None:
         self.activation_bytes = 0
         self._activation_by_module.clear()
+        self._activation_metadata.clear()
 
     def _activation_hook(self, module_name: str, _mod, _inp, outp) -> None:
         bytes_used = _collect_nested_bytes(outp)
@@ -124,6 +146,13 @@ class MemoryUsageTracker:
             return
         self.activation_bytes += bytes_used
         self._activation_by_module[module_name] += bytes_used
+        tensor = _extract_first_tensor(outp)
+        dtype: Optional[torch.dtype] = None
+        shape: Optional[Tuple[int, ...]] = None
+        if tensor is not None:
+            dtype = tensor.dtype
+            shape = tuple(int(dim) for dim in tensor.shape)
+        self._activation_metadata[module_name] = (dtype, shape)
 
     @contextmanager
     def capture_activations(self):
@@ -141,10 +170,15 @@ class MemoryUsageTracker:
             for handle in handles:
                 handle.remove()
 
-    def activation_topk(self, k: int = 5) -> List[Tuple[str, int]]:
+    def activation_topk(self, k: int = 5) -> List[Tuple[str, int, Optional[torch.dtype], Optional[Tuple[int, ...]]]]:
         if not self._activation_by_module:
             return []
-        return sorted(self._activation_by_module.items(), key=lambda item: item[1], reverse=True)[:k]
+        sorted_items = sorted(self._activation_by_module.items(), key=lambda item: item[1], reverse=True)[:k]
+        detailed = []
+        for name, bytes_used in sorted_items:
+            dtype, shape = self._activation_metadata.get(name, (None, None))
+            detailed.append((name, bytes_used, dtype, shape))
+        return detailed
 
     def device_allocated_bytes(self) -> int:
         if self._device is None or not torch.cuda.is_available():

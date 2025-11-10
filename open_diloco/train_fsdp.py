@@ -854,9 +854,14 @@ def train(config: Config):
 
                     top_modules = memory_tracker.activation_topk()
                     if top_modules:
-                        top_summary = ", ".join(
-                            f"{name}: {bytes_to_gb(value):.3f}GB" for name, value in top_modules
-                        )
+                        top_summary_parts = []
+                        for name, value, dtype, shape in top_modules:
+                            dtype_str = str(dtype) if dtype is not None else "unknown"
+                            shape_str = f"{list(shape)}" if shape is not None else "unknown"
+                            top_summary_parts.append(
+                                f"{name}: {bytes_to_gb(value):.3f}GB (dtype={dtype_str}, shape={shape_str})"
+                            )
+                        top_summary = ", ".join(top_summary_parts)
                         log(f"Activation memory top modules (step {real_step}): {top_summary}")
 
                     log(
