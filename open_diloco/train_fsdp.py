@@ -851,6 +851,9 @@ def train(config: Config):
                     metrics["memory/cuda_allocated_gb"] = cuda_alloc_gb
                     metrics["memory/cuda_reserved_gb"] = cuda_reserved_gb
                     metrics["memory/cuda_max_allocated_gb"] = cuda_max_alloc_gb
+                    optimizer_dtype_gb = memory_tracker.optimizer_dtype_breakdown()
+                    for dtype_name, gb in optimizer_dtype_gb.items():
+                        metrics[f"memory/optimizer_dtype/{dtype_name}"] = gb
 
                     top_modules = memory_tracker.activation_topk()
                     if top_modules:
@@ -876,6 +879,9 @@ def train(config: Config):
                             cuda_max_alloc_gb,
                         )
                     )
+                    if optimizer_dtype_gb:
+                        dtype_summary = ", ".join(f"{dtype}: {gb:.3f} GB" for dtype, gb in optimizer_dtype_gb.items())
+                        log(f"Optimizer state dtype usage (step {real_step}): {dtype_summary}")
 
                 if world_messenger_hv:
                     outer_lr = [group["lr"] for group in optimizer.state_averager.optimizer.param_groups][0]

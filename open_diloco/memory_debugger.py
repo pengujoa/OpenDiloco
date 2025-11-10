@@ -67,6 +67,7 @@ class MemoryUsageTracker:
         self._activation_metadata: Dict[str, Tuple[Optional[torch.dtype], Optional[Tuple[int, ...]]]] = {}
         self._leaf_modules: List[Tuple[str, torch.nn.Module]] = self._compute_leaf_modules()
         self._device = self._infer_device()
+        self._last_optimizer_dtype_bytes: Dict[torch.dtype, int] = {}
 
     def _infer_device(self) -> torch.device | None:
         for param in self.model.parameters():
@@ -128,12 +129,23 @@ class MemoryUsageTracker:
                         stack.append(nested)
 
     def optimizer_state_bytes(self) -> int:
-        if self.optimizer is None:
-            return 0
         total = 0
-        for tensor in self._iter_optimizer_tensors(self.optimizer):
+        for tensor in self._iter_optimizer_tensors(self.optimizer) if self.optimizer is not None else []:
             total += _tensor_nbytes(tensor)
         return total
+
+    def optimizer_state_stats(self) -> tuple[int, Dict[torch.dtype, int]]:
+        if self.optimizer is None:
+            return 0, {}
+        total = 0
+        dtype_bytes: Dict[torch.dtype, int] = defaultdict(int)
+        for tensor in self._iter_optimizer_tensors(self.optimizer):
+            bytes_used = _tensor_nbytes(tensor)
+            if bytes_used <= 0:
+                continue
+            total += bytes_used
+            dtype_bytes[tensor.dtype] += bytes_used
+        return total, dtype_bytes
 
     def reset_activation_stats(self) -> None:
         self.activation_bytes = 0
@@ -199,14 +211,19 @@ class MemoryUsageTracker:
         """
         Return the latest per-component memory usage in bytes.
         """
+        optimizer_bytes, optimizer_dtype_bytes = self.optimizer_state_stats()
+        self._last_optimizer_dtype_bytes = optimizer_dtype_bytes
         return {
             "parameters_bytes": self.parameter_bytes(),
             "gradients_bytes": self.gradient_bytes(),
-            "optimizer_bytes": self.optimizer_state_bytes(),
+            "optimizer_bytes": optimizer_bytes,
             "activations_bytes": self.activation_bytes,
             "cuda_allocated_bytes": self.device_allocated_bytes(),
             "cuda_reserved_bytes": self.device_reserved_bytes(),
             "cuda_max_allocated_bytes": self.max_device_allocated_bytes(),
         }
+
+    def optimizer_dtype_breakdown(self) -> Dict[str, float]:
+        return {str(dtype): bytes_to_gb(bytes_used) for dtype, bytes_used in self._last_optimizer_dtype_bytes.items()}
 
 
