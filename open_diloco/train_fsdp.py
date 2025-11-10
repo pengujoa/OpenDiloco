@@ -73,6 +73,10 @@ from hivemind.utils.networking import log_visible_maddrs
 from hivemind.optim.optimizer import logger
 
 
+try:
+    from .memory_debugger import MemoryUsageTracker, bytes_to_gb  # type: ignore[attr-defined]
+except ImportError:
+    from memory_debugger import MemoryUsageTracker, bytes_to_gb
 from open_diloco.utils import (
     FakeTokenizedDataset,
     get_compression_kwargs,
@@ -237,6 +241,7 @@ class Config(BaseConfig):
     project: str = "hivemind_debug"
     metric_logger_type: Literal["wandb", "dummy"] = "wandb"
     log_activations_steps: int | None = None
+    log_memory_breakdown_steps: int | None = None
     ckpt: CkptConfig = CkptConfig()
     # Hivemind
     hv: HvConfig | None = None  # if no hv config then hivemind is disabled
@@ -707,6 +712,8 @@ def train(config: Config):
 
     model.train()
 
+    memory_tracker = MemoryUsageTracker(model=model, optimizer=optimizer)
+
     if world_messenger_hv and not config.hv.skip_load_from_peers:
         optimizer.load_state_from_peers()
 
@@ -726,6 +733,13 @@ def train(config: Config):
     for step, batch in enumerate(iterable=train_dataloader, start=start_step * gradient_accumulation_steps):
         real_step = (step + 1) // gradient_accumulation_steps
         is_accumulating = bool((step + 1) % gradient_accumulation_steps)
+        should_profile_memory = (
+            config.log_memory_breakdown_steps is not None
+            and not is_accumulating
+            and real_step > 0
+            and real_step % config.log_memory_breakdown_steps == 0
+        )
+        memory_breakdown: dict[str, int] | None = None
 
         logging_activations_steps = (
             config.log_activations_steps is not None and real_step % config.log_activations_steps == 0
@@ -740,13 +754,15 @@ def train(config: Config):
             batch[key] = batch[key].to("cuda")
 
         with model.no_sync() if is_accumulating else nullcontext():
-            outputs = model(**batch)
-            
+            activation_cm = memory_tracker.capture_activations() if should_profile_memory else nullcontext()
+            with activation_cm:
+                outputs = model(**batch)
+
             # 첫 번째 forward pass 후 모든 노드가 준비될 때까지 대기
             if world_messenger_hv and not all_nodes_ready:
                 wait_for_all_nodes_ready(dht, config.hv.galaxy_size, log)
                 all_nodes_ready = True
-            
+
             loss = outputs.loss / gradient_accumulation_steps
 
             loss_batch += loss.detach()
@@ -787,6 +803,9 @@ def train(config: Config):
 
             scaler.update()
 
+            if should_profile_memory:
+                memory_breakdown = memory_tracker.snapshot()
+
             scheduler.step()
             optimizer.zero_grad()
 
@@ -815,6 +834,43 @@ def train(config: Config):
                     "time_taken": time.time() - current_time,
                     "tokens_per_second": config.seq_length * config.total_batch_size / (time.time() - current_time),
                 }
+
+                if memory_breakdown is not None:
+                    params_gb = bytes_to_gb(memory_breakdown["parameters_bytes"])
+                    grads_gb = bytes_to_gb(memory_breakdown["gradients_bytes"])
+                    optim_gb = bytes_to_gb(memory_breakdown["optimizer_bytes"])
+                    acts_gb = bytes_to_gb(memory_breakdown["activations_bytes"])
+                    cuda_alloc_gb = bytes_to_gb(memory_breakdown["cuda_allocated_bytes"])
+                    cuda_reserved_gb = bytes_to_gb(memory_breakdown["cuda_reserved_bytes"])
+                    cuda_max_alloc_gb = bytes_to_gb(memory_breakdown["cuda_max_allocated_bytes"])
+
+                    metrics["memory/parameters_gb"] = params_gb
+                    metrics["memory/gradients_gb"] = grads_gb
+                    metrics["memory/optimizer_gb"] = optim_gb
+                    metrics["memory/activations_gb"] = acts_gb
+                    metrics["memory/cuda_allocated_gb"] = cuda_alloc_gb
+                    metrics["memory/cuda_reserved_gb"] = cuda_reserved_gb
+                    metrics["memory/cuda_max_allocated_gb"] = cuda_max_alloc_gb
+
+                    top_modules = memory_tracker.activation_topk()
+                    if top_modules:
+                        top_summary = ", ".join(
+                            f"{name}: {bytes_to_gb(value):.3f}GB" for name, value in top_modules
+                        )
+                        log(f"Activation memory top modules (step {real_step}): {top_summary}")
+
+                    log(
+                        "Memory breakdown (step {}): params {:.3f} GB | grads {:.3f} GB | optim {:.3f} GB | activations {:.3f} GB | allocated {:.3f} GB | reserved {:.3f} GB | max {:.3f} GB".format(
+                            real_step,
+                            params_gb,
+                            grads_gb,
+                            optim_gb,
+                            acts_gb,
+                            cuda_alloc_gb,
+                            cuda_reserved_gb,
+                            cuda_max_alloc_gb,
+                        )
+                    )
 
                 if world_messenger_hv:
                     outer_lr = [group["lr"] for group in optimizer.state_averager.optimizer.param_groups][0]
