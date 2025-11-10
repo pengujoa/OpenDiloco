@@ -851,6 +851,10 @@ def train(config: Config):
                     metrics["memory/cuda_allocated_gb"] = cuda_alloc_gb
                     metrics["memory/cuda_reserved_gb"] = cuda_reserved_gb
                     metrics["memory/cuda_max_allocated_gb"] = cuda_max_alloc_gb
+                    metrics["memory/parameters_tensor_count"] = memory_breakdown["parameters_tensor_count"]
+                    metrics["memory/parameters_element_count"] = memory_breakdown["parameters_element_count"]
+                    metrics["memory/gradients_tensor_count"] = memory_breakdown["gradients_tensor_count"]
+                    metrics["memory/gradients_element_count"] = memory_breakdown["gradients_element_count"]
                     optimizer_dtype_gb = memory_tracker.optimizer_dtype_breakdown()
                     if optimizer_dtype_gb:
                         for dtype_name, gb in optimizer_dtype_gb.items():
@@ -885,6 +889,13 @@ def train(config: Config):
                             cuda_reserved_gb,
                             cuda_max_alloc_gb,
                         )
+                    )
+                    log(
+                        f"Tensor counts (step {real_step}): "
+                        f"params tensors={memory_breakdown['parameters_tensor_count']} "
+                        f"(elements={memory_breakdown['parameters_element_count']:,}), "
+                        f"grads tensors={memory_breakdown['gradients_tensor_count']} "
+                        f"(elements={memory_breakdown['gradients_element_count']:,})"
                     )
                     if optimizer_dtype_gb:
                         dtype_summary = ", ".join(f"{dtype}: {gb:.3f} GB" for dtype, gb in optimizer_dtype_gb.items())

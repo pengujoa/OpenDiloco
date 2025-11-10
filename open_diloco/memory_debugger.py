@@ -83,17 +83,44 @@ class MemoryUsageTracker:
                 leaves.append((name, module))
         return leaves
 
-    def parameter_bytes(self) -> int:
+    def parameter_stats(self) -> Tuple[int, int, int]:
         total = 0
+        tensor_count = 0
+        element_count = 0
         for param in self.model.parameters():
-            total += _tensor_nbytes(param.data)
+            bytes_used = _tensor_nbytes(param.data)
+            total += bytes_used
+            tensor_count += 1
+            element_count += param.data.numel()
+        return total, tensor_count, element_count
+
+    def parameter_bytes(self) -> int:
+        total, _, _ = self.parameter_stats()
         return total
 
-    def gradient_bytes(self) -> int:
+    def parameter_tensor_count(self) -> int:
+        _, tensor_count, _ = self.parameter_stats()
+        return tensor_count
+
+    def parameter_element_count(self) -> int:
+        _, _, element_count = self.parameter_stats()
+        return element_count
+
+    def gradient_stats(self) -> Tuple[int, int, int]:
         total = 0
+        tensor_count = 0
+        element_count = 0
         for param in self.model.parameters():
-            if param.grad is not None:
-                total += _tensor_nbytes(param.grad)
+            if param.grad is None:
+                continue
+            bytes_used = _tensor_nbytes(param.grad)
+            total += bytes_used
+            tensor_count += 1
+            element_count += param.grad.numel()
+        return total, tensor_count, element_count
+
+    def gradient_bytes(self) -> int:
+        total, _, _ = self.gradient_stats()
         return total
 
     def _iter_optimizer_tensors(self, optimizer: object) -> Iterator[torch.Tensor]:
@@ -216,11 +243,17 @@ class MemoryUsageTracker:
         """
         Return the latest per-component memory usage in bytes.
         """
+        parameters_bytes, parameters_tensor_count, parameters_element_count = self.parameter_stats()
+        gradients_bytes, gradients_tensor_count, gradients_element_count = self.gradient_stats()
         optimizer_bytes, optimizer_dtype_bytes = self.optimizer_state_stats()
         self._last_optimizer_dtype_bytes = optimizer_dtype_bytes
         return {
-            "parameters_bytes": self.parameter_bytes(),
-            "gradients_bytes": self.gradient_bytes(),
+            "parameters_bytes": parameters_bytes,
+            "parameters_tensor_count": parameters_tensor_count,
+            "parameters_element_count": parameters_element_count,
+            "gradients_bytes": gradients_bytes,
+            "gradients_tensor_count": gradients_tensor_count,
+            "gradients_element_count": gradients_element_count,
             "optimizer_bytes": optimizer_bytes,
             "activations_bytes": self.activation_bytes,
             "cuda_allocated_bytes": self.device_allocated_bytes(),
