@@ -890,13 +890,6 @@ def train(config: Config):
             model.clip_grad_norm_(1.0)  # gradient clipping
 
             if world_messenger_hv:
-                if real_step % 10 == 0:  # 10 step마다 로깅
-                    print(f"[DEBUG] Before optimizer.step at real_step={real_step}:")
-                    print(f"[DEBUG]   samples_accumulated={optimizer.tracker.local_progress.samples_accumulated}")
-                    print(f"[DEBUG]   target_batch_size={optimizer.tracker.target_batch_size}")
-                    print(f"[DEBUG]   ready_to_update_epoch={optimizer.tracker.ready_to_update_epoch}")
-                    print(f"[DEBUG]   local_step={optimizer.tracker.local_step}")
-                
                 # This will trigger inter-node synchronization if real_step % local_steps == 0
                 optimizer.step(scaler=scaler)
                 
@@ -917,12 +910,6 @@ def train(config: Config):
                         )
                         if rank == 0:
                             log(f"Validation results: validation_loss={validation_metrics.get('validation_loss', 'N/A'):.4f}, validation_perplexity={validation_metrics.get('validation_perplexity', 'N/A'):.4f}")
-                
-                if real_step % 10 == 0:
-                    print(f"[DEBUG] After optimizer.step:")
-                    print(f"[DEBUG]   samples_accumulated={optimizer.tracker.local_progress.samples_accumulated}")
-                    print(f"[DEBUG]   local_step={optimizer.tracker.local_step}")
-
                 # todo(sami): refactor to use built in pytorch mechanism to handle scaler manually
                 # should allow to just do scaler.step(optimizer)
             else:

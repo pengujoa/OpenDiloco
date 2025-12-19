@@ -208,22 +208,13 @@ class DiLoCoGradAverager(DecentralizedAverager):
             f"Time taken for compute_and_load_pseudo_grad: {time_1_compute_and_load_pseudo_grad - time_0_compute_and_load_pseudo_grad} sec",
         )
 
-        # cyshin
-        time_0_allow_allreduce = time.perf_counter()
         control.allow_allreduce()
-        time_1_allow_allreduce = time.perf_counter()
-        logger.log(
-            logging.INFO,
-            f"Time taken for allow_allreduce: {time_1_allow_allreduce - time_0_allow_allreduce} sec",
-        )
 
         # return control.result(timeout) if wait else control
         if wait:
             time_0_control_result = time.perf_counter()
-            print("control result call")
             return_value = control.result(timeout)
             time_1_control_result = time.perf_counter()
-            print(datetime.now().strftime("[%Y-%m-%d %H:%M:%S.%f]"), f"Time taken for control_result: {time_1_control_result - time_0_control_result} sec")
             logger.log(
                 logging.INFO,
                 f"Time taken for control_result: {time_1_control_result - time_0_control_result} sec",
@@ -668,11 +659,9 @@ class DiLoCoOptimizer(Optimizer):
             self.tracker.report_local_progress(self.local_epoch, samples_accumulated=new_samples_accumulated)
 
             self._maybe_schedule_state_averaging()
-            print("call self._maybe_schedule_gradient_averaging()")
             self._maybe_schedule_gradient_averaging()
 
             if scaler is not None:
-                print(datetime.now().strftime("[%Y-%m-%d %H:%M:%S.%f]"), "call scaler.step(self.inner_optimizer)")
                 scaler.step(self.inner_optimizer)
                 if found_inf_grad(self.inner_optimizer, scaler):
                     logger.log(self.status_loglevel, f"Found inf grad at step {self.tracker.real_step}")
@@ -746,12 +735,10 @@ class DiLoCoOptimizer(Optimizer):
             if self.tracker.global_progress.num_peers > 1:
                 logger.log(self.status_loglevel, f"Beginning optimizer step #{self.local_epoch}")
                 time_0 = time.perf_counter()
-
                 self.diloco_grad_averager.step(
                     wait=True, timeout=self.averaging_timeout, control=self.scheduled_diloco_grads
                 )
                 time_1 = time.perf_counter()
-                print(datetime.now().strftime("[%Y-%m-%d %H:%M:%S.%f]"), f"Time taken for gradient all reduce: {time_1 - time_0} sec")
                 logger.log(
                     self.status_loglevel,
                     f"Time taken for gradient all reduce: {time_1 - time_0} sec",
