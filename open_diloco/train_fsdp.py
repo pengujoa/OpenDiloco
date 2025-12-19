@@ -1128,7 +1128,7 @@ if __name__ == "__main__":
     
     # Batch size 탐색 모드인 경우, 추정 후 학습 진행
     if config.find_max_batch_size:
-        max_batch_size = find_max_batch_size_for_model(config)
+        max_batch_size, parameter_count = find_max_batch_size_for_model(config)
         if max_batch_size is None or max_batch_size <= 0:
             print("Batch size 탐색에 실패했습니다. 종료합니다.")
             destroy_process_group()
@@ -1136,6 +1136,7 @@ if __name__ == "__main__":
         
         # 추정된 batch size를 설정에 적용
         print(f"\n추정된 batch size ({max_batch_size})를 학습에 적용합니다.")
+        print(f"모델 파라미터 수: {parameter_count:,}")
         config.per_device_train_batch_size = max_batch_size
     
     train(config)
