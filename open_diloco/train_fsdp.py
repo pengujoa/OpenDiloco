@@ -448,7 +448,7 @@ def wait_for_all_nodes_ready(dht: DHT, galaxy_size: int, log_fn):
         "ts": now,
         "host": socket.gethostname()
     }
-    exp = now + 60.0  # 60초 TTL
+    exp = now + config.hv.averaging_timeout  # 30분 TTL
     dht.store(key=ready_key, subkey=worker_id, value=ready_payload, expiration_time=exp)
     log_fn(f"Published ready state for {worker_id}")
     
@@ -837,6 +837,11 @@ def train(config: Config):
     
     # 모든 노드 준비 체크 플래그
     all_nodes_ready = False
+    
+    # 모든 노드가 준비될 때까지 대기
+    if world_messenger_hv and not all_nodes_ready:
+        wait_for_all_nodes_ready(dht, config.hv.galaxy_size, log)
+        all_nodes_ready = True
 
     for step, batch in enumerate(iterable=train_dataloader, start=start_step * gradient_accumulation_steps):
         real_step = (step + 1) // gradient_accumulation_steps
@@ -865,11 +870,6 @@ def train(config: Config):
             activation_cm = memory_tracker.capture_activations() if should_profile_memory else nullcontext()
             with activation_cm:
                 outputs = model(**batch)
-
-            # 첫 번째 forward pass 후 모든 노드가 준비될 때까지 대기
-            if world_messenger_hv and not all_nodes_ready:
-                wait_for_all_nodes_ready(dht, config.hv.galaxy_size, log)
-                all_nodes_ready = True
 
             loss = outputs.loss / gradient_accumulation_steps
 
