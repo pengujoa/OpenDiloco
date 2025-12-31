@@ -112,9 +112,30 @@ class DiLoCoGradAverager(DecentralizedAverager):
         if selective_layer_patterns is not None and param_names is not None:
             # 파라미터 마스크 생성: 업데이트할 레이어 패턴에 매칭되는 파라미터만 True
             self.param_update_mask = self._create_param_mask(param_names, selective_layer_patterns)
-            logger.info(f"Selective layer update enabled: {sum(self.param_update_mask)}/{len(self.param_update_mask)} parameters will be updated")
+            updated_count = sum(self.param_update_mask)
+            total_count = len(self.param_update_mask)
+            logger.info(f"Selective layer update enabled: {updated_count}/{total_count} parameters will be updated")
+            
+            # 디버그: 업데이트되는 파라미터 이름 출력
+            updated_params = [name for name, mask in zip(param_names, self.param_update_mask) if mask]
+            skipped_params = [name for name, mask in zip(param_names, self.param_update_mask) if not mask]
+            
+            logger.info(f"[DEBUG] Parameters to be updated ({updated_count}):")
+            for i, name in enumerate(updated_params[:20]):  # 처음 20개만 출력
+                logger.info(f"  {i+1}. {name}")
+            if len(updated_params) > 20:
+                logger.info(f"  ... and {len(updated_params) - 20} more parameters")
+            
+            if len(skipped_params) > 0:
+                logger.info(f"[DEBUG] Parameters skipped from update ({len(skipped_params)}):")
+                for i, name in enumerate(skipped_params[:10]):  # 처음 10개만 출력
+                    logger.info(f"  {i+1}. {name}")
+                if len(skipped_params) > 10:
+                    logger.info(f"  ... and {len(skipped_params) - 10} more parameters")
         else:
             self.param_update_mask = None
+            if param_names is not None:
+                logger.info(f"[DEBUG] All {len(param_names)} parameters will be updated (no selective layer patterns)")
 
         averaged_grads = tuple(grad for grad in self._grads_from_optimizer())
 
@@ -152,9 +173,7 @@ class DiLoCoGradAverager(DecentralizedAverager):
                 if self.param_update_mask is not None:
                     if self.param_update_mask[param_idx]:
                         yield param.grad
-                    else:
-                        # 업데이트하지 않을 파라미터는 zero gradient 반환 (all-reduce에서 효과적으로 제외)
-                        yield torch.zeros_like(param.grad)
+                    # skipped params는 yield하지 않음 - 통신에서 완전히 제외
                 else:
                     yield param.grad
                 param_idx += 1
@@ -179,6 +198,7 @@ class DiLoCoGradAverager(DecentralizedAverager):
         control: Optional[StepControl] = None,
         timeout: Optional[float] = None,
         wait: bool = True,
+        epoch: Optional[int] = None,
         **kwargs,        
     ):
         """
@@ -189,7 +209,12 @@ class DiLoCoGradAverager(DecentralizedAverager):
         :param control: reuse a pre-arranged group of peers (or a matchmaking in progress) from averager.schedule_step
         :param timeout: if specified, await for averaging round for at most this number of seconds (if wait=True)
         :param wait: if True, await for the step to finish (or fail), otherwise run all-reduce in background
+        :param epoch: current epoch number for debugging
         """
+        # epoch 정보 저장 (디버그용)
+        if epoch is not None:
+            self._current_epoch = epoch
+        
         if control is None:
             # cyshin
             time_0_schedule_step = time.perf_counter()
@@ -230,22 +255,63 @@ class DiLoCoGradAverager(DecentralizedAverager):
         opt_parameters = [param for group in self.offloaded_optimizer.param_groups for param in group["params"]]
         with self.get_tensors() as averaged_grads:
             param_idx = 0
-            for opt_param, averaged_grad, main_param in zip(opt_parameters, averaged_grads, self.main_parameters):
+            grad_idx = 0  # averaged_grads의 인덱스
+            updated_param_names = []
+            skipped_param_names = []
+            
+            for opt_param, main_param in zip(opt_parameters, self.main_parameters):
+                param_name = self.param_names[param_idx] if self.param_names and param_idx < len(self.param_names) else f"param_{param_idx}"
+                
                 # opt_param is the param that will be all_reduce, it is suppose to be on cpu
                 # main_param is the param that has been updated by the inner optimizer, it is suppose to be on gpu
                 if self.param_update_mask is not None:
                     if self.param_update_mask[param_idx]:
                         # 선택된 레이어만 pseudo gradient 계산
                         grad = opt_param.data - main_param.detach().to(opt_param.device)
-                        averaged_grad.copy_(grad, non_blocking=True)
+                        averaged_grads[grad_idx].copy_(grad, non_blocking=True)
+                        updated_param_names.append(param_name)
+                        grad_idx += 1
                     else:
-                        # 선택되지 않은 레이어는 zero gradient로 설정 (동기화 안 함)
-                        averaged_grad.zero_()
+                        # 선택되지 않은 레이어는 통신에서 제외됨 (averaged_grads에 포함되지 않음)
+                        skipped_param_names.append(param_name)
                 else:
                     # 모든 레이어 업데이트
                     grad = opt_param.data - main_param.detach().to(opt_param.device)
-                    averaged_grad.copy_(grad, non_blocking=True)
+                    averaged_grads[grad_idx].copy_(grad, non_blocking=True)
+                    if not updated_param_names:  # 첫 번째 호출 시에만 로깅
+                        updated_param_names.append(param_name)
+                    grad_idx += 1
                 param_idx += 1
+            
+            # 디버그: 실제로 통신되는 파라미터 로깅
+            current_epoch = getattr(self, '_current_epoch', 0)
+            if not hasattr(self, '_last_logged_epoch'):
+                self._last_logged_epoch = -1
+            
+            # 매 epoch마다 한 번만 또는 매번 상세 로깅 (처음 몇 번만)
+            should_log = current_epoch != self._last_logged_epoch or current_epoch < 3
+            
+            if should_log:
+                logger.info(f"[DEBUG] Computing pseudo gradients (epoch {current_epoch}, step {getattr(self, '_current_step', '?')})")
+                if self.param_update_mask is not None:
+                    logger.info(f"[DEBUG]   - Parameters to be synced: {len(updated_param_names)}/{param_idx}")
+                    logger.info(f"[DEBUG]   - Parameters skipped: {len(skipped_param_names)}/{param_idx}")
+                    
+                    if updated_param_names:
+                        logger.info(f"[DEBUG]   - Synced parameter names:")
+                        for i, name in enumerate(updated_param_names[:30]):  # 처음 30개
+                            logger.info(f"     {i+1}. {name}")
+                        if len(updated_param_names) > 30:
+                            logger.info(f"     ... and {len(updated_param_names) - 30} more parameters")
+                    
+                    if skipped_param_names and len(skipped_param_names) <= 10:
+                        logger.info(f"[DEBUG]   - Skipped parameter names:")
+                        for i, name in enumerate(skipped_param_names[:10]):
+                            logger.info(f"     {i+1}. {name}")
+                else:
+                    logger.info(f"[DEBUG]   - All {param_idx} parameters will be synced")
+                
+                self._last_logged_epoch = current_epoch
 
     def notify_used_averaged_gradients(self):
         """Notify averager that the results of a previous averaging round are accounted for"""
@@ -659,9 +725,11 @@ class DiLoCoOptimizer(Optimizer):
             self.tracker.report_local_progress(self.local_epoch, samples_accumulated=new_samples_accumulated)
 
             self._maybe_schedule_state_averaging()
+            print("call self._maybe_schedule_gradient_averaging()")
             self._maybe_schedule_gradient_averaging()
 
             if scaler is not None:
+                print(datetime.now().strftime("[%Y-%m-%d %H:%M:%S.%f]"), "call scaler.step(self.inner_optimizer)")
                 scaler.step(self.inner_optimizer)
                 if found_inf_grad(self.inner_optimizer, scaler):
                     logger.log(self.status_loglevel, f"Found inf grad at step {self.tracker.real_step}")
@@ -735,8 +803,14 @@ class DiLoCoOptimizer(Optimizer):
             if self.tracker.global_progress.num_peers > 1:
                 logger.log(self.status_loglevel, f"Beginning optimizer step #{self.local_epoch}")
                 time_0 = time.perf_counter()
+
+                # epoch 정보를 grad averager에 전달
+                if hasattr(self.diloco_grad_averager, '_current_epoch'):
+                    self.diloco_grad_averager._current_epoch = self.local_epoch
+                self.diloco_grad_averager._current_step = self.tracker.real_step
+                
                 self.diloco_grad_averager.step(
-                    wait=True, timeout=self.averaging_timeout, control=self.scheduled_diloco_grads
+                    wait=True, timeout=self.averaging_timeout, control=self.scheduled_diloco_grads, epoch=self.local_epoch
                 )
                 time_1 = time.perf_counter()
                 logger.log(
