@@ -1,6 +1,6 @@
 from enum import Enum
 import time
-from typing import Callable, Iterator, List, Optional, Union
+from typing import Callable, Dict, Iterator, List, Optional, Union
 import numpy as np
 
 import os
@@ -34,6 +34,7 @@ from hivemind.optim.progress_tracker import LocalTrainingProgress
 from open_diloco.utils import found_inf_grad
 # cyshin
 import logging
+import socket
 from pydantic.v1 import BaseModel, StrictBool, StrictFloat, confloat, conint
 
 
@@ -80,6 +81,7 @@ class DiLoCoGradAverager(DecentralizedAverager):
         warn: bool = True,
         param_names: Optional[List[str]] = None,
         selective_layer_patterns: Optional[List[str]] = None,
+        token_weighted_aggregation: bool = False,
         **kwargs,
     ):
         if "client_mode" in kwargs:
@@ -105,6 +107,16 @@ class DiLoCoGradAverager(DecentralizedAverager):
         self.local_times_accumulated = 0
 
         self._new_averaged_grads = False
+        
+        # Token-weighted aggregation 지원
+        self.token_weighted_aggregation = token_weighted_aggregation
+        self.cumulative_tokens = 0  # 누적된 token 수
+        self.token_count_key = None  # DHT key for token counts
+        self.worker_id = None  # Worker identifier for DHT
+        self.expected_num_peers = None  # 예상되는 peer 수 (galaxy_size)
+        
+        if self.token_weighted_aggregation:
+            logger.info("Token-weighted aggregation is enabled")
 
         # Selective layer update 지원
         self.param_names = param_names
@@ -192,6 +204,104 @@ class DiLoCoGradAverager(DecentralizedAverager):
         
         assert kwargs.get("weight") is None, "setting weight in schedule_step is not supported"
         return super().step(scheduled_time=scheduled_time, wait=False, require_trigger=True, **kwargs)
+    
+    def _read_token_counts_from_dht(self, wait_for_peers: bool = True, max_wait_time: float = 300.0, check_interval: float = 0.5) -> Dict[str, float]:
+        """DHT에서 모든 노드의 token 수를 읽어옴 (token_weighted_aggregation이 활성화된 경우에만)
+        
+        :param wait_for_peers: True면 expected_num_peers만큼의 노드가 token 수를 업데이트할 때까지 대기
+        :param max_wait_time: 최대 대기 시간 (초)
+        :param check_interval: 대기 중 확인 간격 (초)
+        """
+        if not self.token_weighted_aggregation or self.token_count_key is None or self.dht is None:
+            return {}
+        
+        start_time = time.time()
+        
+        while True:
+            res = self.dht.get(self.token_count_key, latest=True)
+            root = getattr(res, "value", res) if res else None
+            token_counts: Dict[str, float] = {}
+            
+            if isinstance(root, dict):
+                for k, v in root.items():
+                    p = getattr(v, "value", v)
+                    if isinstance(p, dict):
+                        if "tokens" in p and isinstance(p["tokens"], (int, float)):
+                            token_counts[k] = float(p["tokens"])
+            
+            # 자신의 token 수도 포함 (DHT eventual consistency 때문에 바로 반영되지 않을 수 있음)
+            if self.worker_id not in token_counts and self.cumulative_tokens > 0:
+                token_counts[self.worker_id] = self.cumulative_tokens
+            
+            # wait_for_peers가 False이거나, expected_num_peers가 설정되지 않았거나, 충분한 peer 수를 얻었으면 반환
+            if not wait_for_peers or self.expected_num_peers is None:
+                return token_counts
+            
+            num_peers_with_tokens = len(token_counts)
+            
+            # 예상되는 peer 수만큼 token 수를 얻었으면 반환
+            if num_peers_with_tokens >= self.expected_num_peers:
+                logger.debug(
+                    f"Token-weighted aggregation: Got token counts from {num_peers_with_tokens} peers "
+                    f"(expected {self.expected_num_peers})"
+                )
+                return token_counts
+            
+            # 최대 대기 시간 초과 시 현재 상태 반환
+            elapsed_time = time.time() - start_time
+            if elapsed_time >= max_wait_time:
+                logger.warning(
+                    f"Token-weighted aggregation: Timeout waiting for token counts. "
+                    f"Got {num_peers_with_tokens}/{self.expected_num_peers} peers after {elapsed_time:.2f}s. "
+                    f"Using available token counts."
+                )
+                return token_counts
+            
+            # 일정 간격마다 재확인
+            time.sleep(check_interval)
+    
+    def _publish_token_count_to_dht(self, ttl: float = 300.0):
+        """DHT에 현재 노드의 token 수를 publish (token_weighted_aggregation이 활성화된 경우에만)"""
+        if not self.token_weighted_aggregation or self.token_count_key is None or self.worker_id is None or self.dht is None:
+            return
+        
+        now = get_dht_time()
+        payload = {
+            "tokens": float(self.cumulative_tokens),
+            "ts": now,
+            "host": socket.gethostname()
+        }
+        exp = now + ttl
+        self.dht.store(key=self.token_count_key, subkey=self.worker_id, value=payload, expiration_time=exp)
+    
+    def accumulate_tokens(self, token_count: int):
+        """Token 수를 누적 (token_weighted_aggregation이 활성화된 경우에만)"""
+        if self.token_weighted_aggregation:
+            self.cumulative_tokens += token_count
+    
+    def reset_token_count(self):
+        """Token 수를 리셋 및 DHT에서 이전 값 삭제 (outer step 완료 후 호출, token_weighted_aggregation이 활성화된 경우에만)"""
+        if self.token_weighted_aggregation:
+            # DHT에서 이전 token 수 값을 명시적으로 삭제 (다음 iteration에서 혼선 방지)
+            self._delete_token_count_from_dht()
+            self.cumulative_tokens = 0
+    
+    def _delete_token_count_from_dht(self):
+        """DHT에서 현재 노드의 token 수 값을 삭제 (token_weighted_aggregation이 활성화된 경우에만)"""
+        if not self.token_weighted_aggregation or self.token_count_key is None or self.worker_id is None or self.dht is None:
+            return
+        
+        # DHT에서 값을 삭제하려면 value=None을 설정하고 expiration_time을 현재 시간으로 설정
+        # 또는 expiration_time을 과거로 설정하여 즉시 만료되도록 함
+        now = get_dht_time()
+        # value=None과 함께 현재 시간을 expiration_time으로 설정하여 삭제 표시
+        self.dht.store(
+            key=self.token_count_key,
+            subkey=self.worker_id,
+            value=None,
+            expiration_time=now,  # 즉시 만료되도록 설정
+        )
+        logger.debug(f"Deleted previous token count from DHT for worker {self.worker_id}")
 
     def step(
         self,
@@ -232,6 +342,40 @@ class DiLoCoGradAverager(DecentralizedAverager):
             logging.INFO,
             f"Time taken for compute_and_load_pseudo_grad: {time_1_compute_and_load_pseudo_grad - time_0_compute_and_load_pseudo_grad} sec",
         )
+
+        # Token-weighted aggregation: weight 계산 및 설정
+        # weight가 kwargs에 명시적으로 지정되지 않은 경우에만 token 기반 weight 계산
+        if self.token_weighted_aggregation and 'weight' not in kwargs and self.cumulative_tokens > 0:
+            # 자신의 token 수를 DHT에 publish (먼저 publish해서 다른 노드들이 읽을 수 있도록)
+            self._publish_token_count_to_dht()
+            
+            # DHT에서 모든 노드의 token 수 조회 (모든 노드가 업데이트할 때까지 대기)
+            token_counts = self._read_token_counts_from_dht(
+                wait_for_peers=True,
+                max_wait_time=300.0,  # 최대 5분 대기
+                check_interval=0.2  # 0.2초마다 확인
+            )
+            
+            # 모든 노드의 token 수 합산
+            total_tokens = sum(token_counts.values())
+            
+            # Weight 계산: 자신의 token 수 / 전체 token 수
+            if total_tokens > 0:
+                weight = self.cumulative_tokens / total_tokens
+                control.weight = weight
+                logger.info(
+                    f"Token-weighted aggregation: local_tokens={self.cumulative_tokens}, "
+                    f"total_tokens={total_tokens}, weight={weight:.6f}, num_peers={len(token_counts)}"
+                )
+            else:
+                control.weight = 1.0
+                logger.warning("Token-weighted aggregation: total_tokens is 0, using weight=1.0")
+        elif 'weight' in kwargs:
+            # 명시적으로 weight가 지정된 경우 사용
+            control.weight = kwargs['weight']
+        else:
+            # token 수가 0이거나 weight가 지정되지 않은 경우 기본 weight 사용 (1.0)
+            logger.debug(f"Token-weighted aggregation: using default weight (cumulative_tokens={self.cumulative_tokens})")
 
         control.allow_allreduce()
 
@@ -490,12 +634,14 @@ class DiLoCoOptimizer(Optimizer):
         lora: bool | None = False,
         selective_layer_patterns: Optional[List[str]] = None,
         param_names: Optional[List[str]] = None,
+        token_weighted_aggregation: bool = False,
         **kwargs,
     ):
         self._check_kwargs(kwargs)
         
         # Selective layer update를 위한 파라미터 이름 수집
         self.selective_layer_patterns = selective_layer_patterns
+        self.token_weighted_aggregation = token_weighted_aggregation
         if selective_layer_patterns is not None:
             if param_names is None:
                 # param_names가 제공되지 않으면 모델에서 직접 추출 시도
@@ -642,8 +788,18 @@ class DiLoCoOptimizer(Optimizer):
             start=True,
             param_names=param_names,
             selective_layer_patterns=self.selective_layer_patterns,
+            token_weighted_aggregation=self.token_weighted_aggregation,
             **kwargs,
         )
+        
+        # Token-weighted aggregation을 위한 설정 (활성화된 경우에만)
+        if self.token_weighted_aggregation:
+            RUN_ID = "OpenDiLoCo"
+            grad_averager.token_count_key = f"{RUN_ID}:tokens"
+            grad_averager.worker_id = f"{socket.gethostname()}-pid{os.getpid()}"
+            grad_averager.cumulative_tokens = 0
+            # expected_num_peers는 step() 호출 시점에 tracker에서 동적으로 설정됨
+        
         return grad_averager
 
     def _make_state_averager(self, **kwargs) -> DiLoCoStateAverager:
@@ -809,6 +965,14 @@ class DiLoCoOptimizer(Optimizer):
                     self.diloco_grad_averager._current_epoch = self.local_epoch
                 self.diloco_grad_averager._current_step = self.tracker.real_step
                 
+                # Token-weighted aggregation을 위한 expected_num_peers 설정
+                if self.diloco_grad_averager.token_weighted_aggregation:
+                    # tracker에서 현재 peer 수를 가져와서 설정 (최소한의 예상 값)
+                    self.diloco_grad_averager.expected_num_peers = max(
+                        self.tracker.global_progress.num_peers,
+                        2  # 최소 2개 노드는 있어야 함
+                    )
+                
                 self.diloco_grad_averager.step(
                     wait=True, timeout=self.averaging_timeout, control=self.scheduled_diloco_grads, epoch=self.local_epoch
                 )
@@ -819,6 +983,10 @@ class DiLoCoOptimizer(Optimizer):
                 )
 
                 self.diloco_grad_averager.notify_used_averaged_gradients()
+                
+                # Token 수 리셋 (outer step 완료 후)
+                self.diloco_grad_averager.reset_token_count()
+                
                 self.scheduled_diloco_grads = None
             else:
                 self.diloco_grad_averager.compute_and_load_pseudo_grad_into_averager()

@@ -209,6 +209,10 @@ class HvConfig(BaseConfig):
     fail_rank_drop: bool = False  # fail if we lose a diloco worker
     # Selective layer update
     selective_layer_patterns: list[str] | None = None  # 업데이트할 레이어 패턴 목록 (예: ["model.layers.0", "model.layers.1", "lm_head"])
+    # Token-weighted aggregation
+    token_weighted_aggregation: bool = False  # If True, use token-weighted aggregation instead of uniform averaging
+    # Outer optimization steps limit
+    max_outer_optimization_steps: int | None = None  # If set, training will stop after this many outer optimization steps
 
     
     @field_validator('initial_peers', mode='before')
@@ -431,6 +435,32 @@ def read_speeds(dht: DHT, key: str) -> Dict[str, float]:
 
 def unwrap(v):
     return getattr(v, "value", v)
+
+
+def read_token_counts(dht: DHT, key: str) -> Dict[str, float]:
+    """DHT에서 각 노드의 누적 token 수를 읽어옴"""
+    res = dht.get(key, latest=True)
+    root = unwrap(res) if res else None
+    token_counts: Dict[str, float] = {}
+    if isinstance(root, dict):
+        for k, v in root.items():
+            p = unwrap(v)
+            if isinstance(p, dict):
+                if "tokens" in p and isinstance(p["tokens"], (int, float)):
+                    token_counts[k] = float(p["tokens"])
+    return token_counts
+
+
+def publish_token_count(dht: DHT, key: str, worker_id: str, token_count: int, ttl: float = 30.0):
+    """DHT에 현재 노드의 누적 token 수를 publish"""
+    now = get_dht_time()
+    payload = {
+        "tokens": float(token_count),
+        "ts": now,
+        "host": socket.gethostname()
+    }
+    exp = now + ttl
+    dht.store(key=key, subkey=worker_id, value=payload, expiration_time=exp)
 
 
 def wait_for_all_nodes_ready(dht: DHT, galaxy_size: int, log_fn):
@@ -745,6 +775,7 @@ def train(config: Config):
             lora=config.lora,
             selective_layer_patterns=config.hv.selective_layer_patterns,
             param_names=param_names,
+            token_weighted_aggregation=config.hv.token_weighted_aggregation,
         )
 
         diloco_args.update(get_compression_kwargs(config.hv.hivemind_compression))
@@ -837,11 +868,6 @@ def train(config: Config):
     
     # 모든 노드 준비 체크 플래그
     all_nodes_ready = False
-    
-    # 모든 노드가 준비될 때까지 대기
-    if world_messenger_hv and not all_nodes_ready:
-        wait_for_all_nodes_ready(dht, config.hv.galaxy_size, log)
-        all_nodes_ready = True
 
     for step, batch in enumerate(iterable=train_dataloader, start=start_step * gradient_accumulation_steps):
         real_step = (step + 1) // gradient_accumulation_steps
@@ -875,8 +901,31 @@ def train(config: Config):
 
             loss_batch += loss.detach()
 
+            # Token 수 계산 및 누적 (token-weighted aggregation용)
+            if (world_messenger_hv 
+                and not is_accumulating 
+                and config.hv is not None 
+                and config.hv.token_weighted_aggregation):
+                # Batch의 실제 token 수 계산 (padding 제외)
+                if 'attention_mask' in batch:
+                    batch_token_count = batch['attention_mask'].sum().item()
+                elif 'input_ids' in batch:
+                    batch_token_count = batch['input_ids'].numel()
+                else:
+                    # attention_mask나 input_ids가 없으면 seq_length * batch_size로 추정
+                    batch_token_count = config.seq_length * config.per_device_train_batch_size
+                
+                # Token 수를 optimizer에 누적
+                if hasattr(optimizer, 'diloco_grad_averager'):
+                    optimizer.diloco_grad_averager.accumulate_tokens(batch_token_count)
+
             scaler.scale(loss).backward()
 
+        # 모든 노드가 준비될 때까지 대기
+        if world_messenger_hv and not all_nodes_ready:
+            wait_for_all_nodes_ready(dht, config.hv.galaxy_size, log)
+            all_nodes_ready = True
+        
         if logging_activations_steps:
             for handle in handles:
                 handle.remove()
@@ -1061,6 +1110,10 @@ def train(config: Config):
 
                     metrics["outer_lr"] = outer_lr
                     metrics["num_peers"] = num_peers
+                    
+                    # Track outer optimization steps (epoch represents outer optimization count)
+                    outer_optimization_steps = optimizer.tracker.local_progress.epoch
+                    metrics["outer_optimization_steps"] = outer_optimization_steps
 
                 if logging_activations_steps:
                     metrics.update(log_activations)
@@ -1124,6 +1177,14 @@ def train(config: Config):
                             log(f"Deleted old checkpoints: {ckpt_deleted}")
 
             loss_batch = 0
+
+            # Check outer optimization steps limit
+            if world_messenger_hv and config.hv is not None and config.hv.max_outer_optimization_steps is not None:
+                outer_optimization_steps = optimizer.tracker.local_progress.epoch
+                if outer_optimization_steps >= config.hv.max_outer_optimization_steps:
+                    if rank == 0:
+                        log(f"Reached max outer optimization steps ({config.hv.max_outer_optimization_steps}). Stopping training.")
+                    break
 
             if config.max_steps is not None and real_step >= config.max_steps:
                 break
