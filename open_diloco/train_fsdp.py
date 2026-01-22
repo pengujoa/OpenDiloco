@@ -12,6 +12,7 @@ import socket
 import time
 import math
 import re
+import hashlib
 from contextlib import nullcontext
 import datetime
 from typing import Any, Literal, Dict
@@ -87,6 +88,13 @@ from batch_size_finder import find_max_batch_size_for_model
 from speed_profiler import measure_steps_per_second
 
 from peft import get_peft_model, LoraConfig, TaskType
+
+from dataset_splitter import (
+    split_dataset_by_worker_batch_size,
+    publish_node_info,
+    get_node_batch_sizes_from_dht,
+    read_node_info,
+)
 
 
 TIMEOUT_NCCL_MINUTES = os.environ.get("TIMEOUT_NCCL_MINUTES", 120)
@@ -235,7 +243,7 @@ class Config(BaseConfig):
     num_workers: int = 4
     # Optimization
     lr: float = 4e-4
-    total_batch_size: int = 512
+    total_batch_size: int = 512  # Reference batch size for learning rate scaling (lr was tuned for this batch size)
     per_device_train_batch_size: int = 32
     warmup_steps: int = 1000
     total_steps: int = 88_000
@@ -251,8 +259,6 @@ class Config(BaseConfig):
     hv: HvConfig | None = None  # if no hv config then hivemind is disabled
     fake_data: bool = False
     max_steps: int | None = None
-    # Node-specific GPU configuration
-    node_gpu_counts: list[int] = Field(..., description="List of GPU counts per node. Must be provided.") # List to store GPU counts per node
     # Lora
     lora: bool | None = False
     # Batch size finder
@@ -261,16 +267,14 @@ class Config(BaseConfig):
     adjust_local_steps: bool = False  # If True, adjust local_steps based on node speed distribution; if False, use initial value
     # Validation
     validation: bool = False  # If True, run validation after each local_steps (inter-node synchronization)
-
-    @field_validator('node_gpu_counts', mode='before')
-    def _parse_str_to_int_list(cls, v):
-        if isinstance(v, list):
-            return v
-        items = v.strip('[]').split(',')
-        return [int(item) for item in items if item.strip()]
     
     
-def get_dataloader(tokenizer, world_size, rank, local_rank, config: Config) -> StatefulDataLoader:
+def get_dataloader(tokenizer, world_size, rank, local_rank, config: Config, dht: DHT | None = None) -> tuple[StatefulDataLoader, int, int]:
+    """Returns (dataloader, actual_total_batch_size, actual_per_device_batch_size) tuple.
+    actual_total_batch_size: total batch size across all nodes (for reference)
+    actual_per_device_batch_size: per device batch size (used for learning rate scaling)"""
+    actual_total_batch_size = config.total_batch_size  # Default to config value
+    actual_per_device_batch_size = config.per_device_train_batch_size  # Default to config value
     if config.fake_data:
         train_dataset = FakeTokenizedDataset(config.seq_length, TEST_VOCAB_SIZE)
     else:
@@ -292,29 +296,86 @@ def get_dataloader(tokenizer, world_size, rank, local_rank, config: Config) -> S
         ]
 
         if config.hv is not None:
-            print("MY LOCAL RANK: ", local_rank)
-            print("MY RANK: ", sum(config.node_gpu_counts[:config.hv.world_rank]) + local_rank)
-            train_dataset = split_dataset_by_node(
-                tokenized_datasets,
-                world_size=sum(config.node_gpu_counts),
-                rank=sum(config.node_gpu_counts[:config.hv.world_rank]) + local_rank,
+            if dht is None:
+                raise ValueError("DHT must be provided when using hivemind for dataset splitting")
+            
+            # DHT에서 모든 노드의 batch size, GPU worker 수, per_device_batch_size 정보를 받아옴
+            RUN_ID = "OpenDiLoCo"
+            node_batch_sizes, node_gpu_counts, node_per_device_batch_sizes = get_node_batch_sizes_from_dht(
+                dht=dht,
+                run_id=RUN_ID,
+                galaxy_size=config.hv.galaxy_size,
+                timeout=120.0,
             )
+            
+            # 현재 worker의 global rank 계산
+            global_rank = sum(node_gpu_counts[:config.hv.world_rank]) + local_rank
+            
+            # 현재 worker의 per device batch size
+            current_worker_batch_size = node_per_device_batch_sizes[config.hv.world_rank]
+            actual_per_device_batch_size = current_worker_batch_size  # Update actual per device batch size
+            
+            print(f"MY LOCAL RANK: {local_rank}, MY WORLD RANK: {config.hv.world_rank}, MY GLOBAL RANK: {global_rank}")
+            print(f"Node batch sizes: {node_batch_sizes}")
+            print(f"Node GPU counts: {node_gpu_counts}")
+            print(f"Node per_device_batch_sizes: {node_per_device_batch_sizes}")
+            print(f"Total GPU workers: {sum(node_gpu_counts)}")
+            actual_total_batch_size = sum(node_batch_sizes)
+            print(f"Total batch size: {actual_total_batch_size}")
+            print(f"Current worker per_device_batch_size: {current_worker_batch_size}")
+            
+            # 각 GPU worker별 batch size에 비례하여 데이터셋 분할
+            train_dataset = split_dataset_by_worker_batch_size(
+                tokenized_datasets,
+                node_batch_sizes=node_batch_sizes,
+                node_gpu_counts=node_gpu_counts,
+                node_per_device_batch_sizes=node_per_device_batch_sizes,
+                world_rank=config.hv.world_rank,
+                local_rank=local_rank,
+            )
+            
+            # Clean up node_info data from DHT after dataloader initialization is complete
+            if local_rank == 0:
+                node_info_key = f"{RUN_ID}:node_info"
+                node_info = read_node_info(dht, node_info_key)
+                now = get_dht_time()
+                print(f"[INFO] Cleaning up node_info data from DHT...")
+                deleted_count = 0
+                for worker_id in node_info.keys():
+                    dht.store(key=node_info_key, subkey=worker_id, value=None, expiration_time=now - 1)
+                    deleted_count += 1
+                print(f"[INFO] Deleted {deleted_count} node_info entries from DHT")
 
         else:
             train_dataset = split_dataset_by_node(tokenized_datasets, world_size=world_size, rank=rank)
 
+    # Print train dataset size
+    try:
+        train_dataset_size = len(train_dataset)
+        if rank == 0:
+            log(f"Train dataset size: {train_dataset_size:,} samples")
+    except (TypeError, AttributeError):
+        if rank == 0:
+            log("Train dataset size: streaming dataset (size unknown)")
+
     data_collator = DataCollatorForLanguageModeling(tokenizer=tokenizer, mlm=False)
 
-    return StatefulDataLoader(
+    dataloader = StatefulDataLoader(
         train_dataset,
         collate_fn=data_collator,
         batch_size=config.per_device_train_batch_size,
         num_workers=config.num_workers,
     )
+    
+    # Return actual total batch size and per device batch size for learning rate scaling
+    return dataloader, actual_total_batch_size, actual_per_device_batch_size
 
 
 def get_validation_dataloader(tokenizer, config: Config) -> StatefulDataLoader:
-    """Create validation dataloader."""
+    """Create validation dataloader with fixed 1,000 samples using fixed seed."""
+    VALIDATION_SEED = 42  # Fixed seed for reproducible validation samples
+    VALIDATION_SAMPLE_SIZE = 1000  # Fixed number of samples for validation
+    
     if config.fake_data:
         # For fake data, create a small validation dataset
         validation_dataset = FakeTokenizedDataset(config.seq_length, TEST_VOCAB_SIZE)
@@ -343,12 +404,24 @@ def get_validation_dataloader(tokenizer, config: Config) -> StatefulDataLoader:
                 # Fallback: use a subset of train data for validation
                 log("Warning: No validation split found. Using train split subset for validation.")
                 train_data = tokenized_datasets["train"]
-                validation_dataset = train_data.take(1000)  # Use first 1000 samples
+                validation_dataset = train_data
         except Exception as e:
             log(f"Warning: Could not load validation split: {e}. Using train split subset.")
             tokenized_datasets = ds.map(tokenize_function, batched=True, remove_columns=["text", "timestamp", "url"])
             train_data = tokenized_datasets["train"]
-            validation_dataset = train_data.take(1000)
+            validation_dataset = train_data
+        
+        # Fixed random sampling: shuffle with fixed seed and take 1,000 samples
+        # This ensures the same samples are used throughout training for consistent PPL measurement
+        validation_dataset = validation_dataset.shuffle(seed=VALIDATION_SEED, buffer_size=10000).take(VALIDATION_SAMPLE_SIZE)
+        log(f"Validation dataset: Fixed {VALIDATION_SAMPLE_SIZE:,} samples (seed={VALIDATION_SEED}) for consistent PPL measurement")
+    
+    # Print validation dataset size
+    try:
+        validation_dataset_size = len(validation_dataset)
+        log(f"Validation dataset size: {validation_dataset_size:,} samples")
+    except (TypeError, AttributeError):
+        log(f"Validation dataset size: {VALIDATION_SAMPLE_SIZE:,} samples (streaming, fixed seed={VALIDATION_SEED})")
     
     data_collator = DataCollatorForLanguageModeling(tokenizer=tokenizer, mlm=False)
     
@@ -360,44 +433,110 @@ def get_validation_dataloader(tokenizer, config: Config) -> StatefulDataLoader:
     )
 
 
-def validate_model(validation_dataloader, model, half_precision: bool, half_precision_dtype, rank: int, world_size: int):
+def validate_model(validation_dataloader, model, half_precision: bool, half_precision_dtype, rank: int, world_size: int, max_batches: int | None = None):
     """Validate model on validation dataset. All ranks must participate for FSDP."""
+    # Import torch._dynamo at the top to avoid UnboundLocalError
+    import torch._dynamo
+    
     loss_val = 0.0
     step_val = 0
     
     validation_start_time = time.time()
     
-    model.eval()
-    with torch.no_grad():
-        for batch_val in validation_dataloader:
-            for key in batch_val.keys():
-                batch_val[key] = batch_val[key].to("cuda")
-            
-            # Use the same dtype handling as train (FSDP MixedPrecision handles it automatically)
-            # All ranks must participate in forward pass for FSDP
-            outputs = model(**batch_val)
-            loss_val += outputs.loss.item()
-            
-            step_val += 1
+   
+    # Disable torch.compile for validation to avoid dtype mismatch errors
+    # The error occurs when torch.compile tries to trace operations with mismatched dtypes
+    # (gradient dtype 'float' vs tensor dtype 'c10::Half')
+    original_disable = torch._dynamo.config.disable
+    torch._dynamo.config.disable = True
     
-    validation_end_time = time.time()
-    model.train()
+    try:
+        model.eval()
+        with torch.no_grad():
+            # Use autocast for mixed precision in validation
+            autocast_context = torch.autocast(device_type="cuda", dtype=half_precision_dtype) if half_precision else nullcontext()
+            
+            if rank == 0:
+                log(f"Starting validation loop (max_batches={max_batches})...")
+            
+            for batch_idx, batch_val in enumerate(validation_dataloader):
+                # Limit the number of batches to process
+                if max_batches is not None and batch_idx >= max_batches:
+                    if rank == 0:
+                        log(f"Reached max_batches limit ({max_batches}), stopping validation.")
+                    break
+                
+                if rank == 0 and batch_idx % 10 == 0:
+                    log(f"Processing validation batch {batch_idx}...")
+                
+                # Move batch to GPU
+                for key in batch_val.keys():
+                    batch_val[key] = batch_val[key].to("cuda")
+                
+                # All ranks must participate in forward pass for FSDP
+                with autocast_context:
+                    outputs = model(**batch_val)
+                loss_val += outputs.loss.item()
+                
+                step_val += 1
+                
+                # Clear batch from GPU memory immediately after processing
+                del batch_val
+                del outputs
+
+        validation_end_time = time.time()
+        model.train()
+        
+
+    except Exception as e:
+        if rank == 0:
+            log(f"[rank 0] Exception during validation: {e}")
+        raise
+    finally:
+        # Restore original torch._dynamo config
+        torch._dynamo.config.disable = original_disable
     
-    if step_val > 0:
-        loss_val /= step_val
-        perplexity_val = math.exp(loss_val)
+    # Synchronize all ranks before proceeding to all_reduce
+    if rank == 0:
+        log(f"[rank 0] Validation loop finished: step_val={step_val}, loss_val={loss_val} (sum)")
+    
+    torch.distributed.barrier()
+    
+    if rank == 0:
+        log(f"[rank 0] All ranks synchronized after validation loop")
+    
+    # Calculate average loss correctly across all ranks
+    # loss_val is currently the SUM of losses, not the average
+    # We need to sum across all ranks and divide by total steps
+    
+    # First, sum step_val across all ranks to get total batches processed
+    step_val_tensor = torch.tensor(step_val, device="cuda", dtype=torch.int32)
+    torch.distributed.all_reduce(step_val_tensor, op=torch.distributed.ReduceOp.SUM)
+    total_step_val = step_val_tensor.item()
+    
+    if rank == 0:
+        log(f"[rank 0] Total batches across all ranks: {total_step_val}, local_step_val={step_val}")
+    
+    # Sum loss_val across all ranks (loss_val is sum, not average)
+    loss_tensor = torch.tensor(loss_val, device="cuda", dtype=torch.float32)
+    if rank == 0:
+        log(f"[rank 0] Before all_reduce: loss_val={loss_val} (sum), step_val={step_val}")
+    
+    torch.distributed.all_reduce(loss_tensor, op=torch.distributed.ReduceOp.SUM)
+    
+    if rank == 0:
+        log(f"[rank 0] all_reduce completed: total_loss_sum={loss_tensor.item()}, total_steps={total_step_val}")
+    
+    # Now divide by total steps to get the correct average
+    if total_step_val > 0:
+        loss_val = loss_tensor.item() / total_step_val
     else:
         loss_val = float('inf')
-        perplexity_val = float('inf')
     
-    # Average loss across all ranks for consistent results
-    loss_tensor = torch.tensor(loss_val, device="cuda")
-    torch.distributed.all_reduce(loss_tensor, op=torch.distributed.ReduceOp.AVG)
-    loss_val = loss_tensor.item()
     perplexity_val = math.exp(loss_val)
     
     if rank == 0:
-        log(f"Validation completed: {step_val} batches, time: {validation_end_time - validation_start_time:.2f} seconds")
+        log(f"Validation completed: {total_step_val} total batches (local: {step_val}), time: {validation_end_time - validation_start_time:.2f} seconds")
     
     return {
         "validation_loss": loss_val,
@@ -502,6 +641,17 @@ def wait_for_all_nodes_ready(dht: DHT, galaxy_size: int, log_fn):
         
         time.sleep(2.0)  # 2초마다 확인
     
+    # 모든 노드가 준비되었으므로 ready 상태를 5초 후에 만료되도록 업데이트
+    now = get_dht_time()
+    ready_payload = {
+        "ready": True,
+        "ts": now,
+        "host": socket.gethostname()
+    }
+    exp = now + 5.0  # 5초 후 만료
+    dht.store(key=ready_key, subkey=worker_id, value=ready_payload, expiration_time=exp)
+    log_fn(f"Updated ready state expiration to 5 seconds for {worker_id}")
+    
     log_fn("All nodes are ready. Starting training loop.")
 
 
@@ -532,119 +682,130 @@ def train(config: Config):
 
     if config.hv is not None:
         log("hivemind diloco enabled")
-
-    if world_messenger_hv:
+        # 모든 rank에서 DHT 초기화 (데이터셋 분할을 위해 필요)
         dht = DHT(
             start=True,
             initial_peers=config.hv.initial_peers,
             host_maddrs=config.hv.host_maddrs,
             announce_maddrs=config.hv.announce_maddrs,
         )
-        log_visible_maddrs(dht.get_visible_maddrs(), only_p2p=False)
+        if world_messenger_hv:
+            log_visible_maddrs(dht.get_visible_maddrs(), only_p2p=False)
 
-        if config.adjust_local_steps:
-            # 원래 입력으로 받은 local_steps 값 저장
-            original_local_steps = config.hv.local_steps
-            print(f"[INFO] Original local_steps from input: {original_local_steps}")
+            if config.adjust_local_steps:
+                # 원래 입력으로 받은 local_steps 값 저장
+                original_local_steps = config.hv.local_steps
+                print(f"[INFO] Original local_steps from input: {original_local_steps}")
 
-            # Measure speeds & compute inner (local) steps
-            PUBLISH_INTERVAL = 10.0
-            TTL = 30.0
-            # 1) key
-            RUN_ID = "OpenDiLoCo"
-            key = f"{RUN_ID}:speed"
-            # 2) subkey
-            GPU = int(os.getenv("LOCAL_RANK", "0"))
-            torch.cuda.set_device(GPU)
-            gpu_name = torch.cuda.get_device_name(GPU)
-            worker_id = f"{socket.gethostname()}-pid{os.getpid()}-gpu{GPU}"
-            # 3) Load model config for benchmarking
-            model_config = LlamaConfig.from_pretrained(config.path_model, attn_implementation=config.attn_implementation, resume_download=True)
-            # 4) measure speed using actual batch size, model config, and precision
-            print(f"[{worker_id}] Starting speed profiling with precision={config.precision}...")
-            profiling_start_time = time.time()
-            steps_per_sec = measure_steps_per_second(GPU, config.per_device_train_batch_size, model_config, config.precision)
-            profiling_elapsed_time = time.time() - profiling_start_time
-            print(f"[{worker_id}] Speed profiling completed in {profiling_elapsed_time:.2f} seconds")
-            # repeat
-            while True:
-                # 4) value            
-                now = get_dht_time()        
-                payload = {
-                    "steps_per_sec": float(steps_per_sec), 
-                    "ts": now, 
-                    "host": socket.gethostname(), 
-                    "gpu_id": GPU,
-                    "gpu_name": gpu_name
-                }
-                # 5) expiration time            
-                exp = now + TTL
-                # 6) store in DHT        
-                ok = dht.store(key=key, subkey=worker_id, value=payload, expiration_time=exp)     
-                # 7) print result 
-                print(f"[publish] {worker_id} ({gpu_name}): {steps_per_sec:.2f} steps/sec ({'ok' if ok else 'fail'})")
+                # Measure speeds & compute inner (local) steps
+                PUBLISH_INTERVAL = 10.0
+                TTL = 30.0
+                # 1) key
+                RUN_ID = "OpenDiLoCo"
+                key = f"{RUN_ID}:speed"
+                # 2) subkey
+                GPU = int(os.getenv("LOCAL_RANK", "0"))
+                torch.cuda.set_device(GPU)
+                gpu_name = torch.cuda.get_device_name(GPU)
+                worker_id = f"{socket.gethostname()}-pid{os.getpid()}-gpu{GPU}"
+                # 3) Load model config for benchmarking
+                model_config = LlamaConfig.from_pretrained(config.path_model, attn_implementation=config.attn_implementation, resume_download=True)
+                # 4) measure speed using actual batch size, model config, and precision
+                print(f"[{worker_id}] Starting speed profiling with precision={config.precision}...")
+                profiling_start_time = time.time()
+                steps_per_sec = measure_steps_per_second(GPU, config.per_device_train_batch_size, model_config, config.precision)
+                profiling_elapsed_time = time.time() - profiling_start_time
+                print(f"[{worker_id}] Speed profiling completed in {profiling_elapsed_time:.2f} seconds")
+                # repeat
+                while True:
+                    # 4) value            
+                    now = get_dht_time()        
+                    payload = {
+                        "steps_per_sec": float(steps_per_sec), 
+                        "ts": now, 
+                        "host": socket.gethostname(), 
+                        "gpu_id": GPU,
+                        "gpu_name": gpu_name
+                    }
+                    # 5) expiration time            
+                    exp = now + TTL
+                    # 6) store in DHT        
+                    ok = dht.store(key=key, subkey=worker_id, value=payload, expiration_time=exp)     
+                    # 7) print result 
+                    print(f"[publish] {worker_id} ({gpu_name}): {steps_per_sec:.2f} steps/sec ({'ok' if ok else 'fail'})")
 
-                # 8) read all speeds
-                speeds = read_speeds(dht, key)
-                if not speeds:
-                    print(f"[error] no usable speeds at '{key}'. Is the publisher running?")
-                    return 2
-                if len(speeds) < config.hv.galaxy_size:
-                    print(len(speeds), "speeds found, waiting for", config.hv.galaxy_size)
-                    # 다음 PUBLISH_INTERVAL초 단위 경계까지 대기
-                    time_in_cycle = now % PUBLISH_INTERVAL
-                    sleep_duration = PUBLISH_INTERVAL - time_in_cycle
-                    print(f"[sync] Waiting {sleep_duration:.2f}s until next {PUBLISH_INTERVAL}s boundary")
-                    time.sleep(sleep_duration)
-                else:
-                    break
-                    
-            # 9) compute inner (local) steps based on speed distribution
-            # 전체 epoch의 작업량 = 노드 개수 * 원래 local_steps
-            total_work = config.hv.galaxy_size * original_local_steps
-            print(f"[INFO] Total work per epoch: {config.hv.galaxy_size} nodes × {original_local_steps} steps = {total_work} steps")
-            
-            # 모든 노드의 속도를 정렬된 리스트로 변환 (worker_id, speed)
-            sorted_speeds = sorted(speeds.items(), key=lambda x: x[1], reverse=True)  # 속도 내림차순
-            total_speed = sum(speeds.values())
-            print(f"[INFO] Total speed across all nodes: {total_speed:.2f} steps/sec")
-            
-            # 각 노드의 local_steps 할당 계산 (비례 분배)
-            allocations = {}
-            allocated_sum = 0
-            
-            for i, (wid, speed) in enumerate(sorted_speeds):
-                speed_ratio = speed / total_speed
-                if i < len(sorted_speeds) - 1:
-                    # 마지막 노드가 아닌 경우 floor 사용
-                    allocated_steps = int(math.floor(total_work * speed_ratio))
-                    allocated_steps = max(1, allocated_steps)  # 최소 1 step 보장
-                else:
-                    # 마지막 노드는 나머지를 모두 할당하여 total_work를 정확히 맞춤
-                    allocated_steps = total_work - allocated_sum
-                    allocated_steps = max(1, allocated_steps)  # 최소 1 step 보장
+                    # 8) read all speeds
+                    speeds = read_speeds(dht, key)
+                    if not speeds:
+                        print(f"[error] no usable speeds at '{key}'. Is the publisher running?")
+                        return 2
+                    if len(speeds) < config.hv.galaxy_size:
+                        print(len(speeds), "speeds found, waiting for", config.hv.galaxy_size)
+                        # 다음 PUBLISH_INTERVAL초 단위 경계까지 대기
+                        time_in_cycle = now % PUBLISH_INTERVAL
+                        sleep_duration = PUBLISH_INTERVAL - time_in_cycle
+                        print(f"[sync] Waiting {sleep_duration:.2f}s until next {PUBLISH_INTERVAL}s boundary")
+                        time.sleep(sleep_duration)
+                    else:
+                        break
+                        
+                # 9) compute inner (local) steps based on speed distribution
+                # 전체 epoch의 작업량 = 노드 개수 * 원래 local_steps
+                total_work = config.hv.galaxy_size * original_local_steps
+                print(f"[INFO] Total work per epoch: {config.hv.galaxy_size} nodes × {original_local_steps} steps = {total_work} steps")
                 
-                allocations[wid] = allocated_steps
-                allocated_sum += allocated_steps
-            
-            # 현재 노드의 local_steps 설정
-            config.hv.local_steps = allocations[worker_id]
-            
-            # 검증: 모든 할당량의 합이 total_work와 일치하는지 확인
-            print(f"[INFO] Local steps allocation verification:")
-            print(f"[INFO]   - Total work: {total_work}")
-            print(f"[INFO]   - Sum of allocations: {allocated_sum}")
-            print(f"[INFO]   - Match: {allocated_sum == total_work}")
-            
-            # 현재 노드의 속도 비율
-            speed_ratio = steps_per_sec / total_speed
-            print(f"[INFO] Speed distribution-based local_steps allocation:")
-            print(f"[INFO]   - Current node speed: {steps_per_sec:.2f} steps/sec ({speed_ratio*100:.2f}%)")
-            print(f"[INFO]   - Allocated local_steps: {config.hv.local_steps}")
-            print(f"[INFO]   - Actual contribution: {config.hv.local_steps / total_work * 100:.2f}% of total work")
-            print(f"[DEBUG] batch_size={batch_size}, target_batch_size will be={batch_size * config.hv.local_steps}")
-        else:
-            print(f"[INFO] Using initial local_steps value: {config.hv.local_steps} (adjust_local_steps=False)")
+                # 모든 노드의 속도를 정렬된 리스트로 변환 (worker_id, speed)
+                sorted_speeds = sorted(speeds.items(), key=lambda x: x[1], reverse=True)  # 속도 내림차순
+                total_speed = sum(speeds.values())
+                print(f"[INFO] Total speed across all nodes: {total_speed:.2f} steps/sec")
+                
+                # 각 노드의 local_steps 할당 계산 (비례 분배)
+                allocations = {}
+                allocated_sum = 0
+                
+                for i, (wid, speed) in enumerate(sorted_speeds):
+                    speed_ratio = speed / total_speed
+                    if i < len(sorted_speeds) - 1:
+                        # 마지막 노드가 아닌 경우 floor 사용
+                        allocated_steps = int(math.floor(total_work * speed_ratio))
+                        allocated_steps = max(1, allocated_steps)  # 최소 1 step 보장
+                    else:
+                        # 마지막 노드는 나머지를 모두 할당하여 total_work를 정확히 맞춤
+                        allocated_steps = total_work - allocated_sum
+                        allocated_steps = max(1, allocated_steps)  # 최소 1 step 보장
+                    
+                    allocations[wid] = allocated_steps
+                    allocated_sum += allocated_steps
+                
+                # 현재 노드의 local_steps 설정
+                config.hv.local_steps = allocations[worker_id]
+                
+                # 검증: 모든 할당량의 합이 total_work와 일치하는지 확인
+                print(f"[INFO] Local steps allocation verification:")
+                print(f"[INFO]   - Total work: {total_work}")
+                print(f"[INFO]   - Sum of allocations: {allocated_sum}")
+                print(f"[INFO]   - Match: {allocated_sum == total_work}")
+                
+                # 현재 노드의 속도 비율
+                speed_ratio = steps_per_sec / total_speed
+                print(f"[INFO] Speed distribution-based local_steps allocation:")
+                print(f"[INFO]   - Current node speed: {steps_per_sec:.2f} steps/sec ({speed_ratio*100:.2f}%)")
+                print(f"[INFO]   - Allocated local_steps: {config.hv.local_steps}")
+                print(f"[INFO]   - Actual contribution: {config.hv.local_steps / total_work * 100:.2f}% of total work")
+                print(f"[DEBUG] batch_size={batch_size}, target_batch_size will be={batch_size * config.hv.local_steps}")
+                
+                # Clean up speed data from DHT after local_steps calculation is complete
+                if local_rank == 0:
+                    now = get_dht_time()
+                    print(f"[INFO] Cleaning up speed data from DHT...")
+                    for wid in speeds.keys():
+                        dht.store(key=key, subkey=wid, value=None, expiration_time=now - 1)
+                    print(f"[INFO] Deleted {len(speeds)} speed entries from DHT")
+            else:
+                print(f"[INFO] Using initial local_steps value: {config.hv.local_steps} (adjust_local_steps=False)")
+
+    else:
+        dht = None 
     
     # Broadcast local_steps to all ranks to ensure consistency
     if config.hv is not None:
@@ -653,7 +814,29 @@ def train(config: Config):
         torch.distributed.broadcast(local_steps_tensor, src=0)
         config.hv.local_steps = int(local_steps_tensor.item())
         print(f"[DEBUG] rank={rank}, local_rank={local_rank}: synchronized local_steps={config.hv.local_steps}")
+        
+        # Validation uses fixed 1,000 samples (seed=42) for consistent PPL measurement
+        if config.validation and rank == 0:
+            log(f"Validation: Using fixed 1,000 samples (seed=42) for consistent PPL measurement")
+        
+        # DHT에 노드 정보 publish (local_rank 0만, 모든 노드에서)
+        if local_rank == 0:
+            RUN_ID = "OpenDiLoCo"
+            node_info_key = f"{RUN_ID}:node_info"
+            local_world_size = int(os.environ.get("LOCAL_WORLD_SIZE", world_size))
+            worker_id = f"{socket.gethostname()}-world_rank{config.hv.world_rank}"
             
+            # 주기적으로 노드 정보를 publish
+            publish_node_info(
+                dht=dht,
+                key=node_info_key,
+                worker_id=worker_id,
+                world_rank=config.hv.world_rank,
+                gpu_count=local_world_size,
+                per_device_batch_size=config.per_device_train_batch_size,
+                ttl=300.0,
+            )
+            log(f"Published node info: worker_id={worker_id}, gpu_count={local_world_size}, per_device_batch_size={config.per_device_train_batch_size}")
 
     if local_rank == 0:
         check_checkpoint_path_access(config.ckpt.path, rank, config.hv.world_rank if config.hv else None)
@@ -662,9 +845,59 @@ def train(config: Config):
     tokenizer = AutoTokenizer.from_pretrained("mistralai/Mistral-7B-v0.1", use_fast=True, resume_download=True)
     tokenizer.pad_token = "</s>"  # Ensure pad token is set for models that need it
 
-    train_dataloader = get_dataloader(tokenizer, world_size, rank, local_rank, config)
+    train_dataloader, actual_total_batch_size, actual_per_device_batch_size = get_dataloader(tokenizer, world_size, rank, local_rank, config, dht=dht if config.hv is not None else None)
+    
+    # Adjust Inner Optimizer (AdamW) learning rate based on actual per_device batch size
+    # Using Linear Scaling Rule: LR_new = LR_base * (batch_size_new / batch_size_base)
+    # 
+    # Reference: "Accurate, Large Minibatch SGD: Training ImageNet in 1 Hour" (Goyal et al., 2017)
+    # 
+    # base_batch_size: the per_device batch size that the learning rate was originally tuned for
+    # Fixed to 512 - the reference per_device batch size where LR was optimized
+    # 
+    # Note: AdamW is adaptive and may be less sensitive to batch size scaling than SGD,
+    # but linear scaling is still a good starting point. For very small batch sizes,
+    # we apply a more conservative scaling to avoid training instability.
+    base_batch_size = 512  # Fixed base per_device batch size for learning rate scaling
+    if False:
+    # if actual_per_device_batch_size != base_batch_size:
+        # Linear scaling factor
+        lr_scale_factor = actual_per_device_batch_size / base_batch_size
+        
+        # For very small batch sizes (< 1/4 of base), apply more conservative scaling
+        # to avoid training instability due to high gradient noise
+        # Use sqrt scaling for very small batches: more conservative than linear
+        if actual_per_device_batch_size < base_batch_size / 4:
+            # Apply sqrt scaling for very small batches: sqrt(batch_new / batch_base)
+            conservative_scale_factor = math.sqrt(actual_per_device_batch_size / base_batch_size)
+            adjusted_lr = config.lr * conservative_scale_factor
+            scaling_method = "sqrt (conservative for small batch)"
+        else:
+            # Standard linear scaling for normal batch sizes
+            adjusted_lr = config.lr * lr_scale_factor
+            scaling_method = "linear"
+        
+        if rank == 0:
+            log(f"Inner Optimizer LR adjustment ({scaling_method}):")
+            log(f"  Base LR: {config.lr:.2e} (tuned for per_device_batch_size={base_batch_size})")
+            log(f"  Actual per_device_batch_size: {actual_per_device_batch_size}")
+            log(f"  Total batch_size: {actual_total_batch_size} (reference only)")
+            if actual_per_device_batch_size < base_batch_size / 4:
+                sqrt_factor = math.sqrt(actual_per_device_batch_size / base_batch_size)
+                log(f"  Linear scale factor: {lr_scale_factor:.3f}")
+                log(f"  Applied sqrt scale factor: {sqrt_factor:.3f} (conservative for small batch)")
+            else:
+                log(f"  Scale factor: {lr_scale_factor:.3f} (linear scaling)")
+            log(f"  Adjusted LR: {adjusted_lr:.2e}")
+        
+        # Update config.lr for optimizer initialization
+        config.lr = adjusted_lr
+    else:
+        if rank == 0:
+            log(f"Inner Optimizer LR: {config.lr:.2e} (no adjustment needed, per_device_batch_size={actual_per_device_batch_size} matches base)")
 
     # Create validation dataloader if validation is enabled
+    # Each rank gets a different portion of validation data (split like train_dataloader)
     validation_dataloader = None
     if config.validation:
         if rank == 0:
@@ -677,8 +910,8 @@ def train(config: Config):
     model = model.to(local_rank)
 
     # 디버그: 파라미터 이름 출력 (FSDP 래핑 전에)
-    if rank == 0:
-        print_all_parameter_names(model, rank=rank)
+    # if rank == 0:
+    #     print_all_parameter_names(model, rank=rank)
 
     half_precision = config.precision == "fp16-mixed" or config.precision == "bf16-mixed"
     half_precision_dtype = torch.bfloat16 if config.precision == "bf16-mixed" else torch.float16
@@ -872,6 +1105,7 @@ def train(config: Config):
     for step, batch in enumerate(iterable=train_dataloader, start=start_step * gradient_accumulation_steps):
         real_step = (step + 1) // gradient_accumulation_steps
         is_accumulating = bool((step + 1) % gradient_accumulation_steps)
+        
         should_profile_memory = (
             config.log_memory_breakdown_steps is not None
             and not is_accumulating
@@ -941,30 +1175,29 @@ def train(config: Config):
             if world_messenger_hv:
                 # This will trigger inter-node synchronization if real_step % local_steps == 0
                 optimizer.step(scaler=scaler)
-                
-                # Perform validation after inter-node synchronization (when real_step is multiple of local_steps)
-                # All ranks must participate in validation for FSDP
-                validation_metrics = {}
-                if config.validation and validation_dataloader is not None and real_step > 0:
-                    if int(real_step) % config.hv.local_steps == 0:
-                        if rank == 0:
-                            log(f"Running validation at step {real_step} (after inter-node synchronization)...")
-                        validation_metrics = validate_model(
-                            validation_dataloader,
-                            model,
-                            half_precision,
-                            half_precision_dtype,
-                            rank,
-                            world_size,
-                        )
-                        if rank == 0:
-                            log(f"Validation results: validation_loss={validation_metrics.get('validation_loss', 'N/A'):.4f}, validation_perplexity={validation_metrics.get('validation_perplexity', 'N/A'):.4f}")
                 # todo(sami): refactor to use built in pytorch mechanism to handle scaler manually
                 # should allow to just do scaler.step(optimizer)
             else:
-                # For non-hivemind: validation is not supported (only for hivemind with local_steps)
-                validation_metrics = {}
                 scaler.step(optimizer)
+            
+            # Perform validation after inter-node synchronization (when real_step is multiple of local_steps)
+            # All ranks must participate in validation for FSDP (not just local_rank == 0)
+            validation_metrics = {}
+            if config.hv is not None and config.validation and validation_dataloader is not None and real_step > 0:
+                if int(real_step) % config.hv.local_steps == 0:
+                    if rank == 0:
+                        log(f"Running validation at step {real_step} (after inter-node synchronization)...")
+                    validation_metrics = validate_model(
+                        validation_dataloader,
+                        model,
+                        half_precision,
+                        half_precision_dtype,
+                        rank,
+                        world_size,
+                        max_batches=None,
+                    )
+                    if rank == 0:
+                        log(f"Validation results: validation_loss={validation_metrics.get('validation_loss', 'N/A'):.4f}, validation_perplexity={validation_metrics.get('validation_perplexity', 'N/A'):.4f}")
 
             scaler.update()
 

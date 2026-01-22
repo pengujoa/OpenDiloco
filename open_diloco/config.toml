@@ -6,25 +6,23 @@ dataset_name_or_path = "$C4"
 
 # Training optimization
 lr = 4e-4
-per_device_train_batch_size = 16
-total_batch_size = 32
+per_device_train_batch_size = 4
+total_batch_size = 16
 precision = "fp16-mixed"
 warmup_steps = 1000
-max_steps = 100000
+max_steps = 88000
 adjust_local_steps = true
+validation = true
 
 # Project and logging
 project = "${EXP}-${WORLD_RANK}"
-
-# Node GPU configuration
-node_gpu_counts = [2, 2, 2]
 
 # LoRA
 lora = false
 
 # Checkpoint configuration
 [ckpt]
-interval = 2000
+interval = 200000
 path = "${EXP}_ckpt"
 
 # Hivemind configuration
@@ -35,6 +33,6 @@ skip_load_from_peers = true
 initial_peers = ["$PEER"]
 galaxy_size = 3
 world_rank = "${WORLD_RANK}"
-selective_layer_patterns = ["model.layers.0", "model.layers.1", "lm_head"]
-token_weighted_aggregation = false
+# selective_layer_patterns = ["model.layers.0", "model.layers.1", "lm_head"]
+token_weighted_aggregation = true
 max_outer_optimization_steps = 200
