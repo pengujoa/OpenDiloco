@@ -1,6 +1,6 @@
 from enum import Enum
 import time
-from typing import Callable, Dict, Iterator, List, Optional, Union
+from typing import Any, Callable, Dict, Iterator, List, Optional, Union
 import numpy as np
 
 import os
@@ -31,24 +31,129 @@ from hivemind.utils.timed_storage import DHTExpiration
 from hivemind.optim.optimizer import logger
 from hivemind.optim.progress_tracker import LocalTrainingProgress
 
-from open_diloco.utils import found_inf_grad
+
+def unwrap(v):
+    """Helper function to unwrap DHT values"""
+    return getattr(v, "value", v)
+
+
+def wait_for_all_nodes_local_step_complete(
+    dht: DHT, 
+    epoch: int, 
+    num_inner_steps: int,
+    expected_num_peers: int,
+    log_fn=None,
+    timeout: float = 300.0,
+    check_interval: float = 1.0,
+):
+    """
+    각 노드가 local step을 완료했는지 DHT를 통해 동기화합니다.
+    
+    :param dht: DHT 인스턴스
+    :param epoch: 현재 epoch 번호
+    :param num_inner_steps: 각 노드가 완료해야 하는 local step 수
+    :param expected_num_peers: 예상되는 peer 수 (galaxy_size)
+    :param log_fn: 로깅 함수 (None이면 logger.info 사용)
+    :param timeout: 최대 대기 시간 (초)
+    :param check_interval: 확인 간격 (초)
+    """
+    if log_fn is None:
+        log_fn = logger.info
+    
+    RUN_ID = "OpenDiLoCo"
+    local_step_key = f"{RUN_ID}:local_step_complete:epoch_{epoch}"
+    worker_id = f"{socket.gethostname()}-pid{os.getpid()}"
+    
+    # 현재 노드의 local step 완료 상태를 DHT에 publish
+    now = get_dht_time()
+    local_step_payload = {
+        "epoch": epoch,
+        "local_steps_completed": num_inner_steps,
+        "completed": True,
+        "ts": now,
+        "host": socket.gethostname(),
+    }
+    exp = now + timeout
+    dht.store(key=local_step_key, subkey=worker_id, value=local_step_payload, expiration_time=exp)
+    log_fn(f"Published local step completion for epoch {epoch}: worker_id={worker_id}, local_steps={num_inner_steps}")
+    
+    # 모든 노드가 local step을 완료할 때까지 대기
+    start_time = time.time()
+    while True:
+        elapsed_time = time.time() - start_time
+        if elapsed_time > timeout:
+            log_fn(f"Timeout waiting for all nodes to complete local steps (timeout={timeout}s)")
+            break
+        
+        local_step_res = dht.get(local_step_key, latest=True)
+        local_step_root = unwrap(local_step_res) if local_step_res else None
+        completed_count = 0
+        
+        if isinstance(local_step_root, dict):
+            for k, v in local_step_root.items():
+                p = unwrap(v)
+                if isinstance(p, dict) and p.get("completed") is True and p.get("epoch") == epoch:
+                    completed_count += 1
+        
+        log_fn(f"Local step completion status for epoch {epoch}: {completed_count}/{expected_num_peers} nodes completed")
+        
+        if completed_count >= expected_num_peers:
+            log_fn(f"All {expected_num_peers} nodes completed local steps for epoch {epoch}!")
+            break
+        
+        time.sleep(check_interval)
+    
+    # 동기화 완료 후 상태를 짧은 시간 후 만료되도록 업데이트
+    now = get_dht_time()
+    local_step_payload = {
+        "epoch": epoch,
+        "local_steps_completed": num_inner_steps,
+        "completed": True,
+        "ts": now,
+        "host": socket.gethostname(),
+    }
+    exp = now + 5.0  # 5초 후 만료
+    dht.store(key=local_step_key, subkey=worker_id, value=local_step_payload, expiration_time=exp)
+    log_fn(f"Updated local step completion expiration to 5 seconds for epoch {epoch}, worker_id={worker_id}")
+
+try:
+    from .utils import found_inf_grad
+    from .token_weighted_aggregation import TokenWeightedAggregationMixin
+except ImportError:
+    try:
+        from open_diloco.utils import found_inf_grad
+        from open_diloco.token_weighted_aggregation import TokenWeightedAggregationMixin
+    except ImportError:
+        # Fallback for direct module execution (same directory)
+        from utils import found_inf_grad
+        from token_weighted_aggregation import TokenWeightedAggregationMixin
 # cyshin
 import logging
 import socket
+import os
+import time
 from pydantic.v1 import BaseModel, StrictBool, StrictFloat, confloat, conint
 
 
-class DiLoCoStateAverager(TrainingStateAverager):
+class DiLoCoStateAverager(TrainingStateAverager, TokenWeightedAggregationMixin):
     def __init__(
         self,
         *,
         num_inner_steps: int,
         inner_optimizer: TorchOptimizer,
         scheduler: Optional[SchedulerFactory] = None,
+        token_weighted_aggregation: bool = False,
         **kwargs,
     ):
         self.inner_optimizer = inner_optimizer
         self.num_inner_steps = num_inner_steps
+
+        # Token-weighted aggregation 지원 (mixin 초기화)
+        self.token_weighted_aggregation = token_weighted_aggregation
+        self.cumulative_tokens = 0
+        self.token_count_key = None
+        self.worker_id = None
+        self.expected_num_peers = None
 
         super().__init__(
             **kwargs
@@ -56,15 +161,134 @@ class DiLoCoStateAverager(TrainingStateAverager):
 
         self.scheduler_inner_optimizer = scheduler(self.inner_optimizer) if scheduler is not None else None
         assert isinstance(self.scheduler_inner_optimizer, (LRSchedulerBase, type(None)))
+        
+        # Token-weighted aggregation 초기화 (DHT와 worker_id가 설정된 후)
+        if self.token_weighted_aggregation:
+            self._init_token_weighted_aggregation(key_suffix="_state")
 
     def _update_scheduler(self):
         """Increase the scheduler state until it becomes synchronized with local epoch"""
         # TODO(sami) handle update scheduler
         # for now assuming that all scheduler are on time
         pass
+    
+    def _adjust_momentum_from_token_weight(self, token_weight: float, base_momentum: Optional[float] = None) -> Optional[float]:
+        """
+        Token weight를 기반으로 outer optimizer의 momentum을 조정.
+        
+        :param token_weight: Token weight (0.0 ~ 1.0, 자신의 token 수 / 전체 token 수)
+        :param base_momentum: 기본 momentum 값 (None이면 optimizer에서 자동으로 가져옴)
+        :returns: 조정된 momentum 값 (조정 실패 시 None)
+        """
+        if not self.token_weighted_aggregation or token_weight <= 0:
+            return base_momentum
+        
+        # Outer optimizer의 momentum 변경 (SGD optimizer인 경우)
+        if not hasattr(self, 'optimizer') or self.optimizer is None:
+            return None
+        
+        # base_momentum이 없으면 optimizer에서 현재 momentum 값 가져오기
+        if base_momentum is None:
+            for param_group in self.optimizer.param_groups:
+                if 'momentum' in param_group:
+                    base_momentum = param_group['momentum']
+                    break
+            if base_momentum is None:
+                logger.warning("StateAverager: optimizer에 'momentum' 파라미터가 없어 momentum 조정을 건너뜁니다.")
+                return None
+        
+        # Token weight를 기반으로 momentum 조정
+        # token_weight는 0~1 사이 값 (자신의 token 수 / 전체 token 수)
+        # token_weight가 높을수록 (더 많은 token 처리) momentum을 높게 설정
+        
+        # 선형 보간: token_weight=0일 때 min_ratio, token_weight=1일 때 max_ratio
+        # 예: min_ratio=0.8, max_ratio=1.1이면 base_momentum * 0.8 ~ base_momentum * 1.1 범위
+        min_momentum_ratio = 0.5  # token_weight=0일 때 momentum 비율
+        max_momentum_ratio = 1.0  # token_weight=1일 때 momentum 비율
+        
+        adjusted_momentum = min_momentum_ratio + token_weight * (max_momentum_ratio - min_momentum_ratio)
+        
+        # Outer optimizer의 momentum 변경
+        for param_group in self.optimizer.param_groups:
+            if 'momentum' in param_group:
+                old_momentum = param_group['momentum']
+                param_group['momentum'] = adjusted_momentum
+                if abs(old_momentum - adjusted_momentum) > 1e-6:  # 변화가 있을 때만 로그
+                    logger.info(
+                        f"StateAverager momentum adjusted: token_weight={token_weight:.6f}, "
+                        f"old_momentum={old_momentum:.6f}, new_momentum={adjusted_momentum:.6f}"
+                    )
+        
+        return adjusted_momentum
+    
+    def _do(
+        self,
+        wait_for_trigger: Optional[Callable[[], Any]],
+        optimizer_step: bool,
+        zero_grad: bool,
+        averaging_round: bool,
+        averaging_control: Optional[StepControl],
+        grad_scaler: Optional[Any],
+        set_to_none: bool,
+        timeout: Optional[float] = None,
+        **kwargs,
+    ):
+        """
+        Run the optimizer step, followed by a scheduler step and an averaging round, each stage is optional.
+        This method overrides TrainingStateAverager._do to add token-weighted aggregation support.
+        """
+        # Token-weighted aggregation: weight 계산 및 설정
+        computed_token_weight = None
+        if averaging_round and 'weight' not in kwargs:
+            if averaging_control is not None:
+                # 이미 생성된 control이 있으면 weight 설정
+                computed_token_weight = self._compute_token_weight(averaging_control, log_prefix="StateAverager Token-weighted aggregation")
+            elif self.token_weighted_aggregation and self.cumulative_tokens > 0:
+                # control이 None이면, weight를 계산해서 kwargs에 추가
+                # 먼저 token 수를 publish하고 읽어옴
+                self._publish_token_count_to_dht()
+                token_counts = self._read_token_counts_from_dht(
+                    wait_for_peers=True,
+                    max_wait_time=300.0,
+                    check_interval=0.2
+                )
+                total_tokens = sum(token_counts.values())
+                if total_tokens > 0:
+                    weight = self.cumulative_tokens / total_tokens
+                    computed_token_weight = weight
+                    kwargs['weight'] = weight
+                    logger.info(
+                        f"StateAverager Token-weighted aggregation: local_tokens={self.cumulative_tokens}, "
+                        f"total_tokens={total_tokens}, weight={weight:.6f}, num_peers={len(token_counts)}"
+                    )
+        
+        # Token weight를 기반으로 momentum 조정 (optimizer step이 있을 때만)
+        if optimizer_step and self.token_weighted_aggregation:
+            # Token weight 가져오기 (computed_token_weight 또는 averaging_control.weight)
+            token_weight = computed_token_weight
+            if token_weight is None and averaging_control is not None and hasattr(averaging_control, 'weight'):
+                token_weight = averaging_control.weight
+            
+            if token_weight is not None and token_weight > 0:
+                self._adjust_momentum_from_token_weight(token_weight)
+        
+        # 부모 클래스의 _do 메서드 호출
+        result = super()._do(
+            wait_for_trigger=wait_for_trigger,
+            optimizer_step=optimizer_step,
+            zero_grad=zero_grad,
+            averaging_round=averaging_round,
+            averaging_control=averaging_control,
+            grad_scaler=grad_scaler,
+            set_to_none=set_to_none,
+            timeout=timeout,
+            **kwargs,
+        )
+        
+        return result
 
 
-class DiLoCoGradAverager(DecentralizedAverager):
+class DiLoCoGradAverager(DecentralizedAverager, TokenWeightedAggregationMixin):
     """ "
     DiLoCoGradAverager is meant to be used in pair with DiLoCoStateAverager. Specifically it takes as input the offloaded optimizer of DiLoCoStateAverager, and
     use the grad buffer of the offloaded param as averaged_tensors for the DecentralizedAverager. In other words the DiLoCoGradAverager makes sure that the grad of the offloaded optimizer
@@ -108,15 +332,17 @@ class DiLoCoGradAverager(DecentralizedAverager):
 
         self._new_averaged_grads = False
         
-        # Token-weighted aggregation 지원
+        # Token-weighted aggregation 지원 (mixin 초기화)
         self.token_weighted_aggregation = token_weighted_aggregation
-        self.cumulative_tokens = 0  # 누적된 token 수
-        self.token_count_key = None  # DHT key for token counts
-        self.worker_id = None  # Worker identifier for DHT
-        self.expected_num_peers = None  # 예상되는 peer 수 (galaxy_size)
-        
-        if self.token_weighted_aggregation:
-            logger.info("Token-weighted aggregation is enabled")
+        self.cumulative_tokens = 0
+        self.token_count_key = None
+        self.worker_id = None
+        self.expected_num_peers = None
+
+        # Local step 동기화를 위한 정보 저장
+        self.num_inner_steps = None  # 나중에 설정됨
+        self._current_epoch = None
+        self._current_step = None
 
         # Selective layer update 지원
         self.param_names = param_names
@@ -159,6 +385,10 @@ class DiLoCoGradAverager(DecentralizedAverager):
             classstr="gradaverager",
             **kwargs,
         )
+        
+        # Token-weighted aggregation 초기화 (DHT와 worker_id가 설정된 후)
+        if self.token_weighted_aggregation:
+            self._init_token_weighted_aggregation(key_suffix="_grad")
 
     def _create_param_mask(self, param_names: List[str], patterns: List[str]) -> List[bool]:
         """파라미터 이름이 패턴 중 하나라도 매칭되면 True인 마스크 생성"""
@@ -204,105 +434,6 @@ class DiLoCoGradAverager(DecentralizedAverager):
         
         assert kwargs.get("weight") is None, "setting weight in schedule_step is not supported"
         return super().step(scheduled_time=scheduled_time, wait=False, require_trigger=True, **kwargs)
-    
-    def _read_token_counts_from_dht(self, wait_for_peers: bool = True, max_wait_time: float = 300.0, check_interval: float = 0.5) -> Dict[str, float]:
-        """DHT에서 모든 노드의 token 수를 읽어옴 (token_weighted_aggregation이 활성화된 경우에만)
-        
-        :param wait_for_peers: True면 expected_num_peers만큼의 노드가 token 수를 업데이트할 때까지 대기
-        :param max_wait_time: 최대 대기 시간 (초)
-        :param check_interval: 대기 중 확인 간격 (초)
-        """
-        if not self.token_weighted_aggregation or self.token_count_key is None or self.dht is None:
-            return {}
-        
-        start_time = time.time()
-        
-        while True:
-            res = self.dht.get(self.token_count_key, latest=True)
-            root = getattr(res, "value", res) if res else None
-            token_counts: Dict[str, float] = {}
-            
-            if isinstance(root, dict):
-                for k, v in root.items():
-                    p = getattr(v, "value", v)
-                    if isinstance(p, dict):
-                        if "tokens" in p and isinstance(p["tokens"], (int, float)):
-                            token_counts[k] = float(p["tokens"])
-            
-            # 자신의 token 수도 포함 (DHT eventual consistency 때문에 바로 반영되지 않을 수 있음)
-            if self.worker_id not in token_counts and self.cumulative_tokens > 0:
-                token_counts[self.worker_id] = self.cumulative_tokens
-            
-            # wait_for_peers가 False이거나, expected_num_peers가 설정되지 않았거나, 충분한 peer 수를 얻었으면 반환
-            if not wait_for_peers or self.expected_num_peers is None:
-                return token_counts
-            
-            num_peers_with_tokens = len(token_counts)
-            
-            # 예상되는 peer 수만큼 token 수를 얻었으면 반환
-            if num_peers_with_tokens >= self.expected_num_peers:
-                logger.debug(
-                    f"Token-weighted aggregation: Got token counts from {num_peers_with_tokens} peers "
-                    f"(expected {self.expected_num_peers})"
-                )
-                return token_counts
-            
-            # 최대 대기 시간 초과 시 현재 상태 반환
-            elapsed_time = time.time() - start_time
-            if elapsed_time >= max_wait_time:
-                logger.warning(
-                    f"Token-weighted aggregation: Timeout waiting for token counts. "
-                    f"Got {num_peers_with_tokens}/{self.expected_num_peers} peers after {elapsed_time:.2f}s. "
-                    f"Using available token counts."
-                )
-                return token_counts
-            
-            # 일정 간격마다 재확인
-            time.sleep(check_interval)
-    
-    def _publish_token_count_to_dht(self, ttl: float = 300.0):
-        """DHT에 현재 노드의 token 수를 publish (token_weighted_aggregation이 활성화된 경우에만)"""
-        if not self.token_weighted_aggregation or self.token_count_key is None or self.worker_id is None or self.dht is None:
-            return
-        
-        now = get_dht_time()
-        payload = {
-            "tokens": float(self.cumulative_tokens),
-            "ts": now,
-            "host": socket.gethostname()
-        }
-        exp = now + ttl
-        self.dht.store(key=self.token_count_key, subkey=self.worker_id, value=payload, expiration_time=exp)
-    
-    def accumulate_tokens(self, token_count: int):
-        """Token 수를 누적 (token_weighted_aggregation이 활성화된 경우에만)"""
-        if self.token_weighted_aggregation:
-            self.cumulative_tokens += token_count
-    
-    def reset_token_count(self):
-        """Token 수를 리셋 및 DHT에서 이전 값 삭제 (outer step 완료 후 호출, token_weighted_aggregation이 활성화된 경우에만)"""
-        if self.token_weighted_aggregation:
-            # DHT에서 이전 token 수 값을 명시적으로 삭제 (다음 iteration에서 혼선 방지)
-            self._delete_token_count_from_dht()
-            self.cumulative_tokens = 0
-    
-    def _delete_token_count_from_dht(self):
-        """DHT에서 현재 노드의 token 수 값을 삭제 (token_weighted_aggregation이 활성화된 경우에만)"""
-        if not self.token_weighted_aggregation or self.token_count_key is None or self.worker_id is None or self.dht is None:
-            return
-        
-        # DHT에서 값을 삭제하려면 value=None을 설정하고 expiration_time을 현재 시간으로 설정
-        # 또는 expiration_time을 과거로 설정하여 즉시 만료되도록 함
-        now = get_dht_time()
-        # value=None과 함께 현재 시간을 expiration_time으로 설정하여 삭제 표시
-        self.dht.store(
-            key=self.token_count_key,
-            subkey=self.worker_id,
-            value=None,
-            expiration_time=now,  # 즉시 만료되도록 설정
-        )
-        logger.debug(f"Deleted previous token count from DHT for worker {self.worker_id}")
-
     def step(
         self,
         control: Optional[StepControl] = None,
@@ -345,39 +476,41 @@ class DiLoCoGradAverager(DecentralizedAverager):
 
         # Token-weighted aggregation: weight 계산 및 설정
         # weight가 kwargs에 명시적으로 지정되지 않은 경우에만 token 기반 weight 계산
-        if self.token_weighted_aggregation and 'weight' not in kwargs and self.cumulative_tokens > 0:
-            # 자신의 token 수를 DHT에 publish (먼저 publish해서 다른 노드들이 읽을 수 있도록)
-            self._publish_token_count_to_dht()
-            
-            # DHT에서 모든 노드의 token 수 조회 (모든 노드가 업데이트할 때까지 대기)
-            token_counts = self._read_token_counts_from_dht(
-                wait_for_peers=True,
-                max_wait_time=300.0,  # 최대 5분 대기
-                check_interval=0.2  # 0.2초마다 확인
-            )
-            
-            # 모든 노드의 token 수 합산
-            total_tokens = sum(token_counts.values())
-            
-            # Weight 계산: 자신의 token 수 / 전체 token 수
-            if total_tokens > 0:
-                weight = self.cumulative_tokens / total_tokens
-                control.weight = weight
-                logger.info(
-                    f"Token-weighted aggregation: local_tokens={self.cumulative_tokens}, "
-                    f"total_tokens={total_tokens}, weight={weight:.6f}, num_peers={len(token_counts)}"
-                )
-            else:
-                control.weight = 1.0
-                logger.warning("Token-weighted aggregation: total_tokens is 0, using weight=1.0")
-        elif 'weight' in kwargs:
-            # 명시적으로 weight가 지정된 경우 사용
+        if 'weight' in kwargs:
+            # 명시적으로 weight가 지정된 경우 사용 (token weight 덮어쓰기)
             control.weight = kwargs['weight']
-        else:
-            # token 수가 0이거나 weight가 지정되지 않은 경우 기본 weight 사용 (1.0)
-            logger.debug(f"Token-weighted aggregation: using default weight (cumulative_tokens={self.cumulative_tokens})")
+            # kwargs에서 weight 제거하여 나중에 다시 사용되지 않도록 함
+            kwargs.pop('weight', None)
+        elif self.token_weighted_aggregation:
+            # Mixin의 _compute_token_weight 메서드 사용
+            self._compute_token_weight(control, log_prefix="GradAverager Token-weighted aggregation")
+            # token weight 사용 후 kwargs에 weight가 있으면 덮어쓰기 방지
+            if 'weight' in kwargs:
+                kwargs.pop('weight', None)
 
         control.allow_allreduce()
+
+        # control.result() 호출 전에 각 노드가 local step을 완료했는지 DHT를 통해 동기화
+        if wait and self.num_inner_steps is not None and epoch is not None and self.expected_num_peers is not None:
+            try:
+                logger.log(
+                    logging.INFO,
+                    f"Synchronizing local step completion via DHT before control.result() call (epoch={epoch}, num_inner_steps={self.num_inner_steps}, expected_peers={self.expected_num_peers})",
+                )
+                wait_for_all_nodes_local_step_complete(
+                    dht=self.dht,
+                    epoch=epoch,
+                    num_inner_steps=self.num_inner_steps,
+                    expected_num_peers=self.expected_num_peers,
+                    log_fn=lambda msg: logger.log(logging.INFO, msg),
+                    timeout=timeout if timeout is not None else 300.0,
+                )
+                logger.log(
+                    logging.INFO,
+                    f"Local step synchronization completed for epoch {epoch}",
+                )
+            except Exception as e:
+                logger.warning(f"Failed to synchronize local step completion via DHT: {e}. Proceeding with control.result() anyway.")
 
         # return control.result(timeout) if wait else control
         if wait:
@@ -792,6 +925,9 @@ class DiLoCoOptimizer(Optimizer):
             **kwargs,
         )
         
+        # num_inner_steps를 grad_averager에 전달 (local step 동기화용)
+        grad_averager.num_inner_steps = self.num_inner_steps
+        
         # Token-weighted aggregation을 위한 설정 (활성화된 경우에만)
         if self.token_weighted_aggregation:
             RUN_ID = "OpenDiLoCo"
@@ -818,6 +954,7 @@ class DiLoCoOptimizer(Optimizer):
             start=True,
             num_inner_steps=self.num_inner_steps,
             inner_optimizer=self.inner_optimizer,
+            token_weighted_aggregation=False,  # State averager에서는 token-weighted aggregation 비활성화
             **kwargs,
         )
 
@@ -965,13 +1102,12 @@ class DiLoCoOptimizer(Optimizer):
                     self.diloco_grad_averager._current_epoch = self.local_epoch
                 self.diloco_grad_averager._current_step = self.tracker.real_step
                 
-                # Token-weighted aggregation을 위한 expected_num_peers 설정
-                if self.diloco_grad_averager.token_weighted_aggregation:
-                    # tracker에서 현재 peer 수를 가져와서 설정 (최소한의 예상 값)
-                    self.diloco_grad_averager.expected_num_peers = max(
-                        self.tracker.global_progress.num_peers,
-                        2  # 최소 2개 노드는 있어야 함
-                    )
+                # Token-weighted aggregation 및 local step 동기화를 위한 expected_num_peers 설정
+                # tracker에서 현재 peer 수를 가져와서 설정 (최소한의 예상 값)
+                self.diloco_grad_averager.expected_num_peers = max(
+                    self.tracker.global_progress.num_peers,
+                    2  # 최소 2개 노드는 있어야 함
+                )
                 
                 self.diloco_grad_averager.step(
                     wait=True, timeout=self.averaging_timeout, control=self.scheduled_diloco_grads, epoch=self.local_epoch
@@ -1012,6 +1148,14 @@ class DiLoCoOptimizer(Optimizer):
 
             assert self.state_averager.custom_gradients, "custom gradient must be enable for syncing pseudo gradients"
 
+            # Token-weighted aggregation을 위한 expected_num_peers 설정 (state_averager)
+            if self.state_averager.token_weighted_aggregation:
+                # tracker에서 현재 peer 수를 가져와서 설정 (최소한의 예상 값)
+                self.state_averager.expected_num_peers = max(
+                    self.tracker.global_progress.num_peers,
+                    2  # 최소 2개 노드는 있어야 함
+                )
+
             logger.info(f"Try outer optimizer step at  {self.tracker.real_step} step")
             time_0_state_averager_step = time.perf_counter()
             self.state_averager.step(
@@ -1042,6 +1186,10 @@ class DiLoCoOptimizer(Optimizer):
 
             if not self.client_mode:
                 self.state_averager.state_sharing_priority = self.local_epoch
+
+            # Token 수 리셋 (state_averager, outer step 완료 후)
+            if self.state_averager.token_weighted_aggregation:
+                self.state_averager.reset_token_count()
 
             # cyshin
             time_0_update_main_param = time.perf_counter()
