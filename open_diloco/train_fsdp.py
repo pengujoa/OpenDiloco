@@ -217,6 +217,9 @@ class HvConfig(BaseConfig):
     fail_rank_drop: bool = False  # fail if we lose a diloco worker
     # Selective layer update
     selective_layer_patterns: list[str] | None = None  # 업데이트할 레이어 패턴 목록 (예: ["model.layers.0", "model.layers.1", "lm_head"])
+    # Gradient magnitude based layer selection (alternative to selective_layer_patterns)
+    gradient_magnitude_threshold: float | None = None  # threshold 이상의 magnitude를 가진 레이어만 업데이트
+    gradient_magnitude_top_k_ratio: float | None = None  # top-k% 레이어만 업데이트 (0.0 ~ 1.0, 예: 0.5 = 상위 50%)
     # Token-weighted aggregation
     token_weighted_aggregation: bool = False  # If True, use token-weighted aggregation instead of uniform averaging
     # Outer optimization steps limit
@@ -859,8 +862,8 @@ def train(config: Config):
     # but linear scaling is still a good starting point. For very small batch sizes,
     # we apply a more conservative scaling to avoid training instability.
     base_batch_size = 512  # Fixed base per_device batch size for learning rate scaling
-    if False:
-    # if actual_per_device_batch_size != base_batch_size:
+    # if False:
+    if actual_per_device_batch_size != base_batch_size:
         # Linear scaling factor
         lr_scale_factor = actual_per_device_batch_size / base_batch_size
         
@@ -973,9 +976,15 @@ def train(config: Config):
             ckpt_path = resume_path
 
     if world_messenger_hv:
-        # Selective layer update를 위한 파라미터 이름 추출
+        # Selective layer update 또는 gradient magnitude 기반 선택을 위한 파라미터 이름 추출
         param_names = None
-        if config.hv.selective_layer_patterns is not None:
+        needs_param_names = (
+            config.hv.selective_layer_patterns is not None or
+            config.hv.gradient_magnitude_threshold is not None or
+            config.hv.gradient_magnitude_top_k_ratio is not None
+        )
+        
+        if needs_param_names:
             # 모델에서 파라미터 이름 추출 (trainable 파라미터만)
             if config.lora:
                 # LoRA의 경우 trainable 파라미터만 추출
@@ -983,13 +992,21 @@ def train(config: Config):
             else:
                 # 모든 파라미터 이름 추출
                 param_names = [name for name, _ in model.named_parameters()]
-            log(f"Extracted {len(param_names)} parameter names for selective layer update")
-            if config.hv.selective_layer_patterns:
-                matched_count = sum(
-                    1 for name in param_names 
-                    if any(pattern in name or name.startswith(pattern) for pattern in config.hv.selective_layer_patterns)
-                )
-                log(f"Patterns {config.hv.selective_layer_patterns} match {matched_count}/{len(param_names)} parameters")
+            
+            if config.hv.selective_layer_patterns is not None:
+                log(f"Extracted {len(param_names)} parameter names for selective layer update (pattern-based)")
+                if config.hv.selective_layer_patterns:
+                    matched_count = sum(
+                        1 for name in param_names 
+                        if any(pattern in name or name.startswith(pattern) for pattern in config.hv.selective_layer_patterns)
+                    )
+                    log(f"Patterns {config.hv.selective_layer_patterns} match {matched_count}/{len(param_names)} parameters")
+            elif config.hv.gradient_magnitude_threshold is not None or config.hv.gradient_magnitude_top_k_ratio is not None:
+                log(f"Extracted {len(param_names)} parameter names for gradient magnitude-based layer selection")
+                if config.hv.gradient_magnitude_threshold is not None:
+                    log(f"  Using threshold: {config.hv.gradient_magnitude_threshold}")
+                if config.hv.gradient_magnitude_top_k_ratio is not None:
+                    log(f"  Using top_k_ratio: {config.hv.gradient_magnitude_top_k_ratio}")
         
         diloco_args = dict(
             dht=dht,
@@ -1007,6 +1024,8 @@ def train(config: Config):
             timeout_waiting_for_peers=config.hv.timeout_waiting_for_peers,
             lora=config.lora,
             selective_layer_patterns=config.hv.selective_layer_patterns,
+            gradient_magnitude_threshold=config.hv.gradient_magnitude_threshold,
+            gradient_magnitude_top_k_ratio=config.hv.gradient_magnitude_top_k_ratio,
             param_names=param_names,
             token_weighted_aggregation=config.hv.token_weighted_aggregation,
         )

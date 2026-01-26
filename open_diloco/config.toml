@@ -34,5 +34,6 @@ initial_peers = ["$PEER"]
 galaxy_size = 3
 world_rank = "${WORLD_RANK}"
 # selective_layer_patterns = ["model.layers.0", "model.layers.1", "lm_head"]
+gradient_magnitude_top_k_ratio = 0.3
 token_weighted_aggregation = true
 max_outer_optimization_steps = 200
