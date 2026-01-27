@@ -220,6 +220,9 @@ class HvConfig(BaseConfig):
     # Gradient magnitude based layer selection (alternative to selective_layer_patterns)
     gradient_magnitude_threshold: float | None = None  # threshold 이상의 magnitude를 가진 레이어만 업데이트
     gradient_magnitude_top_k_ratio: float | None = None  # top-k% 레이어만 업데이트 (0.0 ~ 1.0, 예: 0.5 = 상위 50%)
+    # Error Feedback (Residual Accumulation) for top-k gradient selection
+    enable_error_feedback: bool = True  # If True, accumulate unselected gradients in residual buffer
+    residual_norm_threshold: float | None = None  # If residual norm exceeds this threshold, force communication for all parameters (None = disabled)
     # Token-weighted aggregation
     token_weighted_aggregation: bool = False  # If True, use token-weighted aggregation instead of uniform averaging
     # Outer optimization steps limit
@@ -1028,6 +1031,8 @@ def train(config: Config):
             gradient_magnitude_top_k_ratio=config.hv.gradient_magnitude_top_k_ratio,
             param_names=param_names,
             token_weighted_aggregation=config.hv.token_weighted_aggregation,
+            enable_error_feedback=config.hv.enable_error_feedback,
+            residual_norm_threshold=config.hv.residual_norm_threshold,
         )
 
         diloco_args.update(get_compression_kwargs(config.hv.hivemind_compression))
@@ -1120,10 +1125,21 @@ def train(config: Config):
     
     # 모든 노드 준비 체크 플래그
     all_nodes_ready = False
+    
+    # Local 학습 시간 측정을 위한 변수
+    local_training_start_time = None
+    local_training_time = 0.0
 
     for step, batch in enumerate(iterable=train_dataloader, start=start_step * gradient_accumulation_steps):
         real_step = (step + 1) // gradient_accumulation_steps
         is_accumulating = bool((step + 1) % gradient_accumulation_steps)
+        
+        # Local 학습 시작 시점 측정 (각 local_steps의 시작)
+        # real_step = (step + 1) // gradient_accumulation_steps이므로,
+        # real_step=1부터 시작하여 real_step % local_steps == 1일 때 측정 시작
+        if world_messenger_hv and config.hv is not None:
+            if real_step > 0 and real_step % config.hv.local_steps == 1:
+                local_training_start_time = time.perf_counter()
         
         should_profile_memory = (
             config.log_memory_breakdown_steps is not None
@@ -1192,6 +1208,12 @@ def train(config: Config):
             model.clip_grad_norm_(1.0)  # gradient clipping
 
             if world_messenger_hv:
+                # Local 학습 시간 측정 (local_steps 완료 시점)
+                if config.hv is not None and real_step > 0 and real_step % config.hv.local_steps == 0:
+                    if local_training_start_time is not None:
+                        local_training_time = time.perf_counter() - local_training_start_time
+                        log(f"[TIMING] GPU local training time: {local_training_time:.6f} sec")
+                
                 # This will trigger inter-node synchronization if real_step % local_steps == 0
                 optimizer.step(scaler=scaler)
                 # todo(sami): refactor to use built in pytorch mechanism to handle scaler manually

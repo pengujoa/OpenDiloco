@@ -41,20 +41,21 @@ class TokenWeightedAggregationMixin:
         self, 
         wait_for_peers: bool = True, 
         max_wait_time: float = 300.0, 
-        check_interval: float = 0.5
-    ) -> Dict[str, float]:
+        check_interval: float = 0.1
+    ) -> tuple[Dict[str, float], float]:
         """
         DHT에서 모든 노드의 token 수를 읽어옴 (token_weighted_aggregation이 활성화된 경우에만)
         
         :param wait_for_peers: True면 expected_num_peers만큼의 노드가 token 수를 업데이트할 때까지 대기
         :param max_wait_time: 최대 대기 시간 (초)
         :param check_interval: 대기 중 확인 간격 (초)
+        :returns: (token_counts, wait_time) 튜플 - token_counts는 노드별 token 수 딕셔너리, wait_time은 항상 0.0 (시간 측정은 _do 함수에서 수행)
         """
         if not self.token_weighted_aggregation or self.token_count_key is None or self.dht is None:
-            return {}
+            return {}, 0.0
         
-        start_time = time.time()
         token_counts = {}
+        start_time = time.time()  # 타임아웃 체크용으로만 사용
         
         while True:
             # DHT에서 모든 token count 읽기
@@ -78,13 +79,13 @@ class TokenWeightedAggregationMixin:
                             token_counts[subkey] = value_dict["tokens"]
             
             if not wait_for_peers:
-                return token_counts
+                return token_counts, 0.0
             
             # expected_num_peers가 설정되어 있으면 그만큼 기다림
             if self.expected_num_peers is not None:
                 num_peers_with_tokens = len(token_counts)
                 if num_peers_with_tokens >= self.expected_num_peers:
-                    return token_counts
+                    return token_counts, 0.0
             
             # 타임아웃 확인
             elapsed_time = time.time() - start_time
@@ -94,7 +95,7 @@ class TokenWeightedAggregationMixin:
                     f"Token-weighted aggregation: Timeout waiting for token counts. "
                     f"Got {num_peers_with_tokens}/{self.expected_num_peers}"
                 )
-                return token_counts
+                return token_counts, 0.0
             
             # 일정 간격마다 재확인
             time.sleep(check_interval)
@@ -138,25 +139,26 @@ class TokenWeightedAggregationMixin:
         self, 
         averaging_control: Optional[StepControl],
         log_prefix: str = "Token-weighted aggregation"
-    ) -> Optional[float]:
+    ) -> tuple[Optional[float], float]:
         """
         Token 수를 기반으로 weight를 계산하고 averaging_control에 설정.
         
         :param averaging_control: StepControl 객체 (weight를 설정할 대상)
         :param log_prefix: 로그 메시지에 사용할 prefix
-        :returns: 계산된 weight 값 (설정 실패 시 None)
+        :returns: (weight, wait_time) 튜플 - weight는 계산된 weight 값 (설정 실패 시 None), wait_time은 항상 0.0 (시간 측정은 _do 함수에서 수행)
         """
         if not self.token_weighted_aggregation or averaging_control is None or self.cumulative_tokens <= 0:
-            return None
+            return None, 0.0
         
         # 자신의 token 수를 DHT에 publish (먼저 publish해서 다른 노드들이 읽을 수 있도록)
         self._publish_token_count_to_dht()
         
         # DHT에서 모든 노드의 token 수 조회 (모든 노드가 업데이트할 때까지 대기)
-        token_counts = self._read_token_counts_from_dht(
+        # 시간 측정은 _do 함수에서 수행되므로 여기서는 측정하지 않음
+        token_counts, _ = self._read_token_counts_from_dht(
             wait_for_peers=True,
             max_wait_time=300.0,  # 최대 5분 대기
-            check_interval=0.2  # 0.2초마다 확인
+            check_interval=0.1  # 0.1초마다 확인
         )
         
         # 모든 노드의 token 수 합산
@@ -172,8 +174,7 @@ class TokenWeightedAggregationMixin:
             )
             # Weight 계산 후 DHT에서 token count 삭제 (다음 iteration에서 혼선 방지)
             self._delete_token_count_from_dht()
-            return weight
+            return weight, 0.0
         else:
-            logger.warning(f"{log_prefix}: total_tokens is 0, using uniform weight")
-            return None
+            return None, 0.0
 

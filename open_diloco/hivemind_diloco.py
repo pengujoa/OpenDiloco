@@ -2,6 +2,7 @@ from enum import Enum
 import time
 from typing import Any, Callable, Dict, Iterator, List, Optional, Union
 import numpy as np
+from concurrent.futures import ThreadPoolExecutor
 
 import os
 from datetime import datetime
@@ -44,8 +45,8 @@ def wait_for_all_nodes_local_step_complete(
     expected_num_peers: int,
     log_fn=None,
     timeout: float = 300.0,
-    check_interval: float = 1.0,
-):
+    check_interval: float = 0.1,
+) -> float:
     """
     각 노드가 local step을 완료했는지 DHT를 통해 동기화합니다.
     
@@ -56,6 +57,7 @@ def wait_for_all_nodes_local_step_complete(
     :param log_fn: 로깅 함수 (None이면 logger.info 사용)
     :param timeout: 최대 대기 시간 (초)
     :param check_interval: 확인 간격 (초)
+    :returns: 동기화 대기 시간 (초) - inner_step 계산 후 동기화까지의 GPU idle 시간
     """
     if log_fn is None:
         log_fn = logger.info
@@ -75,14 +77,12 @@ def wait_for_all_nodes_local_step_complete(
     }
     exp = now + timeout
     dht.store(key=local_step_key, subkey=worker_id, value=local_step_payload, expiration_time=exp)
-    log_fn(f"Published local step completion for epoch {epoch}: worker_id={worker_id}, local_steps={num_inner_steps}")
     
-    # 모든 노드가 local step을 완료할 때까지 대기
+    # 모든 노드가 local step을 완료할 때까지 대기 (inner_step 계산 후 동기화까지의 대기 시간 측정)
     start_time = time.time()
     while True:
         elapsed_time = time.time() - start_time
         if elapsed_time > timeout:
-            log_fn(f"Timeout waiting for all nodes to complete local steps (timeout={timeout}s)")
             break
         
         local_step_res = dht.get(local_step_key, latest=True)
@@ -95,13 +95,12 @@ def wait_for_all_nodes_local_step_complete(
                 if isinstance(p, dict) and p.get("completed") is True and p.get("epoch") == epoch:
                     completed_count += 1
         
-        log_fn(f"Local step completion status for epoch {epoch}: {completed_count}/{expected_num_peers} nodes completed")
-        
         if completed_count >= expected_num_peers:
-            log_fn(f"All {expected_num_peers} nodes completed local steps for epoch {epoch}!")
             break
         
         time.sleep(check_interval)
+    
+    wait_time = time.time() - start_time
     
     # 동기화 완료 후 상태를 짧은 시간 후 만료되도록 업데이트
     now = get_dht_time()
@@ -114,7 +113,8 @@ def wait_for_all_nodes_local_step_complete(
     }
     exp = now + 5.0  # 5초 후 만료
     dht.store(key=local_step_key, subkey=worker_id, value=local_step_payload, expiration_time=exp)
-    log_fn(f"Updated local step completion expiration to 5 seconds for epoch {epoch}, worker_id={worker_id}")
+    
+    return wait_time
 
 try:
     from .utils import found_inf_grad
@@ -239,15 +239,20 @@ class DiLoCoStateAverager(TrainingStateAverager, TokenWeightedAggregationMixin):
         """
         # Token-weighted aggregation: weight 계산 및 설정
         computed_token_weight = None
+        sync_wait_time_state = 0.0  # StateAverager의 동기화 대기 시간
         if averaging_round and 'weight' not in kwargs:
+            # Token weight 수집 전체 시간 측정 시작
+            time_0_token_weight_state = time.perf_counter() if self.token_weighted_aggregation else None
+            
             if averaging_control is not None:
                 # 이미 생성된 control이 있으면 weight 설정
-                computed_token_weight = self._compute_token_weight(averaging_control, log_prefix="StateAverager Token-weighted aggregation")
+                # _compute_token_weight는 (weight, wait_time) 튜플을 반환 (wait_time은 사용하지 않음)
+                computed_token_weight, _ = self._compute_token_weight(averaging_control, log_prefix="StateAverager Token-weighted aggregation")
             elif self.token_weighted_aggregation and self.cumulative_tokens > 0:
                 # control이 None이면, weight를 계산해서 kwargs에 추가
                 # 먼저 token 수를 publish하고 읽어옴
                 self._publish_token_count_to_dht()
-                token_counts = self._read_token_counts_from_dht(
+                token_counts, _ = self._read_token_counts_from_dht(
                     wait_for_peers=True,
                     max_wait_time=300.0,
                     check_interval=0.2
@@ -261,6 +266,20 @@ class DiLoCoStateAverager(TrainingStateAverager, TokenWeightedAggregationMixin):
                         f"StateAverager Token-weighted aggregation: local_tokens={self.cumulative_tokens}, "
                         f"total_tokens={total_tokens}, weight={weight:.6f}, num_peers={len(token_counts)}"
                     )
+            
+            # Token weight 수집 전체 시간 측정 종료
+            if time_0_token_weight_state is not None:
+                time_1_token_weight_state = time.perf_counter()
+                sync_wait_time_state = time_1_token_weight_state - time_0_token_weight_state
+                if computed_token_weight is not None:
+                    logger.info(
+                        f"StateAverager Token-weighted aggregation sync_wait_time={sync_wait_time_state:.6f} sec (GPU idle time during synchronization)"
+                    )
+                else:
+                    logger.warning(
+                        f"StateAverager Token-weighted aggregation: total_tokens is 0, using uniform weight, "
+                        f"sync_wait_time={sync_wait_time_state:.6f} sec (GPU idle time during synchronization)"
+                    )
         
         # Token weight를 기반으로 momentum 조정 (optimizer step이 있을 때만)
         if optimizer_step and self.token_weighted_aggregation:
@@ -271,6 +290,12 @@ class DiLoCoStateAverager(TrainingStateAverager, TokenWeightedAggregationMixin):
             
             if token_weight is not None and token_weight > 0:
                 self._adjust_momentum_from_token_weight(token_weight)
+        
+        # StateAverager의 동기화 대기 시간 출력 (GPU idle 시간)
+        if sync_wait_time_state > 0.0:
+            logger.info(
+                f"StateAverager GPU idle time during synchronization (after inner steps, before all-reduce): {sync_wait_time_state:.6f} sec"
+            )
         
         # 부모 클래스의 _do 메서드 호출
         result = super()._do(
@@ -308,6 +333,9 @@ class DiLoCoGradAverager(DecentralizedAverager, TokenWeightedAggregationMixin):
         gradient_magnitude_threshold: Optional[float] = None,
         gradient_magnitude_top_k_ratio: Optional[float] = None,
         token_weighted_aggregation: bool = False,
+        enable_error_feedback: bool = True,
+        residual_norm_threshold: Optional[float] = None,
+        enable_update_logs: bool = False,
         **kwargs,
     ):
         if "client_mode" in kwargs:
@@ -358,9 +386,44 @@ class DiLoCoGradAverager(DecentralizedAverager, TokenWeightedAggregationMixin):
         self.gradient_magnitude_threshold = gradient_magnitude_threshold
         self.gradient_magnitude_top_k_ratio = gradient_magnitude_top_k_ratio
         
+        # Error Feedback (Residual Accumulation) 설정
+        self.enable_error_feedback = enable_error_feedback
+        self.residual_norm_threshold = residual_norm_threshold
+        
+        # 파라미터 업데이트 로그 활성화/비활성화 (파일 저장 및 상세 로깅)
+        self.enable_update_logs = enable_update_logs
+        
+        # 파일 I/O 작업을 위한 ThreadPoolExecutor 초기화 (비동기 로깅용)
+        self._log_executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="diloco_logger") if enable_update_logs else None
+        
         # Gradient magnitude 기반 선택과 pattern 기반 선택은 동시에 사용 불가
         if (gradient_magnitude_threshold is not None or gradient_magnitude_top_k_ratio is not None) and selective_layer_patterns is not None:
             raise ValueError("gradient_magnitude_threshold/top_k_ratio와 selective_layer_patterns는 동시에 사용할 수 없습니다.")
+        
+        # Error Feedback을 위한 residual buffer 초기화
+        # gradient magnitude 기반 선택이 활성화되고 error feedback이 활성화된 경우에만 사용
+        use_error_feedback = (
+            self.enable_error_feedback and 
+            (gradient_magnitude_threshold is not None or gradient_magnitude_top_k_ratio is not None) and
+            param_names is not None
+        )
+        
+        if use_error_feedback:
+            # 각 파라미터에 대한 residual buffer 초기화 (CPU에 저장)
+            self.residual_buffers = []
+            param_groups = self.offloaded_optimizer.param_groups
+            for param_group in param_groups:
+                for param in param_group["params"]:
+                    # residual buffer는 CPU에 저장 (메모리 효율성)
+                    residual = torch.zeros_like(param, device='cpu')
+                    self.residual_buffers.append(residual)
+            logger.info(f"Error Feedback enabled: {len(self.residual_buffers)} residual buffers initialized")
+            if self.residual_norm_threshold is not None:
+                logger.info(f"Residual norm threshold: {self.residual_norm_threshold} (force communication when exceeded)")
+        else:
+            self.residual_buffers = None
+            if self.enable_error_feedback and (gradient_magnitude_threshold is None and gradient_magnitude_top_k_ratio is None):
+                logger.warning("Error Feedback is enabled but gradient magnitude-based selection is not active. Error Feedback will be disabled.")
         
         # 초기 마스크 설정 (pattern 기반이면 초기화 시 생성, magnitude 기반이면 step에서 동적 생성)
         if selective_layer_patterns is not None and param_names is not None:
@@ -432,7 +495,9 @@ class DiLoCoGradAverager(DecentralizedAverager, TokenWeightedAggregationMixin):
 
     @torch.no_grad()
     def _compute_gradient_magnitudes(self) -> List[float]:
-        """각 파라미터의 gradient magnitude를 계산 (L2 norm)"""
+        """각 파라미터의 gradient magnitude를 계산 (L2 norm)
+        Error Feedback이 활성화된 경우, residual을 더한 gradient magnitude를 계산합니다.
+        """
         magnitudes = []
         param_groups = self.offloaded_optimizer.param_groups
         param_idx = 0
@@ -449,14 +514,30 @@ class DiLoCoGradAverager(DecentralizedAverager, TokenWeightedAggregationMixin):
                     if main_param.grad is not None:
                         # gradient의 L2 norm 계산
                         grad = main_param.grad.detach()
+                        
+                        # Error Feedback이 활성화된 경우, residual을 더함
+                        if self.residual_buffers is not None and param_idx < len(self.residual_buffers):
+                            residual = self.residual_buffers[param_idx]
+                            # residual을 gradient와 같은 device로 이동하여 더함
+                            if residual.device != grad.device:
+                                residual = residual.to(grad.device)
+                            grad = grad + residual
+                        
                         # NaN이나 Inf 체크
                         if torch.isfinite(grad).all():
                             magnitude = grad.norm(p=2).item()
                         else:
                             magnitude = 0.0
                     else:
-                        # gradient가 없으면 0
-                        magnitude = 0.0
+                        # gradient가 없으면 residual만 고려
+                        if self.residual_buffers is not None and param_idx < len(self.residual_buffers):
+                            residual = self.residual_buffers[param_idx]
+                            if torch.isfinite(residual).all():
+                                magnitude = residual.norm(p=2).item()
+                            else:
+                                magnitude = 0.0
+                        else:
+                            magnitude = 0.0
                 else:
                     # 인덱스 범위를 벗어나면 0
                     magnitude = 0.0
@@ -471,8 +552,8 @@ class DiLoCoGradAverager(DecentralizedAverager, TokenWeightedAggregationMixin):
         local_magnitudes: List[float],
         epoch: int,
         timeout: float = 300.0,
-        check_interval: float = 1.0
-    ) -> List[float]:
+        check_interval: float = 0.1
+    ) -> tuple[List[float], float]:
         """
         모든 노드의 gradient magnitude를 DHT에 공유하고 평균을 계산합니다.
         이렇게 하면 모든 노드가 동일한 기준으로 파라미터를 선택할 수 있습니다.
@@ -481,7 +562,7 @@ class DiLoCoGradAverager(DecentralizedAverager, TokenWeightedAggregationMixin):
         :param epoch: 현재 epoch 번호
         :param timeout: 최대 대기 시간 (초)
         :param check_interval: 확인 간격 (초)
-        :returns: 모든 노드의 평균 gradient magnitude 리스트
+        :returns: (averaged_magnitudes, wait_time) 튜플 - 평균 gradient magnitude 리스트와 동기화 대기 시간 (초)
         """
         RUN_ID = "OpenDiLoCo"
         magnitude_key = f"{RUN_ID}:gradient_magnitudes:epoch_{epoch}"
@@ -497,9 +578,8 @@ class DiLoCoGradAverager(DecentralizedAverager, TokenWeightedAggregationMixin):
         }
         exp = now + timeout
         self.dht.store(key=magnitude_key, subkey=worker_id, value=magnitude_payload, expiration_time=exp)
-        logger.info(f"Published gradient magnitudes for epoch {epoch}: worker_id={worker_id}, num_params={len(local_magnitudes)}")
         
-        # 모든 노드의 gradient magnitude를 수집
+        # 모든 노드의 gradient magnitude를 수집 (동기화 대기 시간 측정)
         start_time = time.time()
         all_magnitudes = []
         
@@ -507,7 +587,7 @@ class DiLoCoGradAverager(DecentralizedAverager, TokenWeightedAggregationMixin):
             elapsed_time = time.time() - start_time
             if elapsed_time > timeout:
                 logger.warning(f"Timeout waiting for all nodes to publish gradient magnitudes (timeout={timeout}s). Using local magnitudes only.")
-                return local_magnitudes
+                return local_magnitudes, elapsed_time
             
             magnitude_res = self.dht.get(magnitude_key, latest=True)
             magnitude_root = unwrap(magnitude_res) if magnitude_res else None
@@ -525,24 +605,22 @@ class DiLoCoGradAverager(DecentralizedAverager, TokenWeightedAggregationMixin):
                             collected_count += 1
             
             expected_count = self.expected_num_peers if self.expected_num_peers is not None else 2
-            logger.info(f"Gradient magnitude collection status for epoch {epoch}: {collected_count}/{expected_count} nodes collected")
             
             if collected_count >= expected_count and len(all_magnitudes) > 0:
-                logger.info(f"Collected gradient magnitudes from {collected_count} nodes for epoch {epoch}!")
                 break
             
             time.sleep(check_interval)
         
+        wait_time = time.time() - start_time
+        
         # 모든 노드의 magnitude를 평균
         if len(all_magnitudes) == 0:
             logger.warning("No gradient magnitudes collected from peers. Using local magnitudes only.")
-            return local_magnitudes
+            return local_magnitudes, wait_time
         
-        # numpy를 사용하여 평균 계산 (numpy는 이미 파일 상단에서 import됨)
+        # numpy를 사용하여 평균 계산
         magnitudes_array = np.array(all_magnitudes)
         averaged_magnitudes = magnitudes_array.mean(axis=0).tolist()
-        
-        logger.info(f"Computed averaged gradient magnitudes from {len(all_magnitudes)} nodes")
         
         # 동기화 완료 후 상태를 짧은 시간 후 만료되도록 업데이트
         now = get_dht_time()
@@ -555,7 +633,7 @@ class DiLoCoGradAverager(DecentralizedAverager, TokenWeightedAggregationMixin):
         exp = now + 5.0  # 5초 후 만료
         self.dht.store(key=magnitude_key, subkey=worker_id, value=magnitude_payload, expiration_time=exp)
         
-        return averaged_magnitudes
+        return averaged_magnitudes, wait_time
 
     def _create_mask_from_magnitudes(
         self, 
@@ -587,16 +665,15 @@ class DiLoCoGradAverager(DecentralizedAverager, TokenWeightedAggregationMixin):
         
         return mask
 
-    def _log_magnitude_based_selection(self, magnitudes: List[float], epoch: Optional[int] = None, step: Optional[int] = None):
-        """매 outer optimization마다 magnitude 기반 레이어 선택 상세 정보 출력 및 파일 저장"""
-        logger.info(f"[DEBUG] _log_magnitude_based_selection called: param_names={self.param_names is not None}, magnitudes={len(magnitudes) if magnitudes else 0}, epoch={epoch}, step={step}")
-        
+    def _log_magnitude_based_selection_sync(self, magnitudes: List[float], epoch: Optional[int] = None, step: Optional[int] = None):
+        """매 outer optimization마다 magnitude 기반 레이어 선택 상세 정보 출력 및 파일 저장 (동기 버전)"""
+        if not self.enable_update_logs:
+            return
+            
         if self.param_names is None:
-            logger.warning("[DEBUG] _log_magnitude_based_selection: param_names is None, returning early")
             return
         
         if len(magnitudes) != len(self.param_names):
-            logger.warning(f"[DEBUG] _log_magnitude_based_selection: magnitude count ({len(magnitudes)}) != param_names count ({len(self.param_names)})")
             return
         
         # step 정보 가져오기
@@ -606,7 +683,7 @@ class DiLoCoGradAverager(DecentralizedAverager, TokenWeightedAggregationMixin):
         
         epoch_str = f"epoch {epoch}" if epoch is not None else "unknown epoch"
         logger.info("=" * 80)
-        logger.info(f"[DEBUG] Gradient Magnitude-based Layer Selection - {epoch_str}")
+        logger.info(f"[DEBUG] Gradient Magnitude-based Tensor Selection - {epoch_str}")
         logger.info("=" * 80)
         
         # 파라미터별 정보 수집 (magnitude, 선택 여부, 레이어 이름)
@@ -714,6 +791,17 @@ class DiLoCoGradAverager(DecentralizedAverager, TokenWeightedAggregationMixin):
         
         # 파일로 저장: JSON 형식 (시간에 따른 변화 추적용)
         self._save_selection_history_to_json(param_info, magnitudes, epoch, step, timestamp)
+    
+    def _log_magnitude_based_selection(self, magnitudes: List[float], epoch: Optional[int] = None, step: Optional[int] = None):
+        """매 outer optimization마다 magnitude 기반 파라미터 텐서서 선택 상세 정보 출력 및 파일 저장 (비동기 버전)"""
+        if not self.enable_update_logs:
+            return
+            
+        if self._log_executor is None:
+            return
+            
+        # 비동기로 실행 (메인 학습 루프를 블로킹하지 않음)
+        self._log_executor.submit(self._log_magnitude_based_selection_sync, magnitudes, epoch, step)
 
     def _save_parameter_selection_to_file(
         self, 
@@ -824,20 +912,36 @@ class DiLoCoGradAverager(DecentralizedAverager, TokenWeightedAggregationMixin):
             logger.warning(f"Failed to save recent parameter selection to JSON: {e}")
 
     def _grads_from_optimizer(self) -> Iterator[torch.Tensor]:
-        """gradient buffers associated optimizer"""
+        """gradient buffers associated optimizer
+        주의: 이 함수는 초기화 및 마스크 업데이트 시에만 사용되며,
+        실제 통신에 사용되는 값은 compute_and_load_pseudo_grad_into_averager에서 계산됩니다.
+        Error Feedback이 활성화된 경우, residual을 더한 gradient를 반환합니다.
+        """
         param_groups = self.offloaded_optimizer.param_groups
         param_idx = 0
         for param_group in param_groups:
             for param in param_group["params"]:
                 if param.grad is None:
                     param.grad = torch.zeros_like(param)
+                
+                grad = param.grad
+                
+                # Error Feedback이 활성화된 경우, residual을 더함
+                # (초기화 시점에는 residual이 0이므로 영향 없음)
+                if self.residual_buffers is not None and param_idx < len(self.residual_buffers):
+                    residual = self.residual_buffers[param_idx]
+                    # residual을 gradient와 같은 device로 이동하여 더함
+                    if residual.device != grad.device:
+                        residual = residual.to(grad.device)
+                    grad = grad + residual
+                
                 # Selective layer update가 활성화된 경우, 마스크에 따라 gradient 반환
                 if self.param_update_mask is not None:
                     if self.param_update_mask[param_idx]:
-                        yield param.grad
+                        yield grad
                     # skipped params는 yield하지 않음 - 통신에서 완전히 제외
                 else:
-                    yield param.grad
+                    yield grad
                 param_idx += 1
 
     def schedule_step(self, scheduled_time: Optional[DHTExpiration] = None, **kwargs) -> StepControl:
@@ -876,138 +980,170 @@ class DiLoCoGradAverager(DecentralizedAverager, TokenWeightedAggregationMixin):
         if epoch is not None:
             self._current_epoch = epoch
         
-        # Gradient magnitude 기반 레이어 선택 (매 step마다 동적으로 계산)
-        # 디버그: 조건 확인
+        # Error Feedback: 파라미터별 Residual norm 체크 및 강제 통신 로직
+        # residual_norm_threshold가 설정된 경우, 각 파라미터 텐서별로 residual norm을 체크하여
+        # threshold를 넘는 파라미터만 강제로 통신시킴
+        # (residual_buffers가 있지만 threshold가 None이면 이 체크는 건너뜀)
+        residual_forced_params = set()  # threshold를 넘어서 강제 통신이 필요한 파라미터 인덱스
+        residual_norms = {}  # 파라미터별 residual norm 저장 (로깅용)
+        if self.residual_buffers is not None and self.residual_norm_threshold is not None:
+            for param_idx, residual in enumerate(self.residual_buffers):
+                # 각 파라미터별 residual norm 계산
+                residual_norm = residual.norm(p=2).item()
+                residual_norms[param_idx] = residual_norm
+                
+                if residual_norm > self.residual_norm_threshold:
+                    residual_forced_params.add(param_idx)
+        
+        # Gradient magnitude 기반 tensor 선택 및 Token weight 계산을 병렬로 처리
         has_magnitude_config = (self.gradient_magnitude_threshold is not None or self.gradient_magnitude_top_k_ratio is not None)
         has_param_names = self.param_names is not None
         
-        if has_magnitude_config:
-            logger.info(f"[DEBUG] Gradient magnitude config check: threshold={self.gradient_magnitude_threshold}, top_k_ratio={self.gradient_magnitude_top_k_ratio}, param_names={has_param_names}")
+        time_0_magnitude_selection = time.perf_counter()
+        magnitudes = None
+        magnitude_wait_time = 0.0
+        new_mask = None
         
-        if has_magnitude_config and has_param_names:
-            logger.info(f"[DEBUG] Computing gradient magnitudes for {len(self.param_names)} parameters...")
-            local_magnitudes = self._compute_gradient_magnitudes()
-            logger.info(f"[DEBUG] Computed {len(local_magnitudes)} local magnitudes, range: [{min(local_magnitudes):.6f}, {max(local_magnitudes):.6f}]")
-            
-            # 모든 노드의 gradient magnitude를 DHT에 공유하고 평균을 계산
-            # 이렇게 하면 모든 노드가 동일한 기준으로 파라미터를 선택할 수 있음
-            magnitudes = self._collect_and_average_gradient_magnitudes(
-                local_magnitudes, 
-                epoch=epoch if epoch is not None else 0,
-                timeout=timeout if timeout is not None else 300.0
-            )
-            logger.info(f"[DEBUG] Collected averaged magnitudes from all peers, range: [{min(magnitudes):.6f}, {max(magnitudes):.6f}]")
-            
-            # 모든 노드가 동일한 평균 magnitude를 기반으로 마스크 생성
+        # Gradient magnitude 수집 함수 (병렬 실행용)
+        def collect_magnitudes():
+            if has_magnitude_config and has_param_names:
+                local_magnitudes = self._compute_gradient_magnitudes()
+                return self._collect_and_average_gradient_magnitudes(
+                    local_magnitudes, 
+                    epoch=epoch if epoch is not None else 0,
+                    timeout=timeout if timeout is not None else 300.0
+                )
+            return None, 0.0
+        
+        # Token weight 계산 함수 (병렬 실행용)
+        def compute_token_weight():
+            if self.token_weighted_aggregation and control is not None:
+                return self._compute_token_weight(control, log_prefix="GradAverager Token-weighted aggregation")
+            return None, 0.0
+        
+        # 병렬로 실행
+        sync_wait_time = 0.0
+        token_weight_result = None
+        token_weight_wait_time = 0.0
+        
+        # Token weight 수집 전체 시간 측정 시작
+        time_0_token_weight = time.perf_counter() if self.token_weighted_aggregation else None
+        
+        if (has_magnitude_config and has_param_names) and self.token_weighted_aggregation:
+            # 두 작업 모두 병렬 실행
+            with ThreadPoolExecutor(max_workers=2) as executor:
+                magnitude_future = executor.submit(collect_magnitudes)
+                token_weight_future = executor.submit(compute_token_weight)
+                
+                magnitudes, magnitude_wait_time = magnitude_future.result()
+                token_weight_result, _ = token_weight_future.result()
+        elif has_magnitude_config and has_param_names:
+            # Gradient magnitude만 실행
+            magnitudes, magnitude_wait_time = collect_magnitudes()
+        elif self.token_weighted_aggregation:
+            # Token weight만 실행
+            token_weight_result, _ = compute_token_weight()
+        
+        # Token weight 수집 전체 시간 측정 종료
+        if time_0_token_weight is not None:
+            time_1_token_weight = time.perf_counter()
+            token_weight_wait_time = time_1_token_weight - time_0_token_weight
+        
+        # Gradient magnitude 기반 마스크 생성
+        if magnitudes is not None:
             new_mask = self._create_mask_from_magnitudes(
                 magnitudes,
                 threshold=self.gradient_magnitude_threshold,
                 top_k_ratio=self.gradient_magnitude_top_k_ratio
             )
             
-            # 마스크가 변경되었는지 확인
-            mask_changed = (self.param_update_mask != new_mask)
-            if mask_changed:
-                logger.info(f"[DEBUG] Mask changed: updating averaged_grads dynamically")
-                logger.info(f"[DEBUG] Old mask: {sum(self.param_update_mask) if self.param_update_mask else 'None'} selected, New mask: {sum(new_mask)} selected")
-                
-                # 마스크 업데이트
-                self.param_update_mask = new_mask
-                
-                # averaged_grads를 동적으로 재생성
-                # 새로운 averaged_grads 생성
-                new_averaged_grads = tuple(grad for grad in self._grads_from_optimizer())
-                
-                # _averaged_tensors 재할당 (DecentralizedAverager의 내부 구조 업데이트)
-                # 주의: 이것은 DecentralizedAverager의 내부 구조를 변경하는 것이므로 주의가 필요함
-                with self.lock_averaged_tensors:
-                    # 기존 텐서의 메모리 해제는 Python의 GC가 처리함
-                    self._averaged_tensors = tuple(new_averaged_grads)
-                    # share_memory_() 호출 (multiprocessing을 위해 필요)
-                    for tensor in self._averaged_tensors:
-                        tensor.share_memory_()
-                    # schema_hash와 total_size 업데이트
-                    self.total_size = sum(map(torch.Tensor.numel, self._averaged_tensors))
-                    from hivemind.averaging.averager import compute_schema_hash
-                    self.schema_hash = compute_schema_hash(self._averaged_tensors)
-                
-                logger.info(f"[DEBUG] Successfully updated averaged_grads: {len(self._averaged_tensors)} tensors")
-            else:
-                # 마스크가 변경되지 않았으므로 그대로 사용
-                self.param_update_mask = new_mask
-                logger.info(f"[DEBUG] Mask unchanged: {sum(new_mask)} parameters selected")
+            # Residual norm threshold를 넘는 파라미터는 강제로 통신
+            if residual_forced_params:
+                for param_idx in residual_forced_params:
+                    if param_idx < len(new_mask):
+                        new_mask[param_idx] = True
+        elif not has_magnitude_config and has_param_names and residual_forced_params:
+            new_mask = [False] * len(self.param_names)
+            for param_idx in residual_forced_params:
+                if param_idx < len(new_mask):
+                    new_mask[param_idx] = True
+        
+        # 마스크 업데이트 및 averaged_grads 재생성
+        if new_mask is not None:
+            self.param_update_mask = new_mask
+            self._residual_forced_params = residual_forced_params.copy() if residual_forced_params else set()
             
-            # 디버그: 매 outer optimization마다 상세 정보 출력
-            logger.info(f"[DEBUG] Calling _log_magnitude_based_selection with epoch={epoch}")
-            step = getattr(self, '_current_step', None)
-            self._log_magnitude_based_selection(magnitudes, epoch, step)
-        elif has_magnitude_config and not has_param_names:
-            logger.warning(f"[DEBUG] Gradient magnitude config is set but param_names is None! Cannot compute magnitudes.")
+            with self.lock_averaged_tensors:
+                new_averaged_grads = tuple(grad for grad in self._grads_from_optimizer())
+                self._averaged_tensors = tuple(new_averaged_grads)
+                for tensor in self._averaged_tensors:
+                    tensor.share_memory_()
+                self.total_size = sum(map(torch.Tensor.numel, self._averaged_tensors))
+                from hivemind.averaging.averager import compute_schema_hash
+                self.schema_hash = compute_schema_hash(self._averaged_tensors)
+            
+            # averager 프로세스에 업데이트 전달
+            if self.is_alive():
+                try:
+                    self._outer_pipe.send(("_update_averaged_tensors", [list(new_averaged_grads)], {
+                        "total_size": self.total_size,
+                        "schema_hash": self.schema_hash
+                    }))
+                except Exception as e:
+                    logger.warning(f"Failed to send _update_averaged_tensors: {e}")
+        
+        time_1_magnitude_selection = time.perf_counter()
+        magnitude_selection_time = time_1_magnitude_selection - time_0_magnitude_selection
+        
+        # Token weight 설정
+        if token_weight_result is not None:
+            sync_wait_time = token_weight_wait_time
+        elif 'weight' in kwargs:
+            control.weight = kwargs['weight']
+            kwargs.pop('weight', None)
         
         if control is None:
-            # cyshin
-            time_0_schedule_step = time.perf_counter()
             control = self.schedule_step(timeout=timeout, **kwargs)
-            time_1_schedule_step = time.perf_counter()
-            logger.log(
-                logging.INFO,
-                f"Time taken for schedule_step: {time_1_schedule_step - time_0_schedule_step} sec",
-            )
-        # cyshin
-        time_0_compute_and_load_pseudo_grad = time.perf_counter()
+        
+        time_0_compute_pseudo_grad = time.perf_counter()
         self.compute_and_load_pseudo_grad_into_averager()
-        time_1_compute_and_load_pseudo_grad = time.perf_counter()
-        logger.log(
-            logging.INFO,
-            f"Time taken for compute_and_load_pseudo_grad: {time_1_compute_and_load_pseudo_grad - time_0_compute_and_load_pseudo_grad} sec",
-        )
-
-        # Token-weighted aggregation: weight 계산 및 설정
-        # weight가 kwargs에 명시적으로 지정되지 않은 경우에만 token 기반 weight 계산
-        if 'weight' in kwargs:
-            # 명시적으로 weight가 지정된 경우 사용 (token weight 덮어쓰기)
-            control.weight = kwargs['weight']
-            # kwargs에서 weight 제거하여 나중에 다시 사용되지 않도록 함
-            kwargs.pop('weight', None)
-        elif self.token_weighted_aggregation:
-            # Mixin의 _compute_token_weight 메서드 사용
-            self._compute_token_weight(control, log_prefix="GradAverager Token-weighted aggregation")
-            # token weight 사용 후 kwargs에 weight가 있으면 덮어쓰기 방지
-            if 'weight' in kwargs:
-                kwargs.pop('weight', None)
+        time_1_compute_pseudo_grad = time.perf_counter()
+        compute_pseudo_grad_time = time_1_compute_pseudo_grad - time_0_compute_pseudo_grad
 
         control.allow_allreduce()
 
-        # control.result() 호출 전에 각 노드가 local step을 완료했는지 DHT를 통해 동기화
-        if wait and self.num_inner_steps is not None and epoch is not None and self.expected_num_peers is not None:
+        # Local step 동기화 (token_weighted_aggregation이 비활성화된 경우만)
+        if (not self.token_weighted_aggregation and 
+            wait and self.num_inner_steps is not None and epoch is not None and self.expected_num_peers is not None):
             try:
-                logger.log(
-                    logging.INFO,
-                    f"Synchronizing local step completion via DHT before control.result() call (epoch={epoch}, num_inner_steps={self.num_inner_steps}, expected_peers={self.expected_num_peers})",
-                )
-                wait_for_all_nodes_local_step_complete(
+                sync_wait_time = wait_for_all_nodes_local_step_complete(
                     dht=self.dht,
                     epoch=epoch,
                     num_inner_steps=self.num_inner_steps,
                     expected_num_peers=self.expected_num_peers,
-                    log_fn=lambda msg: logger.log(logging.INFO, msg),
+                    log_fn=lambda msg: None,  # 로그 제거
                     timeout=timeout if timeout is not None else 300.0,
-                )
-                logger.log(
-                    logging.INFO,
-                    f"Local step synchronization completed for epoch {epoch}",
                 )
             except Exception as e:
                 logger.warning(f"Failed to synchronize local step completion via DHT: {e}. Proceeding with control.result() anyway.")
 
+        # 시간 측정 로그 출력
+        logger.log(
+            logging.INFO,
+            f"[TIMING] Gradient magnitude selection: {magnitude_selection_time:.6f} sec, "
+            f"Token weight sync: {token_weight_wait_time:.6f} sec, "
+            f"Sync wait (GPU idle): {sync_wait_time:.6f} sec"
+        )
+        
         # return control.result(timeout) if wait else control
         if wait:
-            time_0_control_result = time.perf_counter()
+            time_0_allreduce = time.perf_counter()
             return_value = control.result(timeout)
-            time_1_control_result = time.perf_counter()
+            time_1_allreduce = time.perf_counter()
+            allreduce_time = time_1_allreduce - time_0_allreduce
             logger.log(
                 logging.INFO,
-                f"Time taken for control_result: {time_1_control_result - time_0_control_result} sec",
+                f"[TIMING] All-reduce networking time: {allreduce_time:.6f} sec"
             )
             return return_value
         else: 
@@ -1019,11 +1155,11 @@ class DiLoCoGradAverager(DecentralizedAverager, TokenWeightedAggregationMixin):
         """compute pseudo gradient by subtracting the offloaded optimizer parameters with the main parameters and load them in the averager"""
         opt_parameters = [param for group in self.offloaded_optimizer.param_groups for param in group["params"]]
         
-        # 파라미터 업데이트 추적을 위한 정보 수집
+        # 파라미터 업데이트 추적을 위한 정보 수집 (enable_update_logs가 True인 경우에만)
         epoch = getattr(self, '_current_epoch', None)
         step = getattr(self, '_current_step', None)
-        timestamp = datetime.now().isoformat()
-        update_records = []
+        timestamp = datetime.now().isoformat() if self.enable_update_logs else None
+        update_records = [] if self.enable_update_logs else None
         
         with self.get_tensors() as averaged_grads:
             param_idx = 0
@@ -1049,8 +1185,18 @@ class DiLoCoGradAverager(DecentralizedAverager, TokenWeightedAggregationMixin):
                 # main_param is the param that has been updated by the inner optimizer, it is suppose to be on gpu
                 if self.param_update_mask is not None:
                     if self.param_update_mask[param_idx]:
-                        # 선택된 레이어만 pseudo gradient 계산
+                        # 선택된 파라미터만 pseudo gradient 계산
+                        # Error Feedback: 통신에 사용되는 pseudo gradient에 residual을 더함
                         grad = opt_param.data - main_param.detach().to(opt_param.device)
+                        
+                        # Error Feedback: residual을 포함한 pseudo gradient 계산
+                        if self.residual_buffers is not None and param_idx < len(self.residual_buffers):
+                            residual = self.residual_buffers[param_idx]
+                            # residual을 grad와 같은 device로 이동하여 더함
+                            if residual.device != grad.device:
+                                residual = residual.to(grad.device)
+                            grad = grad + residual
+                        
                         if grad_idx >= len(averaged_grads):
                             raise RuntimeError(
                                 f"grad_idx ({grad_idx})가 averaged_grads의 길이 ({len(averaged_grads)})를 초과했습니다. "
@@ -1063,31 +1209,50 @@ class DiLoCoGradAverager(DecentralizedAverager, TokenWeightedAggregationMixin):
                                 f"이는 초기화 시점과 step 시점의 param_update_mask가 다르거나, "
                                 f"opt_parameters와 main_parameters의 순서가 일치하지 않을 수 있습니다."
                             )
-                        # 파라미터 업데이트 전후 값 추적
-                        param_before = opt_param.data.clone().cpu()
+                        # Gradient 정보 기록 (enable_update_logs가 True인 경우에만)
                         averaged_grads[grad_idx].copy_(grad, non_blocking=True)
-                        param_after = averaged_grads[grad_idx].clone().cpu()
-                        
-                        # 업데이트 정보 기록
-                        update_records.append({
-                            'param_idx': param_idx,
-                            'param_name': param_name,
-                            'grad_norm': float(grad.norm().item()),
-                            'param_before_mean': float(param_before.mean().item()),
-                            'param_before_std': float(param_before.std().item()),
-                            'param_after_mean': float(param_after.mean().item()),
-                            'param_after_std': float(param_after.std().item()),
-                            'update_magnitude': float((param_after - param_before).norm().item())
-                        })
+                        if self.enable_update_logs and update_records:
+                            # residual threshold로 인해 강제 통신되었는지 확인
+                            was_forced_by_residual = param_idx in getattr(self, '_residual_forced_params', set())
+                            # 업데이트 정보 기록 (gradient norm 및 선택 여부 포함)
+                            update_records.append({
+                                'param_idx': param_idx,
+                                'param_name': param_name,
+                                'grad_norm': float(grad.norm().item()),
+                                'was_selected': True,  # 이 블록에 들어왔으므로 선택됨
+                                'was_forced_by_residual': was_forced_by_residual,
+                            })
                         
                         updated_param_names.append(param_name)
                         grad_idx += 1
                     else:
-                        # 선택되지 않은 레이어는 통신에서 제외됨 (averaged_grads에 포함되지 않음)
+                        # 선택되지 않은 레이어는 통신에서 제외됨
+                        # Error Feedback: 선택되지 않은 gradient를 residual buffer에 누적
+                        if self.residual_buffers is not None and param_idx < len(self.residual_buffers):
+                            # pseudo gradient 계산 (선택되지 않은 파라미터의 경우)
+                            pseudo_grad = opt_param.data - main_param.detach().to(opt_param.device)
+                            # residual buffer에 누적 (CPU에 저장)
+                            residual = self.residual_buffers[param_idx]
+                            # pseudo_grad를 CPU로 이동하여 residual에 더함
+                            if pseudo_grad.device != residual.device:
+                                pseudo_grad = pseudo_grad.to(residual.device)
+                            residual.add_(pseudo_grad)
+                            logger.debug(f"Accumulated unselected gradient to residual buffer for param {param_idx} ({param_name}), residual norm: {residual.norm().item():.6f}")
+                        
                         skipped_param_names.append(param_name)
                 else:
-                    # 모든 레이어 업데이트
+                    # 모든 파라미터 업데이트
+                    # Error Feedback: 통신에 사용되는 pseudo gradient에 residual을 더함
                     grad = opt_param.data - main_param.detach().to(opt_param.device)
+                    
+                    # Error Feedback: residual을 포함한 pseudo gradient 계산
+                    if self.residual_buffers is not None and param_idx < len(self.residual_buffers):
+                        residual = self.residual_buffers[param_idx]
+                        # residual을 grad와 같은 device로 이동하여 더함
+                        if residual.device != grad.device:
+                            residual = residual.to(grad.device)
+                        grad = grad + residual
+                    
                     if grad_idx >= len(averaged_grads):
                         raise RuntimeError(
                             f"grad_idx ({grad_idx})가 averaged_grads의 길이 ({len(averaged_grads)})를 초과했습니다. "
@@ -1099,70 +1264,38 @@ class DiLoCoGradAverager(DecentralizedAverager, TokenWeightedAggregationMixin):
                             f"grad의 크기는 {grad.shape}입니다. param_idx={param_idx}, param_name={param_name}. "
                             f"opt_parameters와 main_parameters의 순서가 일치하지 않을 수 있습니다."
                         )
-                    # 파라미터 업데이트 전후 값 추적
-                    param_before = opt_param.data.clone().cpu()
+                    # Gradient 정보 기록 (enable_update_logs가 True인 경우에만)
                     averaged_grads[grad_idx].copy_(grad, non_blocking=True)
-                    param_after = averaged_grads[grad_idx].clone().cpu()
-                    
-                    # 업데이트 정보 기록
-                    update_records.append({
-                        'param_idx': param_idx,
-                        'param_name': param_name,
-                        'grad_norm': float(grad.norm().item()),
-                        'param_before_mean': float(param_before.mean().item()),
-                        'param_before_std': float(param_before.std().item()),
-                        'param_after_mean': float(param_after.mean().item()),
-                        'param_after_std': float(param_after.std().item()),
-                        'update_magnitude': float((param_after - param_before).norm().item())
-                    })
+                    if self.enable_update_logs and update_records:
+                        # residual threshold로 인해 강제 통신되었는지 확인
+                        was_forced_by_residual = param_idx in getattr(self, '_residual_forced_params', set())
+                        # 업데이트 정보 기록 (gradient norm 및 선택 여부 포함)
+                        update_records.append({
+                            'param_idx': param_idx,
+                            'param_name': param_name,
+                            'grad_norm': float(grad.norm().item()),
+                            'was_selected': True,  # 이 블록에 들어왔으므로 선택됨
+                            'was_forced_by_residual': was_forced_by_residual,
+                        })
                     
                     if not updated_param_names:  # 첫 번째 호출 시에만 로깅
                         updated_param_names.append(param_name)
                     grad_idx += 1
                 param_idx += 1
             
-            # 디버그: 실제로 통신되는 파라미터 로깅
-            current_epoch = getattr(self, '_current_epoch', 0)
-            if not hasattr(self, '_last_logged_epoch'):
-                self._last_logged_epoch = -1
             
-            # 매 epoch마다 한 번만 또는 매번 상세 로깅 (처음 몇 번만)
-            should_log = current_epoch != self._last_logged_epoch or current_epoch < 3
-            
-            if should_log:
-                logger.info(f"[DEBUG] Computing pseudo gradients (epoch {current_epoch}, step {getattr(self, '_current_step', '?')})")
-                if self.param_update_mask is not None:
-                    logger.info(f"[DEBUG]   - Parameters to be synced: {len(updated_param_names)}/{param_idx}")
-                    logger.info(f"[DEBUG]   - Parameters skipped: {len(skipped_param_names)}/{param_idx}")
-                    
-                    if updated_param_names:
-                        logger.info(f"[DEBUG]   - Synced parameter names:")
-                        for i, name in enumerate(updated_param_names[:30]):  # 처음 30개
-                            logger.info(f"     {i+1}. {name}")
-                        if len(updated_param_names) > 30:
-                            logger.info(f"     ... and {len(updated_param_names) - 30} more parameters")
-                    
-                    if skipped_param_names and len(skipped_param_names) <= 10:
-                        logger.info(f"[DEBUG]   - Skipped parameter names:")
-                        for i, name in enumerate(skipped_param_names[:10]):
-                            logger.info(f"     {i+1}. {name}")
-                else:
-                    logger.info(f"[DEBUG]   - All {param_idx} parameters will be synced")
-                
-                self._last_logged_epoch = current_epoch
-            
-            # 파라미터 업데이트 이력 저장
-            if update_records:
+            # 파라미터 업데이트 이력 저장 (enable_update_logs가 True인 경우에만)
+            if self.enable_update_logs and update_records:
                 self._save_parameter_updates_to_file(update_records, epoch, step, timestamp)
 
-    def _save_parameter_updates_to_file(
+    def _save_parameter_updates_to_file_sync(
         self,
         update_records: List[Dict],
         epoch: Optional[int],
         step: Optional[int],
         timestamp: str
     ):
-        """파라미터 업데이트 정보를 파일로 저장"""
+        """파라미터 업데이트 정보를 파일로 저장 (동기 버전)"""
         import csv
         import json
         
@@ -1170,8 +1303,7 @@ class DiLoCoGradAverager(DecentralizedAverager, TokenWeightedAggregationMixin):
         csv_filename = os.path.join(self.log_dir, f"parameter_updates_epoch_{epoch if epoch is not None else 'unknown'}_step_{step if step is not None else 'unknown'}.csv")
         try:
             with open(csv_filename, 'w', newline='') as csvfile:
-                fieldnames = ['epoch', 'step', 'timestamp', 'param_idx', 'param_name', 'grad_norm', 
-                             'param_before_mean', 'param_before_std', 'param_after_mean', 'param_after_std', 'update_magnitude']
+                fieldnames = ['epoch', 'step', 'timestamp', 'param_idx', 'param_name', 'grad_norm', 'was_selected', 'was_forced_by_residual']
                 writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
                 
                 writer.writeheader()
@@ -1205,10 +1337,62 @@ class DiLoCoGradAverager(DecentralizedAverager, TokenWeightedAggregationMixin):
             logger.info(f"Saved parameter update history to JSON: {json_filename}")
         except Exception as e:
             logger.warning(f"Failed to save parameter update history to JSON: {e}")
+    
+    def _save_parameter_updates_to_file(
+        self,
+        update_records: List[Dict],
+        epoch: Optional[int],
+        step: Optional[int],
+        timestamp: str
+    ):
+        """파라미터 업데이트 정보를 파일로 저장 (비동기 버전)"""
+        if not self.enable_update_logs:
+            return
+            
+        if self._log_executor is None:
+            return
+            
+        # 비동기로 실행 (메인 학습 루프를 블로킹하지 않음)
+        self._log_executor.submit(self._save_parameter_updates_to_file_sync, update_records, epoch, step, timestamp)
 
     def notify_used_averaged_gradients(self):
-        """Notify averager that the results of a previous averaging round are accounted for"""
+        """Notify averager that the results of a previous averaging round are accounted for
+        Error Feedback: 통신이 완료된 후, 선택된 파라미터와 강제 통신된 파라미터의 residual을 초기화합니다.
+        """
         self._new_averaged_grads = False
+        
+        # Error Feedback: 통신이 완료된 후 residual 초기화
+        if self.residual_buffers is not None and self.param_update_mask is not None:
+            # 선택된 파라미터와 강제 통신된 파라미터의 residual 초기화
+            residual_forced_params = getattr(self, '_residual_forced_params', set())
+            
+            for param_idx in range(len(self.param_update_mask)):
+                # 선택된 파라미터 또는 강제 통신된 파라미터의 residual 초기화
+                if (self.param_update_mask[param_idx] or param_idx in residual_forced_params):
+                    if param_idx < len(self.residual_buffers):
+                        self.residual_buffers[param_idx].zero_()
+                        logger.debug(f"Reset residual buffer for param {param_idx} after communication")
+    
+    async def _update_averaged_tensors(self, new_tensors: List[torch.Tensor], total_size: int, schema_hash: int):
+        """
+        averager 프로세스에서 _averaged_tensors를 업데이트합니다.
+        
+        메인 프로세스에서 새로운 텐서 리스트를 받아서 averager 프로세스의 _averaged_tensors를 업데이트합니다.
+        텐서는 이미 share_memory_()를 호출했으므로 공유 메모리를 통해 접근 가능합니다.
+        """
+        old_tensor_count = len(self._averaged_tensors)
+        old_total_size = self.total_size
+        
+        with self.lock_averaged_tensors:
+            self._averaged_tensors = tuple(new_tensors)
+            self.total_size = total_size
+            self.schema_hash = schema_hash
+        
+        logger.info(
+            f"[DEBUG averager process] Updated _averaged_tensors: "
+            f"tensor count {old_tensor_count} -> {len(self._averaged_tensors)}, "
+            f"total_size {old_total_size} -> {self.total_size}"
+        )
 
 
 class DiloCoProgressTracker(ProgressTracker):
@@ -1386,6 +1570,9 @@ class DiLoCoOptimizer(Optimizer):
         gradient_magnitude_top_k_ratio: Optional[float] = None,
         param_names: Optional[List[str]] = None,
         token_weighted_aggregation: bool = False,
+        enable_error_feedback: bool = True,
+        residual_norm_threshold: Optional[float] = None,
+        enable_update_logs: bool = False,
         **kwargs,
     ):
         self._check_kwargs(kwargs)
@@ -1395,6 +1582,9 @@ class DiLoCoOptimizer(Optimizer):
         self.gradient_magnitude_threshold = gradient_magnitude_threshold
         self.gradient_magnitude_top_k_ratio = gradient_magnitude_top_k_ratio
         self.token_weighted_aggregation = token_weighted_aggregation
+        self.enable_error_feedback = enable_error_feedback
+        self.residual_norm_threshold = residual_norm_threshold
+        self.enable_update_logs = enable_update_logs
         if selective_layer_patterns is not None or gradient_magnitude_threshold is not None or gradient_magnitude_top_k_ratio is not None:
             if param_names is None:
                 # param_names가 제공되지 않으면 모델에서 직접 추출 시도
@@ -1544,6 +1734,9 @@ class DiLoCoOptimizer(Optimizer):
             gradient_magnitude_threshold=self.gradient_magnitude_threshold,
             gradient_magnitude_top_k_ratio=self.gradient_magnitude_top_k_ratio,
             token_weighted_aggregation=self.token_weighted_aggregation,
+            enable_error_feedback=self.enable_error_feedback,
+            residual_norm_threshold=self.residual_norm_threshold,
+            enable_update_logs=self.enable_update_logs,
             **kwargs,
         )
         
@@ -1716,16 +1909,12 @@ class DiLoCoOptimizer(Optimizer):
             assert not self.delay_optimizer_step, "delay_optimizer_step must be False in DiLoCo"
 
             if self.tracker.global_progress.num_peers > 1:
-                logger.log(self.status_loglevel, f"Beginning optimizer step #{self.local_epoch}")
-                time_0 = time.perf_counter()
-
                 # epoch 정보를 grad averager에 전달
                 if hasattr(self.diloco_grad_averager, '_current_epoch'):
                     self.diloco_grad_averager._current_epoch = self.local_epoch
                 self.diloco_grad_averager._current_step = self.tracker.real_step
                 
                 # Token-weighted aggregation 및 local step 동기화를 위한 expected_num_peers 설정
-                # tracker에서 현재 peer 수를 가져와서 설정 (최소한의 예상 값)
                 self.diloco_grad_averager.expected_num_peers = max(
                     self.tracker.global_progress.num_peers,
                     2  # 최소 2개 노드는 있어야 함
@@ -1733,11 +1922,6 @@ class DiLoCoOptimizer(Optimizer):
                 
                 self.diloco_grad_averager.step(
                     wait=True, timeout=self.averaging_timeout, control=self.scheduled_diloco_grads, epoch=self.local_epoch
-                )
-                time_1 = time.perf_counter()
-                logger.log(
-                    self.status_loglevel,
-                    f"Time taken for gradient all reduce: {time_1 - time_0} sec",
                 )
 
                 self.diloco_grad_averager.notify_used_averaged_gradients()
