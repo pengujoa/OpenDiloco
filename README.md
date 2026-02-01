@@ -48,7 +48,7 @@ pip install flash-attn>=2.5.8
 
 ## Docker container
 
-If you prefer to run your experiments in a reproduceable container, you can use our pre-built docker image containing the repository and pre-installed dependencies.
+If you prefer to run your experiments in a reproducible container, you can use our pre-built docker image containing the repository and pre-installed dependencies.
 ```bash
 docker pull primeintellect/open_diloco:main
 docker run -d --name open-diloco --ipc=host --network=host --gpus=all primeintellect/open_diloco:main
