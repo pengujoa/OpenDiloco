@@ -154,6 +154,9 @@ class DiLoCoStateAverager(TrainingStateAverager, TokenWeightedAggregationMixin):
         self.token_count_key = None
         self.worker_id = None
         self.expected_num_peers = None
+        
+        # grad_averager 참조는 나중에 설정됨 (DiLoCoOptimizer에서)
+        self.grad_averager = None
 
         super().__init__(
             **kwargs
@@ -165,6 +168,52 @@ class DiLoCoStateAverager(TrainingStateAverager, TokenWeightedAggregationMixin):
         # Token-weighted aggregation 초기화 (DHT와 worker_id가 설정된 후)
         if self.token_weighted_aggregation:
             self._init_token_weighted_aggregation(key_suffix="_state")
+
+    @torch.no_grad()
+    def _apply_optimizer_parameters_(self):
+        """Copy parameters from offloaded optimizer to the main model
+        모든 파라미터를 업데이트합니다. Skip된 파라미터의 경우 gradient가 0이었으므로
+        outer optimizer step 후에도 변화가 없어야 하지만, 안전을 위해 모든 파라미터를 업데이트합니다.
+        """
+        assert self.offload_optimizer, "Applying offloaded optimizer updates requires offloaded optimizer"
+        offloaded_parameters = [param for group in self.optimizer.param_groups for param in group["params"]]
+        assert len(offloaded_parameters) == len(self.main_parameters), "Optimizer parameters changed during training"
+        
+        # 모든 파라미터를 업데이트 (skip된 파라미터도 포함)
+        # Skip된 파라미터의 경우 gradient가 0으로 설정되어 outer optimizer step 후에도
+        # 변화가 없어야 하지만, 모든 파라미터를 일관되게 업데이트합니다.
+        for main_param, offloaded_param in zip(self.main_parameters, offloaded_parameters):
+            main_param.copy_(offloaded_param, non_blocking=True)
+
+
+    @torch.no_grad()
+    def _apply_averaging_results_(self):
+        """Copy averaged tensors into their respective local tensors
+        Skip 유무와 상관없이 모든 파라미터를 덮어씁니다.
+        """
+        assert not self.reuse_tensors, "No need to update averaged tensors since they reuse the same memory"
+        if self.delta_rule_averaging and self._old_tensors is None:
+            logger.warning("Using delta_rule_averaging, but old tensors were not found. Averaging may have failed")
+        
+        with self.get_tensors() as averaged_tensors:
+            local_tensors = list(self._local_tensors())
+            assert len(local_tensors) == len(averaged_tensors), "Tensor structure changed during training"
+            
+            # outer optimizer의 파라미터만 필터링 (optimizer statistics는 제외)
+            # _local_tensors()는 [optimizer_params, optimizer_stats, extra_tensors] 순서로 반환
+            num_optimizer_params = len(self.optimizer.param_groups[0]["params"]) if self.optimizer.param_groups else 0
+            # 실제로는 모든 param_groups의 파라미터 수를 세어야 함
+            total_optimizer_params = sum(len(group["params"]) for group in self.optimizer.param_groups)
+            
+            for idx, (local_tensor, averaged_tensor) in enumerate(zip(local_tensors, averaged_tensors)):
+                # 모든 파라미터 업데이트 (skip 유무와 상관없이 덮어쓰기)
+                if not self.delta_rule_averaging or self._old_tensors is None:
+                    local_tensor.copy_(averaged_tensor, non_blocking=True)
+                else:
+                    # Delta rule averaging
+                    old_tensor = self._old_tensors[idx]
+                    delta = torch.sub(averaged_tensor, old_tensor, out=old_tensor)
+                    local_tensor.add_(delta.to(device=local_tensor.device, dtype=local_tensor.dtype))
 
     def _update_scheduler(self):
         """Increase the scheduler state until it becomes synchronized with local epoch"""
@@ -246,13 +295,13 @@ class DiLoCoStateAverager(TrainingStateAverager, TokenWeightedAggregationMixin):
             
             if averaging_control is not None:
                 # 이미 생성된 control이 있으면 weight 설정
-                # _compute_token_weight는 (weight, wait_time) 튜플을 반환 (wait_time은 사용하지 않음)
-                computed_token_weight, _ = self._compute_token_weight(averaging_control, log_prefix="StateAverager Token-weighted aggregation")
+                # _compute_token_weight는 weight을 반환
+                computed_token_weight = self._compute_token_weight(averaging_control, log_prefix="StateAverager Token-weighted aggregation")
             elif self.token_weighted_aggregation and self.cumulative_tokens > 0:
                 # control이 None이면, weight를 계산해서 kwargs에 추가
                 # 먼저 token 수를 publish하고 읽어옴
                 self._publish_token_count_to_dht()
-                token_counts, _ = self._read_token_counts_from_dht(
+                token_counts = self._read_token_counts_from_dht(
                     wait_for_peers=True,
                     max_wait_time=300.0,
                     check_interval=0.2
@@ -332,10 +381,18 @@ class DiLoCoGradAverager(DecentralizedAverager, TokenWeightedAggregationMixin):
         selective_layer_patterns: Optional[List[str]] = None,
         gradient_magnitude_threshold: Optional[float] = None,
         gradient_magnitude_top_k_ratio: Optional[float] = None,
+        gradient_magnitude_top_k_ratio_by_size: bool = False,
+        gradient_magnitude_selection_mode: str = "layer",  # "layer" or "parameter"
+        gradient_importance_metric: str = "magnitude",  # "magnitude" or "taylor"
         token_weighted_aggregation: bool = False,
-        enable_error_feedback: bool = True,
         residual_norm_threshold: Optional[float] = None,
         enable_update_logs: bool = False,
+        # Max Staleness (강제 업데이트) 기능
+        enable_max_staleness: bool = False,
+        max_staleness: int = 100,  # N번 이상 선택되지 않으면 강제 포함
+        # Warm-up (서서히 줄이기) 기능
+        enable_warmup: bool = False,
+        warmup_epochs: int = 5,  # 초기 N epoch 동안은 모든 파라미터 전송
         **kwargs,
     ):
         if "client_mode" in kwargs:
@@ -385,9 +442,19 @@ class DiLoCoGradAverager(DecentralizedAverager, TokenWeightedAggregationMixin):
         self.selective_layer_patterns = selective_layer_patterns
         self.gradient_magnitude_threshold = gradient_magnitude_threshold
         self.gradient_magnitude_top_k_ratio = gradient_magnitude_top_k_ratio
+        self.gradient_magnitude_top_k_ratio_by_size = gradient_magnitude_top_k_ratio_by_size
         
-        # Error Feedback (Residual Accumulation) 설정
-        self.enable_error_feedback = enable_error_feedback
+        # Selection mode: "layer" (레이어 단위) or "parameter" (파라미터 텐서 단위)
+        if gradient_magnitude_selection_mode not in ["layer", "parameter"]:
+            raise ValueError(f"gradient_magnitude_selection_mode must be 'layer' or 'parameter', got '{gradient_magnitude_selection_mode}'")
+        self.gradient_magnitude_selection_mode = gradient_magnitude_selection_mode
+        
+        # Importance metric: "magnitude" (L2 norm) or "taylor" (|w * g|)
+        if gradient_importance_metric not in ["magnitude", "taylor"]:
+            raise ValueError(f"gradient_importance_metric must be 'magnitude' or 'taylor', got '{gradient_importance_metric}'")
+        self.gradient_importance_metric = gradient_importance_metric
+        
+        # Residual norm threshold 설정
         self.residual_norm_threshold = residual_norm_threshold
         
         # 파라미터 업데이트 로그 활성화/비활성화 (파일 저장 및 상세 로깅)
@@ -396,34 +463,43 @@ class DiLoCoGradAverager(DecentralizedAverager, TokenWeightedAggregationMixin):
         # 파일 I/O 작업을 위한 ThreadPoolExecutor 초기화 (비동기 로깅용)
         self._log_executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="diloco_logger") if enable_update_logs else None
         
+        # Max Staleness (강제 업데이트) 기능 설정
+        self.enable_max_staleness = enable_max_staleness
+        self.max_staleness = max_staleness
+        if self.enable_max_staleness and param_names is not None:
+            if self.gradient_magnitude_selection_mode == "layer":
+                # 레이어 단위 Staleness 카운터 초기화 (CPU에 저장하여 메모리 효율성)
+                layer_to_indices = self._group_parameters_by_layer(param_names)
+                self.layer_staleness_counters = {layer_name: 0 for layer_name in layer_to_indices.keys()}
+                self.param_staleness_counters = None
+                logger.info(f"Max Staleness enabled (layer-based): layers not selected for {max_staleness} steps will be forced to update")
+                logger.info(f"  Total layers: {len(self.layer_staleness_counters)}")
+            else:  # parameter mode
+                # 파라미터 단위 Staleness 카운터 초기화
+                self.param_staleness_counters = [0] * len(param_names)
+                self.layer_staleness_counters = None
+                logger.info(f"Max Staleness enabled (parameter-based): parameters not selected for {max_staleness} steps will be forced to update")
+                logger.info(f"  Total parameters: {len(self.param_staleness_counters)}")
+        else:
+            self.layer_staleness_counters = None
+            self.param_staleness_counters = None
+        
+        # Warm-up (서서히 줄이기) 기능 설정
+        self.enable_warmup = enable_warmup
+        self.warmup_epochs = warmup_epochs
+        self.original_top_k_ratio = gradient_magnitude_top_k_ratio  # 원본 top_k_ratio 저장
+        self.original_top_k_ratio_by_size = gradient_magnitude_top_k_ratio_by_size  # 원본 top_k_ratio_by_size 저장
+        if self.enable_warmup:
+            logger.info(f"Warm-up enabled: all parameters will be sent for first {warmup_epochs} epochs, then gradually reduce to target sparsity")
+        
         # Gradient magnitude 기반 선택과 pattern 기반 선택은 동시에 사용 불가
         if (gradient_magnitude_threshold is not None or gradient_magnitude_top_k_ratio is not None) and selective_layer_patterns is not None:
             raise ValueError("gradient_magnitude_threshold/top_k_ratio와 selective_layer_patterns는 동시에 사용할 수 없습니다.")
         
-        # Error Feedback을 위한 residual buffer 초기화
-        # gradient magnitude 기반 선택이 활성화되고 error feedback이 활성화된 경우에만 사용
-        use_error_feedback = (
-            self.enable_error_feedback and 
-            (gradient_magnitude_threshold is not None or gradient_magnitude_top_k_ratio is not None) and
-            param_names is not None
-        )
-        
-        if use_error_feedback:
-            # 각 파라미터에 대한 residual buffer 초기화 (CPU에 저장)
-            self.residual_buffers = []
-            param_groups = self.offloaded_optimizer.param_groups
-            for param_group in param_groups:
-                for param in param_group["params"]:
-                    # residual buffer는 CPU에 저장 (메모리 효율성)
-                    residual = torch.zeros_like(param, device='cpu')
-                    self.residual_buffers.append(residual)
-            logger.info(f"Error Feedback enabled: {len(self.residual_buffers)} residual buffers initialized")
-            if self.residual_norm_threshold is not None:
-                logger.info(f"Residual norm threshold: {self.residual_norm_threshold} (force communication when exceeded)")
-        else:
-            self.residual_buffers = None
-            if self.enable_error_feedback and (gradient_magnitude_threshold is None and gradient_magnitude_top_k_ratio is None):
-                logger.warning("Error Feedback is enabled but gradient magnitude-based selection is not active. Error Feedback will be disabled.")
+        # Residual buffer는 더 이상 필요 없음
+        # main_param을 리셋하지 않으면, opt_param - main_param이 이미 누적된 차이를 나타냄
+        # 따라서 별도의 residual buffer를 유지할 필요가 없음 (Implicit Accumulation)
+        self.residual_buffers = None
         
         # 초기 마스크 설정 (pattern 기반이면 초기화 시 생성, magnitude 기반이면 step에서 동적 생성)
         if selective_layer_patterns is not None and param_names is not None:
@@ -481,7 +557,9 @@ class DiLoCoGradAverager(DecentralizedAverager, TokenWeightedAggregationMixin):
             self._init_token_weighted_aggregation(key_suffix="_grad")
 
     def _create_param_mask(self, param_names: List[str], patterns: List[str]) -> List[bool]:
-        """파라미터 이름이 패턴 중 하나라도 매칭되면 True인 마스크 생성"""
+        """파라미터 이름이 패턴 중 하나라도 매칭되면 True인 마스크 생성
+        Transformer 모델의 관례에 따라 embedding과 lm_head는 항상 포함 (Dense하게 유지)
+        """
         mask = []
         for param_name in param_names:
             matched = False
@@ -490,13 +568,112 @@ class DiLoCoGradAverager(DecentralizedAverager, TokenWeightedAggregationMixin):
                 if pattern in param_name or param_name.startswith(pattern):
                     matched = True
                     break
+            
+            # Transformer 모델의 관례: embedding과 lm_head는 항상 포함 (Dense하게 유지)
+            if not matched:
+                # embedding 레이어 체크 (embed_tokens, embeddings 등)
+                if 'embed' in param_name.lower() or 'embed_tokens' in param_name:
+                    matched = True
+                # output head 레이어 체크 (lm_head, output 등)
+                elif 'lm_head' in param_name.lower() or param_name.endswith('.head') or 'output' in param_name.lower():
+                    matched = True
+            
             mask.append(matched)
         return mask
+
+    def _extract_layer_name(self, param_name: str) -> str:
+        """파라미터 이름에서 레이어 이름을 추출
+        
+        예시:
+        - "model.layers.0.self_attn.q_proj.weight" -> "model.layers.0"
+        - "model.embed_tokens.weight" -> "model.embed_tokens"
+        - "lm_head.weight" -> "lm_head"
+        - "transformer.h.0.attn.c_attn.weight" -> "transformer.h.0"
+        """
+        if "." not in param_name:
+            return param_name
+        
+        parts = param_name.split(".")
+        
+        # "model.layers.X" 형태 (Llama, Mistral 등)
+        if "layers" in parts:
+            layer_idx = parts.index("layers")
+            if layer_idx + 1 < len(parts):
+                return ".".join(parts[:layer_idx + 2])  # "model.layers.0"
+        
+        # "transformer.h.X" 형태 (GPT-2 등)
+        if len(parts) >= 3 and parts[0] == "transformer" and parts[1] == "h":
+            try:
+                # parts[2]가 숫자인지 확인
+                int(parts[2])
+                return ".".join(parts[:3])  # "transformer.h.0"
+            except ValueError:
+                pass
+        
+        # "blocks.X" 형태
+        if "blocks" in parts:
+            block_idx = parts.index("blocks")
+            if block_idx + 1 < len(parts):
+                return ".".join(parts[:block_idx + 2])  # "blocks.0"
+        
+        # "model.embed_tokens", "model.norm" 등 (root 레벨)
+        if len(parts) >= 2:
+            # 첫 두 부분이 모델의 루트 레벨 컴포넌트인 경우
+            if parts[0] == "model" or parts[0] == "transformer":
+                # embed_tokens, norm 등은 별도 레이어로 취급
+                if len(parts) >= 2:
+                    return ".".join(parts[:2])  # "model.embed_tokens"
+        
+        # "lm_head" 같은 경우
+        if parts[0] == "lm_head" or (len(parts) >= 1 and "head" in parts[0].lower()):
+            return parts[0]
+        
+        # 기본값: 첫 두 부분만 반환
+        return ".".join(parts[:2]) if len(parts) >= 2 else param_name
+
+    def _group_parameters_by_layer(self, param_names: List[str]) -> Dict[str, List[int]]:
+        """파라미터를 레이어별로 그룹화
+        
+        Returns:
+            layer_to_param_indices: {layer_name: [param_idx1, param_idx2, ...]}
+        """
+        layer_to_indices = {}
+        
+        for idx, param_name in enumerate(param_names):
+            layer_name = self._extract_layer_name(param_name)
+            if layer_name not in layer_to_indices:
+                layer_to_indices[layer_name] = []
+            layer_to_indices[layer_name].append(idx)
+        
+        return layer_to_indices
+
+    def _is_input_output_layer(self, layer_name: str) -> bool:
+        """Input/Output 레이어인지 확인
+        
+        Input 레이어: embed_tokens, embeddings 등
+        Output 레이어: lm_head, output 등
+        """
+        layer_name_lower = layer_name.lower()
+        
+        # Input 레이어 체크
+        if 'embed' in layer_name_lower or 'embed_tokens' in layer_name:
+            return True
+        
+        # Output 레이어 체크
+        if 'lm_head' in layer_name_lower or layer_name.endswith('.head') or 'output' in layer_name_lower:
+            return True
+        
+        return False
 
     @torch.no_grad()
     def _compute_gradient_magnitudes(self) -> List[float]:
         """각 파라미터의 gradient magnitude를 계산 (L2 norm)
-        Error Feedback이 활성화된 경우, residual을 더한 gradient magnitude를 계산합니다.
+        opt_param과 main_param의 차이를 계산하여 magnitude를 구합니다.
+        
+        Note: 이제 모든 파라미터를 업데이트하므로, skip된 파라미터의 누적 차이 문제가 해결됩니다.
+        하지만 magnitude 계산은 outer step 전에 이루어지므로, 이전 step에서 skip된 파라미터의
+        누적 차이가 여전히 반영될 수 있습니다. 다음 step부터는 모든 파라미터가 업데이트되므로
+        이 문제가 해결됩니다.
         """
         magnitudes = []
         param_groups = self.offloaded_optimizer.param_groups
@@ -510,34 +687,19 @@ class DiLoCoGradAverager(DecentralizedAverager, TokenWeightedAggregationMixin):
                 # offloaded_optimizer의 파라미터와 main_parameters는 같은 순서로 구성되어 있음
                 if param_idx < len(main_params_list):
                     main_param = main_params_list[param_idx]
+                    opt_param = param  # offloaded_optimizer의 파라미터
                     
-                    if main_param.grad is not None:
-                        # gradient의 L2 norm 계산
-                        grad = main_param.grad.detach()
-                        
-                        # Error Feedback이 활성화된 경우, residual을 더함
-                        if self.residual_buffers is not None and param_idx < len(self.residual_buffers):
-                            residual = self.residual_buffers[param_idx]
-                            # residual을 gradient와 같은 device로 이동하여 더함
-                            if residual.device != grad.device:
-                                residual = residual.to(grad.device)
-                            grad = grad + residual
-                        
-                        # NaN이나 Inf 체크
-                        if torch.isfinite(grad).all():
-                            magnitude = grad.norm(p=2).item()
-                        else:
-                            magnitude = 0.0
+                    # opt_param과 main_param의 차이를 계산 (pseudo gradient)
+                    # 이제 모든 파라미터를 업데이트하므로, 이 차이는 현재 step의 gradient를 나타냅니다.
+                    # 하지만 magnitude 계산은 outer step 전에 이루어지므로, 이전 step에서 skip된
+                    # 파라미터의 누적 차이가 여전히 반영될 수 있습니다.
+                    pseudo_grad = opt_param.data - main_param.detach().to(opt_param.device)
+                    
+                    # NaN이나 Inf 체크
+                    if torch.isfinite(pseudo_grad).all():
+                        magnitude = pseudo_grad.norm(p=2).item()
                     else:
-                        # gradient가 없으면 residual만 고려
-                        if self.residual_buffers is not None and param_idx < len(self.residual_buffers):
-                            residual = self.residual_buffers[param_idx]
-                            if torch.isfinite(residual).all():
-                                magnitude = residual.norm(p=2).item()
-                            else:
-                                magnitude = 0.0
-                        else:
-                            magnitude = 0.0
+                        magnitude = 0.0
                 else:
                     # 인덱스 범위를 벗어나면 0
                     magnitude = 0.0
@@ -547,25 +709,90 @@ class DiLoCoGradAverager(DecentralizedAverager, TokenWeightedAggregationMixin):
                 
         return magnitudes
 
+    @torch.no_grad()
+    def _compute_taylor_scores(self) -> List[float]:
+        """각 파라미터의 Taylor 1st order saliency score를 계산 (|w * g|)
+        Taylor Score = |w_i * g_i| = 파라미터를 제거했을 때 예상되는 Loss 증가량
+        
+        Returns:
+            taylor_scores: 각 파라미터 텐서의 Taylor score 리스트
+        """
+        taylor_scores = []
+        param_groups = self.offloaded_optimizer.param_groups
+        param_idx = 0
+        
+        # main_parameters를 리스트로 변환 (인덱스 접근을 위해)
+        main_params_list = list(self.main_parameters)
+        
+        for param_group in param_groups:
+            for param in param_group["params"]:
+                # offloaded_optimizer의 파라미터와 main_parameters는 같은 순서로 구성되어 있음
+                if param_idx < len(main_params_list):
+                    main_param = main_params_list[param_idx]
+                    opt_param = param  # offloaded_optimizer의 파라미터
+                    
+                    # opt_param과 main_param의 차이를 계산 (pseudo gradient)
+                    pseudo_grad = opt_param.data - main_param.detach().to(opt_param.device)
+                    
+                    # Taylor Score = |w * g| (절대값 내적)
+                    # w: 현재 파라미터 값, g: gradient
+                    if torch.isfinite(pseudo_grad).all() and torch.isfinite(opt_param.data).all():
+                        # 각 요소별로 |w * g| 계산 후 합산
+                        taylor_score = (opt_param.data * pseudo_grad).abs().sum().item()
+                    else:
+                        taylor_score = 0.0
+                else:
+                    # 인덱스 범위를 벗어나면 0
+                    taylor_score = 0.0
+                
+                taylor_scores.append(taylor_score)
+                param_idx += 1
+                
+        return taylor_scores
+
+    def _compute_layer_magnitudes(self, param_magnitudes: List[float]) -> Dict[str, float]:
+        """레이어별 magnitude 계산 (레이어 내 모든 파라미터의 합)
+        
+        Args:
+            param_magnitudes: 각 파라미터 텐서의 magnitude 리스트
+            
+        Returns:
+            layer_magnitudes: {layer_name: layer_magnitude}
+        """
+        if self.param_names is None:
+            raise ValueError("param_names가 None입니다. 레이어 단위 계산을 위해 필요합니다.")
+        
+        layer_to_indices = self._group_parameters_by_layer(self.param_names)
+        layer_magnitudes = {}
+        
+        for layer_name, param_indices in layer_to_indices.items():
+            # 레이어 내 모든 파라미터의 magnitude 합계
+            layer_mag = sum(param_magnitudes[i] for i in param_indices if i < len(param_magnitudes))
+            layer_magnitudes[layer_name] = layer_mag
+        
+        return layer_magnitudes
+
     def _collect_and_average_gradient_magnitudes(
         self,
         local_magnitudes: List[float],
         epoch: int,
         timeout: float = 300.0,
         check_interval: float = 0.1
-    ) -> tuple[List[float], float]:
+    ) -> List[float]:
         """
-        모든 노드의 gradient magnitude를 DHT에 공유하고 평균을 계산합니다.
+        모든 노드의 gradient importance scores를 DHT에 공유하고 평균을 계산합니다.
         이렇게 하면 모든 노드가 동일한 기준으로 파라미터를 선택할 수 있습니다.
         
-        :param local_magnitudes: 현재 노드의 gradient magnitude 리스트
+        :param local_magnitudes: 현재 노드의 importance score 리스트 (magnitude 또는 taylor)
         :param epoch: 현재 epoch 번호
         :param timeout: 최대 대기 시간 (초)
         :param check_interval: 확인 간격 (초)
-        :returns: (averaged_magnitudes, wait_time) 튜플 - 평균 gradient magnitude 리스트와 동기화 대기 시간 (초)
+        :returns: 모든 노드의 평균 importance score 리스트
         """
         RUN_ID = "OpenDiLoCo"
-        magnitude_key = f"{RUN_ID}:gradient_magnitudes:epoch_{epoch}"
+        # Metric에 따라 DHT 키 분리 (magnitude와 taylor가 섞이지 않도록)
+        metric_suffix = "magnitudes" if self.gradient_importance_metric == "magnitude" else "taylor"
+        magnitude_key = f"{RUN_ID}:gradient_{metric_suffix}:epoch_{epoch}"
         worker_id = f"{socket.gethostname()}-pid{os.getpid()}"
         
         # 현재 노드의 gradient magnitude를 DHT에 publish
@@ -579,15 +806,15 @@ class DiLoCoGradAverager(DecentralizedAverager, TokenWeightedAggregationMixin):
         exp = now + timeout
         self.dht.store(key=magnitude_key, subkey=worker_id, value=magnitude_payload, expiration_time=exp)
         
-        # 모든 노드의 gradient magnitude를 수집 (동기화 대기 시간 측정)
-        start_time = time.time()
+        # 모든 노드의 gradient magnitude를 수집
         all_magnitudes = []
+        start_time = time.time()
         
         while True:
             elapsed_time = time.time() - start_time
             if elapsed_time > timeout:
                 logger.warning(f"Timeout waiting for all nodes to publish gradient magnitudes (timeout={timeout}s). Using local magnitudes only.")
-                return local_magnitudes, elapsed_time
+                return local_magnitudes
             
             magnitude_res = self.dht.get(magnitude_key, latest=True)
             magnitude_root = unwrap(magnitude_res) if magnitude_res else None
@@ -611,12 +838,10 @@ class DiLoCoGradAverager(DecentralizedAverager, TokenWeightedAggregationMixin):
             
             time.sleep(check_interval)
         
-        wait_time = time.time() - start_time
-        
         # 모든 노드의 magnitude를 평균
         if len(all_magnitudes) == 0:
             logger.warning("No gradient magnitudes collected from peers. Using local magnitudes only.")
-            return local_magnitudes, wait_time
+            return local_magnitudes
         
         # numpy를 사용하여 평균 계산
         magnitudes_array = np.array(all_magnitudes)
@@ -633,40 +858,351 @@ class DiLoCoGradAverager(DecentralizedAverager, TokenWeightedAggregationMixin):
         exp = now + 5.0  # 5초 후 만료
         self.dht.store(key=magnitude_key, subkey=worker_id, value=magnitude_payload, expiration_time=exp)
         
-        return averaged_magnitudes, wait_time
+        return averaged_magnitudes
+
+    def _create_layer_based_mask(
+        self,
+        layer_magnitudes: Dict[str, float],
+        threshold: Optional[float] = None,
+        top_k_ratio: Optional[float] = None,
+        top_k_ratio_by_size: bool = False,
+        forced_layers: Optional[set] = None
+    ) -> List[bool]:
+        """레이어 단위로 마스크 생성
+        - Input/Output 레이어는 항상 True
+        - Transformer block 레이어들은 magnitude 기반으로 선택
+        
+        Args:
+            layer_magnitudes: {layer_name: layer_magnitude}
+            threshold: magnitude threshold 이상의 레이어만 선택
+            top_k_ratio: top-k% 레이어 선택 (0.0 ~ 1.0)
+            top_k_ratio_by_size: True면 레이어 크기 기준으로 비율 계산, False면 개수 기준
+            forced_layers: Max Staleness로 강제 포함할 레이어 이름 집합
+            
+        Returns:
+            mask: 파라미터별 마스크 리스트
+        """
+        if self.param_names is None:
+            raise ValueError("param_names가 None입니다. 레이어 단위 마스크 생성을 위해 필요합니다.")
+        
+        if forced_layers is None:
+            forced_layers = set()
+        
+        layer_to_indices = self._group_parameters_by_layer(self.param_names)
+        mask = [False] * len(self.param_names)
+        
+        # 디버깅: 레이어 그룹화 정보 출력
+        logger.info("=" * 80)
+        logger.info("[DEBUG] Layer Grouping Information")
+        logger.info("=" * 80)
+        logger.info(f"Total layers identified: {len(layer_to_indices)}")
+        logger.info(f"Total parameters: {len(self.param_names)}")
+        
+        # 레이어별 정보 출력
+        input_output_layers = []
+        transformer_layers = []
+        for layer_name, param_indices in sorted(layer_to_indices.items()):
+            is_io = self._is_input_output_layer(layer_name)
+            layer_type = "Input/Output" if is_io else "Transformer Block"
+            param_count = len(param_indices)
+            total_size = sum(self.main_parameters[i].numel() for i in param_indices)
+            magnitude = layer_magnitudes.get(layer_name, 0.0)
+            
+            logger.info(f"  Layer: {layer_name:<40} Type: {layer_type:<20} Params: {param_count:<5} Size: {total_size:<12} Magnitude: {magnitude:.6f}")
+            
+            if is_io:
+                input_output_layers.append(layer_name)
+            else:
+                transformer_layers.append(layer_name)
+        
+        logger.info(f"\nInput/Output layers (always included): {len(input_output_layers)}")
+        for layer_name in input_output_layers:
+            logger.info(f"  - {layer_name}")
+        
+        logger.info(f"Transformer block layers (selective): {len(transformer_layers)}")
+        for layer_name in transformer_layers[:10]:  # 처음 10개만 출력
+            logger.info(f"  - {layer_name}")
+        if len(transformer_layers) > 10:
+            logger.info(f"  ... and {len(transformer_layers) - 10} more layers")
+        logger.info("=" * 80)
+        
+        # 1. Input/Output 레이어는 항상 포함
+        for layer_name in input_output_layers:
+            for idx in layer_to_indices[layer_name]:
+                mask[idx] = True
+        
+        # 2. Transformer block 레이어들만 magnitude 기반 선택
+        transformer_layer_magnitudes = {
+            name: mag for name, mag in layer_magnitudes.items()
+            if name in transformer_layers
+        }
+        
+        selected_transformer_layers = set()
+        
+        if threshold is not None:
+            # Threshold 기반: threshold 이상의 magnitude를 가진 레이어만 선택
+            selected_transformer_layers = {
+                name for name, mag in transformer_layer_magnitudes.items()
+                if mag >= threshold
+            }
+            logger.info(f"Layer-based threshold selection: {len(selected_transformer_layers)}/{len(transformer_layers)} transformer layers selected (threshold={threshold})")
+        
+        elif top_k_ratio is not None:
+            # Top-k ratio 기반 선택 로직
+            if not (0.0 <= top_k_ratio <= 1.0):
+                raise ValueError(f"top_k_ratio must be between 0.0 and 1.0, got {top_k_ratio}")
+            
+            # Input/Output 레이어와 forced_layers는 이미 포함됨
+            already_included_layers = set(input_output_layers) | forced_layers
+            
+            if top_k_ratio_by_size:
+                # 크기 기준: 레이어 크기 합계 기준으로 비율 계산
+                total_layer_sizes = {}
+                for layer_name, param_indices in layer_to_indices.items():
+                    total_layer_sizes[layer_name] = sum(self.main_parameters[i].numel() for i in param_indices)
+                
+                total_size = sum(total_layer_sizes.values())
+                already_included_size = sum(total_layer_sizes.get(name, 0) for name in already_included_layers)
+                target_size = total_size * top_k_ratio
+                remaining_target_size = max(0, target_size - already_included_size)
+                
+                # Magnitude 내림차순 정렬
+                sorted_transformer = sorted(
+                    transformer_layer_magnitudes.items(),
+                    key=lambda x: x[1],
+                    reverse=True
+                )
+                
+                accumulated_size = 0
+                for layer_name, mag in sorted_transformer:
+                    if accumulated_size >= remaining_target_size:
+                        break
+                    if layer_name not in already_included_layers:
+                        accumulated_size += total_layer_sizes.get(layer_name, 0)
+                        selected_transformer_layers.add(layer_name)
+                
+                total_selected_size = already_included_size + accumulated_size
+                logger.info(
+                    f"Layer-based top-k selection (by size): {len(selected_transformer_layers)}/{len(transformer_layers)} transformer layers selected "
+                    f"({total_selected_size}/{total_size} elements, {100.0*total_selected_size/total_size:.1f}%), "
+                    f"includes {len(input_output_layers)} input/output layers + "
+                    f"{len([l for l in forced_layers if l not in input_output_layers])} forced by staleness + "
+                    f"{len([l for l in selected_transformer_layers if l not in forced_layers])} by magnitude"
+                )
+            else:
+                # 개수 기준: 레이어 개수 기준으로 비율 계산
+                total_layers = len(layer_to_indices)
+                already_included_count = len(already_included_layers)
+                target_count = max(1, int(total_layers * top_k_ratio))
+                remaining_target_count = max(0, target_count - already_included_count)
+                
+                # Magnitude 내림차순 정렬
+                sorted_transformer = sorted(
+                    transformer_layer_magnitudes.items(),
+                    key=lambda x: x[1],
+                    reverse=True
+                )
+                
+                selected_transformer_layers = {
+                    name for name, _ in sorted_transformer[:remaining_target_count]
+                    if name not in already_included_layers
+                }
+                
+                actual_selected = len(selected_transformer_layers) + len(already_included_layers)
+                logger.info(
+                    f"Layer-based top-k selection (by count): {actual_selected}/{total_layers} layers selected "
+                    f"({100.0*actual_selected/total_layers:.1f}%), "
+                    f"includes {len(input_output_layers)} input/output layers + "
+                    f"{len([l for l in forced_layers if l not in input_output_layers])} forced by staleness + "
+                    f"{len(selected_transformer_layers)} by magnitude"
+                )
+        else:
+            raise ValueError("Either threshold or top_k_ratio must be provided")
+        
+        # 3. Forced layers 추가 (Max Staleness)
+        for layer_name in forced_layers:
+            if layer_name in layer_to_indices:
+                selected_transformer_layers.add(layer_name)
+        
+        # 4. 선택된 레이어의 모든 파라미터를 마스크에 포함
+        for layer_name in selected_transformer_layers:
+            if layer_name in layer_to_indices:
+                for idx in layer_to_indices[layer_name]:
+                    mask[idx] = True
+        
+        # 디버깅: 선택된 레이어 정보 출력
+        logger.info("\n[DEBUG] Selected Layers:")
+        logger.info(f"  Input/Output layers (always included): {len(input_output_layers)}")
+        for layer_name in input_output_layers:
+            param_count = len(layer_to_indices[layer_name])
+            logger.info(f"    - {layer_name} ({param_count} parameters)")
+        
+        logger.info(f"  Transformer layers selected: {len(selected_transformer_layers)}")
+        for layer_name in sorted(selected_transformer_layers):
+            param_count = len(layer_to_indices[layer_name])
+            magnitude = layer_magnitudes.get(layer_name, 0.0)
+            logger.info(f"    - {layer_name} ({param_count} parameters, magnitude: {magnitude:.6f})")
+        
+        skipped_layers = set(transformer_layers) - selected_transformer_layers
+        if skipped_layers:
+            logger.info(f"  Transformer layers skipped: {len(skipped_layers)}")
+            for layer_name in sorted(list(skipped_layers)[:10]):  # 처음 10개만 출력
+                param_count = len(layer_to_indices[layer_name])
+                magnitude = layer_magnitudes.get(layer_name, 0.0)
+                logger.info(f"    - {layer_name} ({param_count} parameters, magnitude: {magnitude:.6f})")
+            if len(skipped_layers) > 10:
+                logger.info(f"    ... and {len(skipped_layers) - 10} more layers")
+        
+        logger.info("=" * 80)
+        
+        return mask
 
     def _create_mask_from_magnitudes(
         self, 
         magnitudes: List[float], 
+        param_names: Optional[List[str]] = None,
         threshold: Optional[float] = None,
-        top_k_ratio: Optional[float] = None
+        top_k_ratio: Optional[float] = None,
+        top_k_ratio_by_size: bool = False,
+        forced_indices: Optional[set] = None
     ) -> List[bool]:
-        """Gradient magnitude를 기준으로 마스크 생성"""
+        """Gradient magnitude를 기준으로 마스크 생성
+        Transformer 모델의 관례에 따라 embedding과 lm_head는 항상 포함 (Dense하게 유지)
+        top_k_ratio의 경우, embedding/lm_head와 forced_indices를 포함한 전체 파라미터 중에서 비율을 계산합니다.
+        
+        Args:
+            threshold: magnitude threshold 이상의 파라미터만 선택
+            top_k_ratio: top-k% 파라미터 선택 (0.0 ~ 1.0)
+            top_k_ratio_by_size: True면 파라미터 크기 기준으로 비율 계산, False면 개수 기준
+            forced_indices: Max Staleness로 강제 포함할 파라미터 인덱스 집합 (통신 비율에 포함됨)
+        """
+        if forced_indices is None:
+            forced_indices = set()
+        
+        # 먼저 embedding/lm_head 인덱스 식별 (제외할 파라미터)
+        embedding_indices = set()
+        lm_head_indices = set()
+        if param_names is not None:
+            for idx, param_name in enumerate(param_names):
+                # embedding 레이어 체크 (embed_tokens, embeddings 등)
+                if 'embed' in param_name.lower() or 'embed_tokens' in param_name:
+                    embedding_indices.add(idx)
+                # output head 레이어 체크 (lm_head, output 등)
+                elif 'lm_head' in param_name.lower() or param_name.endswith('.head') or 'output' in param_name.lower():
+                    lm_head_indices.add(idx)
+        
+        excluded_indices = embedding_indices | lm_head_indices
+        
         if threshold is not None:
             # Threshold 기반: threshold 이상의 magnitude를 가진 파라미터만 선택
             mask = [mag >= threshold for mag in magnitudes]
             logger.info(f"Gradient magnitude threshold-based selection: {sum(mask)}/{len(mask)} parameters selected (threshold={threshold})")
         elif top_k_ratio is not None:
-            # Top-k ratio 기반: 상위 k% 파라미터만 선택
+            # Top-k ratio 기반 선택 로직:
+            # 1. embedding/lm_head와 forced_indices는 항상 포함 (크기 비율에 포함됨)
+            # 2. 전체 파라미터 크기(또는 개수)의 k%에 도달할 때까지 magnitude가 높은 파라미터 선택
             if not (0.0 <= top_k_ratio <= 1.0):
                 raise ValueError(f"top_k_ratio must be between 0.0 and 1.0, got {top_k_ratio}")
             
-            # Magnitude를 내림차순으로 정렬
-            sorted_indices = sorted(range(len(magnitudes)), key=lambda i: magnitudes[i], reverse=True)
-            num_select = max(1, int(len(magnitudes) * top_k_ratio))
+            # 파라미터 크기 계산 (크기 기준인 경우)
+            param_sizes = []
+            if top_k_ratio_by_size:
+                for param in self.main_parameters:
+                    size = param.numel()  # 요소 개수 기준 (gradient 크기와 동일)
+                    param_sizes.append(size)
             
             mask = [False] * len(magnitudes)
-            for idx in sorted_indices[:num_select]:
+            
+            # 1. embedding/lm_head는 항상 포함 (크기 비율에 포함)
+            for idx in excluded_indices:
                 mask[idx] = True
             
-            logger.info(f"Gradient magnitude top-k selection: {num_select}/{len(magnitudes)} parameters selected (top_k_ratio={top_k_ratio})")
+            # 2. forced_indices는 항상 포함 (크기 비율에 포함)
+            for idx in forced_indices:
+                mask[idx] = True
+            
+            # 이미 포함된 파라미터의 크기(또는 개수) 계산
+            already_included_indices = excluded_indices | forced_indices
+            if top_k_ratio_by_size:
+                already_included_size = sum(param_sizes[i] for i in already_included_indices)
+                total_size = sum(param_sizes)
+                target_size = total_size * top_k_ratio
+                remaining_target_size = max(0, target_size - already_included_size)
+            else:
+                already_included_count = len(already_included_indices)
+                total_count = len(magnitudes)
+                target_count = max(1, int(total_count * top_k_ratio))
+                remaining_target_count = max(0, target_count - already_included_count)
+            
+            # 3. 나머지 파라미터 중 magnitude 기준으로 선택
+            eligible_indices = [i for i in range(len(magnitudes)) if i not in already_included_indices]
+            eligible_magnitudes = [(i, magnitudes[i]) for i in eligible_indices]
+            
+            # Magnitude를 내림차순으로 정렬
+            sorted_eligible = sorted(eligible_magnitudes, key=lambda x: x[1], reverse=True)
+            
+            if top_k_ratio_by_size:
+                # 크기 기준: 목표 크기에 도달할 때까지 선택
+                accumulated_size = 0
+                selected_by_magnitude = []
+                for idx, mag in sorted_eligible:
+                    if accumulated_size >= remaining_target_size:
+                        break
+                    accumulated_size += param_sizes[idx]
+                    selected_by_magnitude.append(idx)
+                    mask[idx] = True
+                
+                # 로그 출력
+                total_selected_size = already_included_size + accumulated_size
+                excluded_size = sum(param_sizes[i] for i in excluded_indices)
+                forced_size = sum(param_sizes[i] for i in forced_indices if i not in excluded_indices)
+                selected_size = accumulated_size
+                logger.info(
+                    f"Gradient magnitude top-k selection (by size): {sum(mask)}/{len(magnitudes)} parameters selected "
+                    f"({total_selected_size}/{total_size} elements, {100.0*total_selected_size/total_size:.1f}%), "
+                    f"includes {len(excluded_indices)} embedding/lm_head ({excluded_size} elements) + "
+                    f"{len([i for i in forced_indices if i not in excluded_indices])} forced by staleness ({forced_size} elements) + "
+                    f"{len(selected_by_magnitude)} by magnitude ({selected_size} elements)"
+                )
+            else:
+                # 개수 기준: 목표 개수만큼 선택
+                selected_by_magnitude = [idx for idx, _ in sorted_eligible[:remaining_target_count]]
+                for idx in selected_by_magnitude:
+                    mask[idx] = True
+                
+                # 로그 출력
+                excluded_count = len(excluded_indices)
+                forced_count = len([i for i in forced_indices if i not in excluded_indices])
+                actual_selected = sum(mask)
+                logger.info(
+                    f"Gradient magnitude top-k selection (by count): {actual_selected}/{len(magnitudes)} parameters selected "
+                    f"({100.0*actual_selected/len(magnitudes):.1f}%), "
+                    f"includes {excluded_count} embedding/lm_head + {forced_count} forced by staleness + {len(selected_by_magnitude)} by magnitude"
+                )
         else:
             raise ValueError("Either threshold or top_k_ratio must be provided")
         
+        # Transformer 모델의 관례: embedding과 lm_head는 항상 포함 (Dense하게 유지)
+        # (top_k_ratio의 경우 이미 위에서 처리됨)
+        if param_names is not None and threshold is not None:
+            embedding_count = 0
+            lm_head_count = 0
+            for idx in embedding_indices:
+                if not mask[idx]:
+                    mask[idx] = True
+                    embedding_count += 1
+            for idx in lm_head_indices:
+                if not mask[idx]:
+                    mask[idx] = True
+                    lm_head_count += 1
+            
+            if embedding_count > 0 or lm_head_count > 0:
+                logger.info(f"Transformer convention: {embedding_count} embedding parameters and {lm_head_count} output head parameters are always included (dense)")
+        
         return mask
 
-    def _log_magnitude_based_selection_sync(self, magnitudes: List[float], epoch: Optional[int] = None, step: Optional[int] = None):
-        """매 outer optimization마다 magnitude 기반 레이어 선택 상세 정보 출력 및 파일 저장 (동기 버전)"""
+    def _log_magnitude_based_selection_sync(self, magnitudes: List[float], layer_magnitudes: Optional[Dict[str, float]] = None, epoch: Optional[int] = None, step: Optional[int] = None, current_loss: Optional[float] = None):
+        """매 outer optimization마다 magnitude 기반 선택 상세 정보 출력 및 파일 저장 (동기 버전)"""
         if not self.enable_update_logs:
             return
             
@@ -682,27 +1218,16 @@ class DiLoCoGradAverager(DecentralizedAverager, TokenWeightedAggregationMixin):
         timestamp = datetime.now().isoformat()
         
         epoch_str = f"epoch {epoch}" if epoch is not None else "unknown epoch"
+        metric_str = "Taylor Score" if self.gradient_importance_metric == "taylor" else "Magnitude"
+        mode_str = "Layer-based" if self.gradient_magnitude_selection_mode == "layer" else "Parameter-based"
         logger.info("=" * 80)
-        logger.info(f"[DEBUG] Gradient Magnitude-based Tensor Selection - {epoch_str}")
+        logger.info(f"[DEBUG] {mode_str} Gradient {metric_str} Selection - {epoch_str}")
         logger.info("=" * 80)
         
-        # 파라미터별 정보 수집 (magnitude, 선택 여부, 레이어 이름)
+        # 파라미터별 정보 수집
         param_info = []
         for idx, (name, mag, is_selected) in enumerate(zip(self.param_names, magnitudes, self.param_update_mask)):
-            # 레이어 이름 추출 (예: "model.layers.0.self_attn.q_proj.weight" -> "model.layers.0")
-            layer_name = name
-            if "." in name:
-                parts = name.split(".")
-                # "model.layers.X" 형태로 레이어 추출 시도
-                if "layers" in parts:
-                    layer_idx = parts.index("layers")
-                    if layer_idx + 1 < len(parts):
-                        layer_name = ".".join(parts[:layer_idx + 2])  # "model.layers.X"
-                elif name.startswith("model."):
-                    # "model.embed_tokens" 같은 경우
-                    if len(parts) >= 2:
-                        layer_name = ".".join(parts[:2])
-            
+            layer_name = self._extract_layer_name(name)
             param_info.append({
                 'idx': idx,
                 'name': name,
@@ -711,80 +1236,117 @@ class DiLoCoGradAverager(DecentralizedAverager, TokenWeightedAggregationMixin):
                 'selected': is_selected
             })
         
-        # Magnitude 내림차순 정렬
-        param_info_sorted = sorted(param_info, key=lambda x: x['magnitude'], reverse=True)
-        
-        # 선택된 파라미터와 선택되지 않은 파라미터 분리
-        selected_params = [p for p in param_info_sorted if p['selected']]
-        skipped_params = [p for p in param_info_sorted if not p['selected']]
-        
         # 전체 통계
         total_params = len(param_info)
-        selected_count = len(selected_params)
-        skipped_count = len(skipped_params)
-        avg_magnitude = sum(magnitudes) / len(magnitudes) if magnitudes else 0.0
-        max_magnitude = max(magnitudes) if magnitudes else 0.0
-        min_magnitude = min(magnitudes) if magnitudes else 0.0
+        selected_param_count = sum(1 for p in param_info if p['selected'])
+        skipped_param_count = total_params - selected_param_count
         
-        logger.info(f"Summary:")
-        logger.info(f"  - Total parameters: {total_params}")
-        logger.info(f"  - Selected parameters: {selected_count} ({100.0 * selected_count / total_params:.2f}%)")
-        logger.info(f"  - Skipped parameters: {skipped_count} ({100.0 * skipped_count / total_params:.2f}%)")
-        logger.info(f"  - Magnitude statistics: min={min_magnitude:.6f}, max={max_magnitude:.6f}, avg={avg_magnitude:.6f}")
-        
-        # 선택된 파라미터 상위 20개 출력
-        logger.info(f"\nTop {min(20, len(selected_params))} Selected Parameters (by magnitude):")
-        for i, param in enumerate(selected_params[:20], 1):
-            status = "✓ SELECTED" if param['selected'] else "✗ SKIPPED"
-            logger.info(f"  {i:2d}. [{status}] {param['name']}")
-            logger.info(f"      Layer: {param['layer_name']}, Magnitude: {param['magnitude']:.6f}")
-        
-        # 선택되지 않은 파라미터 중 magnitude가 큰 상위 10개 출력
-        if skipped_params:
-            logger.info(f"\nTop {min(10, len(skipped_params))} Skipped Parameters (by magnitude):")
-            for i, param in enumerate(skipped_params[:10], 1):
-                logger.info(f"  {i:2d}. [✗ SKIPPED] {param['name']}")
-                logger.info(f"      Layer: {param['layer_name']}, Magnitude: {param['magnitude']:.6f}")
-        
-        # 레이어별 통계 (레이어 이름으로 그룹화)
-        layer_stats = {}
-        for param in param_info:
-            layer = param['layer_name']
-            if layer not in layer_stats:
-                layer_stats[layer] = {
-                    'total': 0,
-                    'selected': 0,
-                    'magnitudes': []
-                }
-            layer_stats[layer]['total'] += 1
-            if param['selected']:
-                layer_stats[layer]['selected'] += 1
-            layer_stats[layer]['magnitudes'].append(param['magnitude'])
-        
-        # 레이어별 평균 magnitude 계산 및 정렬
-        layer_info = []
-        for layer, stats in layer_stats.items():
-            avg_mag = sum(stats['magnitudes']) / len(stats['magnitudes']) if stats['magnitudes'] else 0.0
-            max_mag = max(stats['magnitudes']) if stats['magnitudes'] else 0.0
-            layer_info.append({
-                'layer': layer,
-                'total': stats['total'],
-                'selected': stats['selected'],
-                'avg_magnitude': avg_mag,
-                'max_magnitude': max_mag
-            })
-        
-        # 평균 magnitude 내림차순 정렬
-        layer_info_sorted = sorted(layer_info, key=lambda x: x['avg_magnitude'], reverse=True)
-        
-        logger.info(f"\nLayer-wise Statistics (sorted by average magnitude):")
-        logger.info(f"{'Layer':<40} {'Total':<8} {'Selected':<8} {'Sel%':<8} {'Avg Mag':<12} {'Max Mag':<12}")
-        logger.info("-" * 100)
-        for layer in layer_info_sorted[:30]:  # 상위 30개 레이어만 출력
-            sel_pct = 100.0 * layer['selected'] / layer['total'] if layer['total'] > 0 else 0.0
-            logger.info(f"{layer['layer']:<40} {layer['total']:<8} {layer['selected']:<8} {sel_pct:<7.1f}% {layer['avg_magnitude']:<12.6f} {layer['max_magnitude']:<12.6f}")
+        if self.gradient_magnitude_selection_mode == "layer" and layer_magnitudes is not None:
+            # 레이어 단위 통계 출력
+            # 레이어 단위 magnitude 계산 (아직 계산되지 않은 경우)
+            if layer_magnitudes is None:
+                layer_magnitudes = self._compute_layer_magnitudes(magnitudes)
+            
+            # 레이어별 정보 수집
+            layer_to_indices = self._group_parameters_by_layer(self.param_names)
+            layer_info = []
+            
+            for layer_name, param_indices in layer_to_indices.items():
+                layer_mag = layer_magnitudes.get(layer_name, 0.0)
+                # 레이어의 파라미터 중 하나라도 선택되었으면 레이어가 선택된 것으로 간주
+                is_selected = any(self.param_update_mask[idx] for idx in param_indices if idx < len(self.param_update_mask))
+                param_count = len(param_indices)
+                total_size = sum(self.main_parameters[i].numel() for i in param_indices if i < len(self.main_parameters))
+                is_io = self._is_input_output_layer(layer_name)
+                
+                layer_info.append({
+                    'layer_name': layer_name,
+                    'magnitude': layer_mag,
+                    'selected': is_selected,
+                    'param_count': param_count,
+                    'total_size': total_size,
+                    'is_input_output': is_io,
+                    'param_indices': param_indices
+                })
+            
+            # 레이어 단위 통계 출력
+            layer_info_sorted = sorted(layer_info, key=lambda x: x['magnitude'], reverse=True)
+            
+            # Input/Output 레이어와 Transformer block 레이어 분리
+            io_layers = [l for l in layer_info_sorted if l['is_input_output']]
+            transformer_layers = [l for l in layer_info_sorted if not l['is_input_output']]
+            
+            selected_layers = [l for l in layer_info_sorted if l['selected']]
+            skipped_layers = [l for l in layer_info_sorted if not l['selected']]
+            
+            # 전체 통계
+            total_layers = len(layer_info_sorted)
+            
+            logger.info(f"Summary (Layer-based):")
+            logger.info(f"  - Total layers: {total_layers} (IO: {len(io_layers)}, Transformer: {len(transformer_layers)})")
+            logger.info(f"  - Selected layers: {len(selected_layers)}/{total_layers} ({100.0 * len(selected_layers) / total_layers:.2f}%)")
+            logger.info(f"  - Skipped layers: {len(skipped_layers)}/{total_layers} ({100.0 * len(skipped_layers) / total_layers:.2f}%)")
+            logger.info(f"  - Total parameters: {total_params}")
+            logger.info(f"  - Selected parameters: {selected_param_count} ({100.0 * selected_param_count / total_params:.2f}%)")
+            logger.info(f"  - Skipped parameters: {skipped_param_count} ({100.0 * skipped_param_count / total_params:.2f}%)")
+            
+            if layer_magnitudes:
+                layer_mags = list(layer_magnitudes.values())
+                logger.info(f"  - Layer magnitude statistics: min={min(layer_mags):.6f}, max={max(layer_mags):.6f}, avg={sum(layer_mags)/len(layer_mags):.6f}")
+            
+            # 선택된 레이어 상위 20개 출력
+            logger.info(f"\nTop {min(20, len(selected_layers))} Selected Layers (by magnitude):")
+            for i, layer in enumerate(selected_layers[:20], 1):
+                status = "✓ SELECTED"
+                layer_type = "IO" if layer['is_input_output'] else "TRANS"
+                logger.info(f"  {i:2d}. [{status}] [{layer_type}] {layer['layer_name']}")
+                logger.info(f"      Params: {layer['param_count']}, Size: {layer['total_size']}, Magnitude: {layer['magnitude']:.6f}")
+            
+            # 선택되지 않은 레이어 중 magnitude가 큰 상위 10개 출력
+            if skipped_layers:
+                logger.info(f"\nTop {min(10, len(skipped_layers))} Skipped Layers (by magnitude):")
+                for i, layer in enumerate(skipped_layers[:10], 1):
+                    logger.info(f"  {i:2d}. [✗ SKIPPED] {layer['layer_name']}")
+                    logger.info(f"      Params: {layer['param_count']}, Size: {layer['total_size']}, Magnitude: {layer['magnitude']:.6f}")
+            
+            # 레이어별 상세 통계
+            logger.info(f"\nLayer-wise Statistics (sorted by magnitude):")
+            logger.info(f"{'Layer':<40} {'Type':<8} {'Params':<8} {'Size':<12} {'Selected':<10} {'Magnitude':<12}")
+            logger.info("-" * 100)
+            for layer in layer_info_sorted[:30]:  # 상위 30개 레이어만 출력
+                layer_type = "IO" if layer['is_input_output'] else "TRANS"
+                selected_str = "YES" if layer['selected'] else "NO"
+                logger.info(f"{layer['layer_name']:<40} {layer_type:<8} {layer['param_count']:<8} {layer['total_size']:<12} {selected_str:<10} {layer['magnitude']:<12.6f}")
+        else:
+            # 파라미터 단위 통계 출력
+            logger.info(f"Summary (Parameter-based):")
+            logger.info(f"  - Total parameters: {total_params}")
+            logger.info(f"  - Selected parameters: {selected_param_count} ({100.0 * selected_param_count / total_params:.2f}%)")
+            logger.info(f"  - Skipped parameters: {skipped_param_count} ({100.0 * skipped_param_count / total_params:.2f}%)")
+            
+            if magnitudes:
+                logger.info(f"  - Parameter magnitude statistics: min={min(magnitudes):.6f}, max={max(magnitudes):.6f}, avg={sum(magnitudes)/len(magnitudes):.6f}")
+            
+            # 선택된 파라미터 상위 20개 출력
+            selected_params = sorted([p for p in param_info if p['selected']], key=lambda x: x['magnitude'], reverse=True)
+            logger.info(f"\nTop {min(20, len(selected_params))} Selected Parameters (by magnitude):")
+            for i, param in enumerate(selected_params[:20], 1):
+                logger.info(f"  {i:2d}. [✓ SELECTED] {param['name']}")
+                logger.info(f"      Magnitude: {param['magnitude']:.6f}")
+            
+            # 선택되지 않은 파라미터 중 magnitude가 큰 상위 10개 출력
+            skipped_params = sorted([p for p in param_info if not p['selected']], key=lambda x: x['magnitude'], reverse=True)
+            if skipped_params:
+                logger.info(f"\nTop {min(10, len(skipped_params))} Skipped Parameters (by magnitude):")
+                for i, param in enumerate(skipped_params[:10], 1):
+                    logger.info(f"  {i:2d}. [✗ SKIPPED] {param['name']}")
+                    logger.info(f"      Magnitude: {param['magnitude']:.6f}")
         
         logger.info("=" * 80)
+        
+        # Loss 대비 비율 출력 (current_loss가 제공된 경우)
+        if current_loss is not None and current_loss > 0:
+            self._log_loss_ratio_internal(magnitudes, layer_magnitudes, current_loss, epoch, step)
         
         # 파일로 저장: CSV 형식 (각 파라미터별 상세 정보)
         self._save_parameter_selection_to_file(param_info, magnitudes, epoch, step, timestamp)
@@ -792,8 +1354,86 @@ class DiLoCoGradAverager(DecentralizedAverager, TokenWeightedAggregationMixin):
         # 파일로 저장: JSON 형식 (시간에 따른 변화 추적용)
         self._save_selection_history_to_json(param_info, magnitudes, epoch, step, timestamp)
     
-    def _log_magnitude_based_selection(self, magnitudes: List[float], epoch: Optional[int] = None, step: Optional[int] = None):
-        """매 outer optimization마다 magnitude 기반 파라미터 텐서서 선택 상세 정보 출력 및 파일 저장 (비동기 버전)"""
+    def _log_loss_ratio(self, magnitudes: List[float], layer_magnitudes: Optional[Dict[str, float]], current_loss: float, epoch: Optional[int]):
+        """Loss 대비 중요도 비율 로깅 (매 epoch마다 항상 출력)"""
+        if current_loss <= 0:
+            return
+        
+        metric_name = "Taylor Score" if self.gradient_importance_metric == "taylor" else "Magnitude"
+        
+        logger.info("=" * 80)
+        logger.info(f"[Loss Ratio Analysis] Epoch {epoch if epoch is not None else 'unknown'}")
+        logger.info("=" * 80)
+        logger.info(f"Current Total Loss: {current_loss:.6f}")
+        logger.info(f"Importance Metric: {metric_name}")
+        logger.info("")
+        
+        if self.gradient_magnitude_selection_mode == "layer" and layer_magnitudes is not None:
+            # 레이어 단위 Loss 대비 비율
+            logger.info("Layer-wise Loss Ratio (Score / Loss):")
+            logger.info(f"{'Layer':<40} {'Score':<15} {'Ratio':<12} {'Interpretation':<20}")
+            logger.info("-" * 90)
+            
+            sorted_layers = sorted(layer_magnitudes.items(), key=lambda x: x[1], reverse=True)
+            for layer_name, score in sorted_layers[:20]:  # 상위 20개 레이어
+                ratio = score / current_loss if current_loss > 0 else 0.0
+                
+                # 해석
+                if ratio >= 0.01:  # 1% 이상
+                    interpretation = "매우 중요 (건드리면 안됨)"
+                elif ratio >= 0.001:  # 0.1% ~ 1%
+                    interpretation = "유의미함"
+                elif ratio >= 0.0001:  # 0.01% ~ 0.1%
+                    interpretation = "영향력 미미"
+                else:  # 0.01% 미만
+                    interpretation = "안전한 가지치기 대상"
+                
+                logger.info(f"{layer_name:<40} {score:<15.6f} {ratio:<12.6f} ({ratio*100:.4f}%) {interpretation:<20}")
+            
+            # 전체 통계
+            total_score = sum(layer_magnitudes.values())
+            total_ratio = total_score / current_loss if current_loss > 0 else 0.0
+            logger.info("")
+            logger.info(f"Total Layer Score: {total_score:.6f}")
+            logger.info(f"Total Ratio (Score/Loss): {total_ratio:.6f} ({total_ratio*100:.4f}%)")
+        else:
+            # 파라미터 단위 Loss 대비 비율
+            total_score = sum(magnitudes)
+            total_ratio = total_score / current_loss if current_loss > 0 else 0.0
+            
+            logger.info("Parameter-wise Loss Ratio:")
+            logger.info(f"Total Parameter Score: {total_score:.6f}")
+            logger.info(f"Total Ratio (Score/Loss): {total_ratio:.6f} ({total_ratio*100:.4f}%)")
+            
+            # 상위 20개 파라미터의 비율
+            sorted_params = sorted(enumerate(magnitudes), key=lambda x: x[1], reverse=True)
+            logger.info("")
+            logger.info(f"{'Param Index':<12} {'Score':<15} {'Ratio':<12} {'Interpretation':<20}")
+            logger.info("-" * 70)
+            for idx, score in sorted_params[:20]:
+                ratio = score / current_loss if current_loss > 0 else 0.0
+                
+                if ratio >= 0.01:
+                    interpretation = "매우 중요"
+                elif ratio >= 0.001:
+                    interpretation = "유의미함"
+                elif ratio >= 0.0001:
+                    interpretation = "영향력 미미"
+                else:
+                    interpretation = "안전한 가지치기"
+                
+                param_name = self.param_names[idx] if self.param_names and idx < len(self.param_names) else f"param_{idx}"
+                logger.info(f"{param_name[:40]:<40} {score:<15.6f} {ratio:<12.6f} ({ratio*100:.4f}%) {interpretation:<20}")
+        
+        logger.info("=" * 80)
+        logger.info("")
+    
+    def _log_loss_ratio_internal(self, magnitudes: List[float], layer_magnitudes: Optional[Dict[str, float]], current_loss: float, epoch: Optional[int], step: Optional[int]):
+        """내부 함수: Loss 대비 비율 로깅 (enable_update_logs와 무관하게 항상 출력)"""
+        self._log_loss_ratio(magnitudes, layer_magnitudes, current_loss, epoch)
+
+    def _log_magnitude_based_selection(self, magnitudes: List[float], layer_magnitudes: Optional[Dict[str, float]] = None, epoch: Optional[int] = None, step: Optional[int] = None, current_loss: Optional[float] = None):
+        """매 outer optimization마다 magnitude 기반 레이어 선택 상세 정보 출력 및 파일 저장 (비동기 버전) - 레이어 단위"""
         if not self.enable_update_logs:
             return
             
@@ -801,7 +1441,7 @@ class DiLoCoGradAverager(DecentralizedAverager, TokenWeightedAggregationMixin):
             return
             
         # 비동기로 실행 (메인 학습 루프를 블로킹하지 않음)
-        self._log_executor.submit(self._log_magnitude_based_selection_sync, magnitudes, epoch, step)
+        self._log_executor.submit(self._log_magnitude_based_selection_sync, magnitudes, layer_magnitudes, epoch, step, current_loss)
 
     def _save_parameter_selection_to_file(
         self, 
@@ -915,25 +1555,14 @@ class DiLoCoGradAverager(DecentralizedAverager, TokenWeightedAggregationMixin):
         """gradient buffers associated optimizer
         주의: 이 함수는 초기화 및 마스크 업데이트 시에만 사용되며,
         실제 통신에 사용되는 값은 compute_and_load_pseudo_grad_into_averager에서 계산됩니다.
-        Error Feedback이 활성화된 경우, residual을 더한 gradient를 반환합니다.
         """
         param_groups = self.offloaded_optimizer.param_groups
         param_idx = 0
         for param_group in param_groups:
             for param in param_group["params"]:
                 if param.grad is None:
-                    param.grad = torch.zeros_like(param)
-                
+                    param.grad = torch.zeros_like(param)                
                 grad = param.grad
-                
-                # Error Feedback이 활성화된 경우, residual을 더함
-                # (초기화 시점에는 residual이 0이므로 영향 없음)
-                if self.residual_buffers is not None and param_idx < len(self.residual_buffers):
-                    residual = self.residual_buffers[param_idx]
-                    # residual을 gradient와 같은 device로 이동하여 더함
-                    if residual.device != grad.device:
-                        residual = residual.to(grad.device)
-                    grad = grad + residual
                 
                 # Selective layer update가 활성화된 경우, 마스크에 따라 gradient 반환
                 if self.param_update_mask is not None:
@@ -964,6 +1593,7 @@ class DiLoCoGradAverager(DecentralizedAverager, TokenWeightedAggregationMixin):
         timeout: Optional[float] = None,
         wait: bool = True,
         epoch: Optional[int] = None,
+        current_loss: Optional[float] = None,
         **kwargs,        
     ):
         """
@@ -980,54 +1610,53 @@ class DiLoCoGradAverager(DecentralizedAverager, TokenWeightedAggregationMixin):
         if epoch is not None:
             self._current_epoch = epoch
         
-        # Error Feedback: 파라미터별 Residual norm 체크 및 강제 통신 로직
-        # residual_norm_threshold가 설정된 경우, 각 파라미터 텐서별로 residual norm을 체크하여
-        # threshold를 넘는 파라미터만 강제로 통신시킴
-        # (residual_buffers가 있지만 threshold가 None이면 이 체크는 건너뜀)
-        residual_forced_params = set()  # threshold를 넘어서 강제 통신이 필요한 파라미터 인덱스
-        residual_norms = {}  # 파라미터별 residual norm 저장 (로깅용)
-        if self.residual_buffers is not None and self.residual_norm_threshold is not None:
-            for param_idx, residual in enumerate(self.residual_buffers):
-                # 각 파라미터별 residual norm 계산
-                residual_norm = residual.norm(p=2).item()
-                residual_norms[param_idx] = residual_norm
-                
-                if residual_norm > self.residual_norm_threshold:
-                    residual_forced_params.add(param_idx)
+        # Residual norm threshold 체크는 더 이상 필요 없음
+        # 이제 모든 파라미터를 업데이트하므로, skip된 파라미터의 누적 차이 문제가 해결됩니다.
+        # residual_forced_params는 빈 집합으로 유지 (하위 호환성)
+        residual_forced_params = set()
         
         # Gradient magnitude 기반 tensor 선택 및 Token weight 계산을 병렬로 처리
         has_magnitude_config = (self.gradient_magnitude_threshold is not None or self.gradient_magnitude_top_k_ratio is not None)
         has_param_names = self.param_names is not None
         
-        time_0_magnitude_selection = time.perf_counter()
         magnitudes = None
-        magnitude_wait_time = 0.0
         new_mask = None
         
-        # Gradient magnitude 수집 함수 (병렬 실행용)
+        # Gradient importance scores 수집 함수 (병렬 실행용, 내부에서 시간 측정)
         def collect_magnitudes():
             if has_magnitude_config and has_param_names:
-                local_magnitudes = self._compute_gradient_magnitudes()
-                return self._collect_and_average_gradient_magnitudes(
-                    local_magnitudes, 
+                time_start = time.perf_counter()
+                # Metric에 따라 magnitude 또는 taylor 계산
+                if self.gradient_importance_metric == "taylor":
+                    local_scores = self._compute_taylor_scores()
+                else:  # magnitude (default)
+                    local_scores = self._compute_gradient_magnitudes()
+                
+                magnitudes = self._collect_and_average_gradient_magnitudes(
+                    local_scores, 
                     epoch=epoch if epoch is not None else 0,
                     timeout=timeout if timeout is not None else 300.0
                 )
+                time_end = time.perf_counter()
+                execution_time = time_end - time_start
+                return magnitudes, execution_time
             return None, 0.0
         
-        # Token weight 계산 함수 (병렬 실행용)
+        # Token weight 계산 함수 (병렬 실행용, 내부에서 시간 측정)
         def compute_token_weight():
             if self.token_weighted_aggregation and control is not None:
-                return self._compute_token_weight(control, log_prefix="GradAverager Token-weighted aggregation")
+                time_start = time.perf_counter()
+                weight = self._compute_token_weight(control, log_prefix="GradAverager Token-weighted aggregation")
+                time_end = time.perf_counter()
+                execution_time = time_end - time_start
+                return weight, execution_time
             return None, 0.0
         
         # 병렬로 실행
         sync_wait_time = 0.0
         token_weight_result = None
         token_weight_wait_time = 0.0
-        
-        # Token weight 수집 전체 시간 측정 시작
-        time_0_token_weight = time.perf_counter() if self.token_weighted_aggregation else None
+        magnitude_selection_time = 0.0
         
         if (has_magnitude_config and has_param_names) and self.token_weighted_aggregation:
             # 두 작업 모두 병렬 실행
@@ -1035,43 +1664,145 @@ class DiLoCoGradAverager(DecentralizedAverager, TokenWeightedAggregationMixin):
                 magnitude_future = executor.submit(collect_magnitudes)
                 token_weight_future = executor.submit(compute_token_weight)
                 
-                magnitudes, magnitude_wait_time = magnitude_future.result()
-                token_weight_result, _ = token_weight_future.result()
+                magnitudes, magnitude_selection_time = magnitude_future.result()
+                token_weight_result, token_weight_wait_time = token_weight_future.result()
         elif has_magnitude_config and has_param_names:
             # Gradient magnitude만 실행
-            magnitudes, magnitude_wait_time = collect_magnitudes()
+            magnitudes, magnitude_selection_time = collect_magnitudes()
         elif self.token_weighted_aggregation:
             # Token weight만 실행
-            token_weight_result, _ = compute_token_weight()
+            token_weight_result, token_weight_wait_time = compute_token_weight()
         
-        # Token weight 수집 전체 시간 측정 종료
-        if time_0_token_weight is not None:
-            time_1_token_weight = time.perf_counter()
-            token_weight_wait_time = time_1_token_weight - time_0_token_weight
+        # Warm-up: 초기 epoch 동안은 모든 레이어 전송
+        effective_top_k_ratio = self.gradient_magnitude_top_k_ratio
+        if self.enable_warmup and epoch is not None and self.original_top_k_ratio is not None:
+            if epoch < self.warmup_epochs:
+                # Warm-up 기간: 모든 레이어 전송 (top_k_ratio = 1.0)
+                effective_top_k_ratio = 1.0
+                if epoch == 0:
+                    logger.info(f"Warm-up phase: sending all layers for first {self.warmup_epochs} epochs")
+            else:
+                # Warm-up 이후: 원본 top_k_ratio 사용
+                effective_top_k_ratio = self.original_top_k_ratio
         
-        # Gradient magnitude 기반 마스크 생성
-        if magnitudes is not None:
-            new_mask = self._create_mask_from_magnitudes(
-                magnitudes,
-                threshold=self.gradient_magnitude_threshold,
-                top_k_ratio=self.gradient_magnitude_top_k_ratio
-            )
+        # Magnitude 기반 마스크 생성 (모드에 따라 레이어 단위 또는 파라미터 단위)
+        layer_magnitudes = None
+        new_mask = None
+        
+        if magnitudes is not None and has_param_names:
+            if self.gradient_magnitude_selection_mode == "layer":
+                # 레이어 단위 선택 모드
+                # 파라미터 단위 magnitude를 레이어 단위로 집계
+                layer_magnitudes = self._compute_layer_magnitudes(magnitudes)
+                
+                # Max Staleness: 먼저 강제 포함할 레이어 식별 (레이어 단위)
+                forced_layers_set = set()
+                if self.enable_max_staleness and self.layer_staleness_counters is not None:
+                    forced_layers_set = {
+                        layer_name for layer_name, staleness in self.layer_staleness_counters.items()
+                        if staleness >= self.max_staleness
+                    }
+                    if len(forced_layers_set) > 0:
+                        logger.info(f"Max Staleness (layer-based): {len(forced_layers_set)} layers will be forced to update (staleness >= {self.max_staleness})")
+                        for layer_name in sorted(forced_layers_set):
+                            logger.info(f"  - {layer_name} (staleness: {self.layer_staleness_counters[layer_name]})")
+                
+                # 레이어 단위 마스크 생성
+                new_mask = self._create_layer_based_mask(
+                    layer_magnitudes,
+                    threshold=self.gradient_magnitude_threshold,
+                    top_k_ratio=effective_top_k_ratio,
+                    top_k_ratio_by_size=self.gradient_magnitude_top_k_ratio_by_size,
+                    forced_layers=forced_layers_set if self.enable_max_staleness else None
+                )
+                
+                # Max Staleness: 레이어 단위 카운터 업데이트
+                if self.enable_max_staleness and self.layer_staleness_counters is not None:
+                    layer_to_indices = self._group_parameters_by_layer(self.param_names)
+                    
+                    # 선택된 레이어 확인
+                    selected_layers = set()
+                    for layer_name, param_indices in layer_to_indices.items():
+                        # 레이어의 파라미터 중 하나라도 선택되었으면 레이어가 선택된 것으로 간주
+                        if any(new_mask[idx] for idx in param_indices):
+                            selected_layers.add(layer_name)
+                    
+                    # Staleness 카운터 업데이트
+                    forced_count = 0
+                    for layer_name in self.layer_staleness_counters.keys():
+                        if layer_name in selected_layers:
+                            self.layer_staleness_counters[layer_name] = 0  # 선택됐으면 초기화
+                        else:
+                            self.layer_staleness_counters[layer_name] += 1  # 선택 안 됐으면 +1
+                            if layer_name in forced_layers_set:
+                                forced_count += 1
+                    
+                    if forced_count > 0:
+                        logger.info(f"Max Staleness (layer-based): {forced_count} layers forced to update (staleness >= {self.max_staleness})")
+                    
+                    # 디버깅: 레이어별 staleness 정보 출력
+                    logger.info("\n[DEBUG] Layer Staleness Counters:")
+                    sorted_layers = sorted(self.layer_staleness_counters.items(), key=lambda x: x[1], reverse=True)
+                    for layer_name, staleness in sorted_layers[:20]:  # 상위 20개만 출력
+                        status = "SELECTED" if layer_name in selected_layers else "SKIPPED"
+                        forced = "FORCED" if layer_name in forced_layers_set else ""
+                        logger.info(f"  {layer_name:<40} Staleness: {staleness:<5} {status} {forced}")
+                    if len(sorted_layers) > 20:
+                        logger.info(f"  ... and {len(sorted_layers) - 20} more layers")
+                    logger.info("")
+            else:  # parameter mode
+                # 파라미터 단위 선택 모드
+                # Max Staleness: 먼저 강제 포함할 파라미터 식별 (파라미터 단위)
+                forced_indices_set = set()
+                if self.enable_max_staleness and self.param_staleness_counters is not None:
+                    forced_indices_set = {
+                        idx for idx, staleness in enumerate(self.param_staleness_counters)
+                        if staleness >= self.max_staleness
+                    }
+                    if len(forced_indices_set) > 0:
+                        logger.info(f"Max Staleness (parameter-based): {len(forced_indices_set)} parameters will be forced to update (staleness >= {self.max_staleness})")
+                
+                # 파라미터 단위 마스크 생성
+                new_mask = self._create_mask_from_magnitudes(
+                    magnitudes,
+                    param_names=self.param_names,
+                    threshold=self.gradient_magnitude_threshold,
+                    top_k_ratio=effective_top_k_ratio,
+                    top_k_ratio_by_size=self.gradient_magnitude_top_k_ratio_by_size,
+                    forced_indices=forced_indices_set if self.enable_max_staleness else None
+                )
+                
+                # Max Staleness: 파라미터 단위 카운터 업데이트
+                if self.enable_max_staleness and self.param_staleness_counters is not None:
+                    # Staleness 카운터 업데이트
+                    forced_count = 0
+                    for idx in range(len(self.param_staleness_counters)):
+                        if new_mask[idx]:
+                            self.param_staleness_counters[idx] = 0  # 선택됐으면 초기화
+                        else:
+                            self.param_staleness_counters[idx] += 1  # 선택 안 됐으면 +1
+                            if idx in forced_indices_set:
+                                forced_count += 1
+                    
+                    if forced_count > 0:
+                        logger.info(f"Max Staleness (parameter-based): {forced_count} parameters forced to update (staleness >= {self.max_staleness})")
             
-            # Residual norm threshold를 넘는 파라미터는 강제로 통신
-            if residual_forced_params:
-                for param_idx in residual_forced_params:
-                    if param_idx < len(new_mask):
-                        new_mask[param_idx] = True
-        elif not has_magnitude_config and has_param_names and residual_forced_params:
-            new_mask = [False] * len(self.param_names)
-            for param_idx in residual_forced_params:
-                if param_idx < len(new_mask):
-                    new_mask[param_idx] = True
-        
         # 마스크 업데이트 및 averaged_grads 재생성
         if new_mask is not None:
             self.param_update_mask = new_mask
-            self._residual_forced_params = residual_forced_params.copy() if residual_forced_params else set()
+            
+            # 로깅 (enable_update_logs가 활성화된 경우)
+            if self.enable_update_logs and magnitudes is not None:
+                if self.gradient_magnitude_selection_mode == "layer" and layer_magnitudes is not None:
+                    # 레이어 단위 로깅
+                    self._log_magnitude_based_selection(magnitudes, layer_magnitudes, epoch, step=getattr(self, '_current_step', None), current_loss=current_loss)
+                elif self.gradient_magnitude_selection_mode == "parameter":
+                    # 파라미터 단위 로깅 (레이어 단위 집계 없이)
+                    self._log_magnitude_based_selection(magnitudes, None, epoch, step=getattr(self, '_current_step', None), current_loss=current_loss)
+            
+            # Loss 대비 비율 로깅 (매 epoch마다 항상 출력)
+            if magnitudes is not None and current_loss is not None and current_loss > 0:
+                self._log_loss_ratio(magnitudes, layer_magnitudes, current_loss, epoch)
             
             with self.lock_averaged_tensors:
                 new_averaged_grads = tuple(grad for grad in self._grads_from_optimizer())
@@ -1091,9 +1822,6 @@ class DiLoCoGradAverager(DecentralizedAverager, TokenWeightedAggregationMixin):
                     }))
                 except Exception as e:
                     logger.warning(f"Failed to send _update_averaged_tensors: {e}")
-        
-        time_1_magnitude_selection = time.perf_counter()
-        magnitude_selection_time = time_1_magnitude_selection - time_0_magnitude_selection
         
         # Token weight 설정
         if token_weight_result is not None:
@@ -1186,16 +1914,8 @@ class DiLoCoGradAverager(DecentralizedAverager, TokenWeightedAggregationMixin):
                 if self.param_update_mask is not None:
                     if self.param_update_mask[param_idx]:
                         # 선택된 파라미터만 pseudo gradient 계산
-                        # Error Feedback: 통신에 사용되는 pseudo gradient에 residual을 더함
+                        # opt_param과 main_param의 차이가 곧 누적된 gradient (Implicit Accumulation)
                         grad = opt_param.data - main_param.detach().to(opt_param.device)
-                        
-                        # Error Feedback: residual을 포함한 pseudo gradient 계산
-                        if self.residual_buffers is not None and param_idx < len(self.residual_buffers):
-                            residual = self.residual_buffers[param_idx]
-                            # residual을 grad와 같은 device로 이동하여 더함
-                            if residual.device != grad.device:
-                                residual = residual.to(grad.device)
-                            grad = grad + residual
                         
                         if grad_idx >= len(averaged_grads):
                             raise RuntimeError(
@@ -1212,46 +1932,26 @@ class DiLoCoGradAverager(DecentralizedAverager, TokenWeightedAggregationMixin):
                         # Gradient 정보 기록 (enable_update_logs가 True인 경우에만)
                         averaged_grads[grad_idx].copy_(grad, non_blocking=True)
                         if self.enable_update_logs and update_records:
-                            # residual threshold로 인해 강제 통신되었는지 확인
-                            was_forced_by_residual = param_idx in getattr(self, '_residual_forced_params', set())
                             # 업데이트 정보 기록 (gradient norm 및 선택 여부 포함)
                             update_records.append({
                                 'param_idx': param_idx,
                                 'param_name': param_name,
                                 'grad_norm': float(grad.norm().item()),
                                 'was_selected': True,  # 이 블록에 들어왔으므로 선택됨
-                                'was_forced_by_residual': was_forced_by_residual,
+                                'was_forced_by_residual': False,  # residual은 더 이상 사용하지 않음
                             })
                         
                         updated_param_names.append(param_name)
                         grad_idx += 1
                     else:
                         # 선택되지 않은 레이어는 통신에서 제외됨
-                        # Error Feedback: 선택되지 않은 gradient를 residual buffer에 누적
-                        if self.residual_buffers is not None and param_idx < len(self.residual_buffers):
-                            # pseudo gradient 계산 (선택되지 않은 파라미터의 경우)
-                            pseudo_grad = opt_param.data - main_param.detach().to(opt_param.device)
-                            # residual buffer에 누적 (CPU에 저장)
-                            residual = self.residual_buffers[param_idx]
-                            # pseudo_grad를 CPU로 이동하여 residual에 더함
-                            if pseudo_grad.device != residual.device:
-                                pseudo_grad = pseudo_grad.to(residual.device)
-                            residual.add_(pseudo_grad)
-                            logger.debug(f"Accumulated unselected gradient to residual buffer for param {param_idx} ({param_name}), residual norm: {residual.norm().item():.6f}")
-                        
+                        # 이제 모든 파라미터를 업데이트하므로, skip된 파라미터의 gradient는 0으로 설정되어
+                        # outer optimizer step 후에도 변화가 없습니다.
                         skipped_param_names.append(param_name)
                 else:
                     # 모든 파라미터 업데이트
-                    # Error Feedback: 통신에 사용되는 pseudo gradient에 residual을 더함
+                    # opt_param과 main_param의 차이가 곧 누적된 gradient (Implicit Accumulation)
                     grad = opt_param.data - main_param.detach().to(opt_param.device)
-                    
-                    # Error Feedback: residual을 포함한 pseudo gradient 계산
-                    if self.residual_buffers is not None and param_idx < len(self.residual_buffers):
-                        residual = self.residual_buffers[param_idx]
-                        # residual을 grad와 같은 device로 이동하여 더함
-                        if residual.device != grad.device:
-                            residual = residual.to(grad.device)
-                        grad = grad + residual
                     
                     if grad_idx >= len(averaged_grads):
                         raise RuntimeError(
@@ -1267,15 +1967,13 @@ class DiLoCoGradAverager(DecentralizedAverager, TokenWeightedAggregationMixin):
                     # Gradient 정보 기록 (enable_update_logs가 True인 경우에만)
                     averaged_grads[grad_idx].copy_(grad, non_blocking=True)
                     if self.enable_update_logs and update_records:
-                        # residual threshold로 인해 강제 통신되었는지 확인
-                        was_forced_by_residual = param_idx in getattr(self, '_residual_forced_params', set())
                         # 업데이트 정보 기록 (gradient norm 및 선택 여부 포함)
                         update_records.append({
                             'param_idx': param_idx,
                             'param_name': param_name,
                             'grad_norm': float(grad.norm().item()),
                             'was_selected': True,  # 이 블록에 들어왔으므로 선택됨
-                            'was_forced_by_residual': was_forced_by_residual,
+                            'was_forced_by_residual': False,  # residual은 더 이상 사용하지 않음
                         })
                     
                     if not updated_param_names:  # 첫 번째 호출 시에만 로깅
@@ -1357,21 +2055,9 @@ class DiLoCoGradAverager(DecentralizedAverager, TokenWeightedAggregationMixin):
 
     def notify_used_averaged_gradients(self):
         """Notify averager that the results of a previous averaging round are accounted for
-        Error Feedback: 통신이 완료된 후, 선택된 파라미터와 강제 통신된 파라미터의 residual을 초기화합니다.
+        Residual buffer는 더 이상 사용하지 않으므로 초기화 로직이 필요 없음.
         """
         self._new_averaged_grads = False
-        
-        # Error Feedback: 통신이 완료된 후 residual 초기화
-        if self.residual_buffers is not None and self.param_update_mask is not None:
-            # 선택된 파라미터와 강제 통신된 파라미터의 residual 초기화
-            residual_forced_params = getattr(self, '_residual_forced_params', set())
-            
-            for param_idx in range(len(self.param_update_mask)):
-                # 선택된 파라미터 또는 강제 통신된 파라미터의 residual 초기화
-                if (self.param_update_mask[param_idx] or param_idx in residual_forced_params):
-                    if param_idx < len(self.residual_buffers):
-                        self.residual_buffers[param_idx].zero_()
-                        logger.debug(f"Reset residual buffer for param {param_idx} after communication")
     
     async def _update_averaged_tensors(self, new_tensors: List[torch.Tensor], total_size: int, schema_hash: int):
         """
@@ -1568,11 +2254,22 @@ class DiLoCoOptimizer(Optimizer):
         selective_layer_patterns: Optional[List[str]] = None,
         gradient_magnitude_threshold: Optional[float] = None,
         gradient_magnitude_top_k_ratio: Optional[float] = None,
+        gradient_magnitude_top_k_ratio_by_size: bool = False,
+        gradient_magnitude_selection_mode: str = "layer",  # "layer" or "parameter"
+        gradient_importance_metric: str = "magnitude",  # "magnitude" or "taylor"
         param_names: Optional[List[str]] = None,
         token_weighted_aggregation: bool = False,
-        enable_error_feedback: bool = True,
         residual_norm_threshold: Optional[float] = None,
         enable_update_logs: bool = False,
+        # Max Staleness (강제 업데이트) 기능
+        enable_max_staleness: bool = False,
+        max_staleness: int = 100,
+        # Warm-up (서서히 줄이기) 기능
+        enable_warmup: bool = False,
+        warmup_epochs: int = 5,
+        # Gradient Clipping 기능
+        enable_gradient_clipping: bool = False,
+        gradient_clip_norm: float = 1.0,
         **kwargs,
     ):
         self._check_kwargs(kwargs)
@@ -1581,10 +2278,20 @@ class DiLoCoOptimizer(Optimizer):
         self.selective_layer_patterns = selective_layer_patterns
         self.gradient_magnitude_threshold = gradient_magnitude_threshold
         self.gradient_magnitude_top_k_ratio = gradient_magnitude_top_k_ratio
+        self.gradient_magnitude_top_k_ratio_by_size = gradient_magnitude_top_k_ratio_by_size
+        self.gradient_magnitude_selection_mode = gradient_magnitude_selection_mode
+        self.gradient_importance_metric = gradient_importance_metric
         self.token_weighted_aggregation = token_weighted_aggregation
-        self.enable_error_feedback = enable_error_feedback
         self.residual_norm_threshold = residual_norm_threshold
         self.enable_update_logs = enable_update_logs
+        # Max Staleness 및 Warm-up 설정
+        self.enable_max_staleness = enable_max_staleness
+        self.max_staleness = max_staleness
+        self.enable_warmup = enable_warmup
+        self.warmup_epochs = warmup_epochs
+        # Gradient Clipping 설정
+        self.enable_gradient_clipping = enable_gradient_clipping
+        self.gradient_clip_norm = gradient_clip_norm
         if selective_layer_patterns is not None or gradient_magnitude_threshold is not None or gradient_magnitude_top_k_ratio is not None:
             if param_names is None:
                 # param_names가 제공되지 않으면 모델에서 직접 추출 시도
@@ -1660,6 +2367,9 @@ class DiLoCoOptimizer(Optimizer):
             **kwargs,
         )
         self.diloco_grad_averager = self._make_gradient_averager(compression=grad_compression)
+        
+        # state_averager에 grad_averager 참조 설정 (skip된 파라미터 보호를 위해)
+        self.state_averager.grad_averager = self.diloco_grad_averager
 
     def _check_kwargs(self, kwargs) -> None:
         """DiLoCo Optimizer only support a subset of Hivemind Optimizer kwargs.
@@ -1733,10 +2443,16 @@ class DiLoCoOptimizer(Optimizer):
             selective_layer_patterns=self.selective_layer_patterns,
             gradient_magnitude_threshold=self.gradient_magnitude_threshold,
             gradient_magnitude_top_k_ratio=self.gradient_magnitude_top_k_ratio,
+            gradient_magnitude_top_k_ratio_by_size=self.gradient_magnitude_top_k_ratio_by_size,
+            gradient_magnitude_selection_mode=self.gradient_magnitude_selection_mode,
+            gradient_importance_metric=getattr(self, 'gradient_importance_metric', 'magnitude'),
             token_weighted_aggregation=self.token_weighted_aggregation,
-            enable_error_feedback=self.enable_error_feedback,
             residual_norm_threshold=self.residual_norm_threshold,
             enable_update_logs=self.enable_update_logs,
+            enable_max_staleness=self.enable_max_staleness,
+            max_staleness=self.max_staleness,
+            enable_warmup=self.enable_warmup,
+            warmup_epochs=self.warmup_epochs,
             **kwargs,
         )
         
@@ -1778,6 +2494,8 @@ class DiLoCoOptimizer(Optimizer):
         closure: Optional[Callable[[], torch.Tensor]] = None,
         batch_size: Optional[int] = None,
         scaler: Optional[torch.cuda.amp.GradScaler] = None,
+        current_loss: Optional[float] = None,
+        **kwargs,
     ):
         """
         Note: code is is copied from Hivemind's Optimizer.step, the main change is that the local step is used with the **iner optimizer**, only
@@ -1817,6 +2535,14 @@ class DiLoCoOptimizer(Optimizer):
         if closure is not None:
             with torch.enable_grad():
                 loss = closure()
+        
+        # Loss 저장 (grad_averager에 전달용)
+        # train_fsdp.py에서 optimizer.step(scaler=scaler, current_loss=...)로 전달됨
+        if current_loss is not None:
+            self._current_loss = float(current_loss)
+        elif loss is not None:
+            self._current_loss = float(loss.detach().item())
+        # loss와 current_loss가 모두 None이면 이전 값 유지 (outer step에서는 loss가 없을 수 있음)
 
         if not self.auxiliary and self._should_load_state_from_peers():
             logger.log(self.status_loglevel, "Peer is out of sync")
@@ -1921,7 +2647,8 @@ class DiLoCoOptimizer(Optimizer):
                 )
                 
                 self.diloco_grad_averager.step(
-                    wait=True, timeout=self.averaging_timeout, control=self.scheduled_diloco_grads, epoch=self.local_epoch
+                    wait=True, timeout=self.averaging_timeout, control=self.scheduled_diloco_grads, 
+                    epoch=self.local_epoch, current_loss=getattr(self, '_current_loss', None)
                 )
 
                 self.diloco_grad_averager.notify_used_averaged_gradients()
@@ -1954,6 +2681,11 @@ class DiLoCoOptimizer(Optimizer):
 
             assert self.state_averager.custom_gradients, "custom gradient must be enable for syncing pseudo gradients"
 
+            # 통신된 averaged gradient를 outer optimizer에 로드
+            # custom_gradients=True이므로 수동으로 averaged gradient를 로드해야 합니다.
+            if self.tracker.global_progress.num_peers > 1:
+                self._load_averaged_gradients_into_outer_optimizer()
+
             # Token-weighted aggregation을 위한 expected_num_peers 설정 (state_averager)
             if self.state_averager.token_weighted_aggregation:
                 # tracker에서 현재 peer 수를 가져와서 설정 (최소한의 예상 값)
@@ -1963,6 +2695,20 @@ class DiLoCoOptimizer(Optimizer):
                 )
 
             logger.info(f"Try outer optimizer step at  {self.tracker.real_step} step")
+            
+            # Gradient Clipping: outer optimizer 업데이트 전에 gradient clipping 적용
+            if self.enable_gradient_clipping and should_perform_optimizer_step:
+                # outer optimizer의 파라미터에 대한 gradient clipping
+                outer_params = [param for group in self.state_averager.optimizer.param_groups for param in group["params"]]
+                # gradient가 있는 파라미터만 필터링
+                params_with_grad = [p for p in outer_params if p.grad is not None]
+                if len(params_with_grad) > 0:
+                    total_norm = torch.nn.utils.clip_grad_norm_(params_with_grad, max_norm=self.gradient_clip_norm)
+                    logger.log(
+                        self.status_loglevel,
+                        f"Gradient clipping applied: total_norm={total_norm:.6f}, max_norm={self.gradient_clip_norm}"
+                    )
+            
             time_0_state_averager_step = time.perf_counter()
             self.state_averager.step(
                 increment_epoch=True,
@@ -2065,10 +2811,78 @@ class DiLoCoOptimizer(Optimizer):
         
         logger.info(f"Updated target_batch_size to {new_target_batch_size} (batch_size={self.tracker.batch_size} * num_inner_steps={new_num_inner_steps})")
 
+    @torch.no_grad()
+    def _load_averaged_gradients_into_outer_optimizer(self):
+        """Load averaged gradients from diloco_grad_averager into outer optimizer's gradient buffers
+        
+        custom_gradients=True이므로 통신된 averaged gradient를 수동으로 outer optimizer에 로드합니다.
+        """
+        outer_params = [param for group in self.state_averager.optimizer.param_groups for param in group["params"]]
+        
+        # param_update_mask 확인 (selective layer update가 활성화된 경우)
+        param_update_mask = getattr(self.diloco_grad_averager, 'param_update_mask', None)
+        
+        # diloco_grad_averager에서 averaged gradient 가져오기
+        with self.diloco_grad_averager.get_tensors() as averaged_grads:
+            param_idx = 0
+            grad_idx = 0
+            
+            for opt_param in outer_params:
+                if param_update_mask is not None:
+                    if param_update_mask[param_idx]:
+                        # 선택된 파라미터: averaged gradient를 opt_param.grad에 설정
+                        if grad_idx >= len(averaged_grads):
+                            raise RuntimeError(
+                                f"grad_idx ({grad_idx})가 averaged_grads의 길이 ({len(averaged_grads)})를 초과했습니다."
+                            )
+                        averaged_grad = averaged_grads[grad_idx]
+                        if opt_param.grad is None:
+                            opt_param.grad = averaged_grad.clone()
+                        else:
+                            opt_param.grad.copy_(averaged_grad, non_blocking=True)
+                        grad_idx += 1
+                    else:
+                        # Skip된 파라미터: gradient를 0으로 설정
+                        if opt_param.grad is None:
+                            opt_param.grad = torch.zeros_like(opt_param)
+                        else:
+                            opt_param.grad.zero_()
+                else:
+                    # 모든 파라미터 업데이트: averaged gradient를 opt_param.grad에 설정
+                    if grad_idx >= len(averaged_grads):
+                        raise RuntimeError(
+                            f"grad_idx ({grad_idx})가 averaged_grads의 길이 ({len(averaged_grads)})를 초과했습니다."
+                        )
+                    averaged_grad = averaged_grads[grad_idx]
+                    if opt_param.grad is None:
+                        opt_param.grad = averaged_grad.clone()
+                    else:
+                        opt_param.grad.copy_(averaged_grad, non_blocking=True)
+                    grad_idx += 1
+                param_idx += 1
+
+
     def update_main_param_after_outer_step(self):
-        """Update the main parameters with the inner optimizer step"""
+        """Update the inner optimizer parameters with the main parameters after outer step
+        
+        흐름:
+        1. Outer step: state_averager.step() 내부에서 outer optimizer.step() 호출
+           → offloaded optimizer의 파라미터가 pseudo gradient로 업데이트됨
+        2. _apply_optimizer_parameters_(): offloaded optimizer → main_parameters 복사
+           → 모든 파라미터 업데이트 (skip된 파라미터도 포함, gradient가 0이므로 변화 없음)
+        3. 이 함수: main_parameters → inner optimizer 파라미터 복사 (Main → Inner)
+        
+        Note: inner optimizer의 파라미터는 main_parameters와 같은 객체를 참조하므로,
+        실제로는 복사가 필요 없지만, 명시적으로 동기화를 보장하기 위해 유지됩니다.
+        PyTorch Optimizer는 파라미터 객체 자체를 참조하므로 별도 복사가 필요 없으나,
+        안전을 위해 방향을 Main → Inner로 명확히 합니다.
+        """
         opt_parameters = [param for group in self.inner_optimizer.param_groups for param in group["params"]]
+        
         for main_param, opt_param in zip(self.state_averager.main_parameters, opt_parameters):
+            # inner optimizer의 파라미터와 main_parameters는 같은 객체를 참조하므로,
+            # _apply_optimizer_parameters_()에서 이미 선택적 업데이트가 처리되었습니다.
+            # 여기서는 모든 파라미터를 복사해도 됩니다 (같은 객체이므로 결과는 동일).
             main_param.data.copy_(opt_param.data, non_blocking=True)
 
     def _maybe_schedule_gradient_averaging(self) -> None:

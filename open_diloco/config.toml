@@ -34,6 +34,23 @@ initial_peers = ["$PEER"]
 galaxy_size = 3
 world_rank = "${WORLD_RANK}"
 # selective_layer_patterns = ["model.layers.0", "model.layers.1", "lm_head"]
-gradient_magnitude_top_k_ratio = 0.3
+gradient_magnitude_top_k_ratio = 0.9  # top-k% 선택 (Input/Output 레이어는 항상 포함)
+gradient_magnitude_top_k_ratio_by_size = true  # true면 크기 기준으로 비율 계산, false면 개수 기준
+gradient_magnitude_selection_mode = "layer"  # "layer" (레이어 단위) or "parameter" (파라미터 텐서 단위)
+gradient_importance_metric = "magnitude"  # (default) pseudo-grad L2 norm
+# gradient_importance_metric = "taylor"     # Taylor 1st order saliency: sum(|w * g|)
 token_weighted_aggregation = true
+# residual_norm_threshold = 1.0  # If residual norm exceeds this threshold, force communication for all parameters (None = disabled)
 max_outer_optimization_steps = 200
+
+# Max Staleness (강제 업데이트) - 레이어가 N번 이상 선택되지 않으면 강제로 포함 (레이어 단위 관리)
+enable_max_staleness = false
+max_staleness = 10  # 레이어가 N번 이상 선택되지 않으면 강제 포함
+
+# Warm-up (서서히 줄이기) - 초기 epoch 동안은 모든 레이어 전송 후 점진적으로 sparsity 증가
+enable_warmup = false
+warmup_epochs = 5  # 초기 N epoch 동안은 모든 레이어 전송
+
+# Gradient Clipping - Outer optimizer 업데이트 전에 gradient clipping 적용
+enable_gradient_clipping = false
+gradient_clip_norm = 2.0  # 최대 gradient norm

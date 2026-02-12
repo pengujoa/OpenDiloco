@@ -220,13 +220,26 @@ class HvConfig(BaseConfig):
     # Gradient magnitude based layer selection (alternative to selective_layer_patterns)
     gradient_magnitude_threshold: float | None = None  # threshold 이상의 magnitude를 가진 레이어만 업데이트
     gradient_magnitude_top_k_ratio: float | None = None  # top-k% 레이어만 업데이트 (0.0 ~ 1.0, 예: 0.5 = 상위 50%)
-    # Error Feedback (Residual Accumulation) for top-k gradient selection
-    enable_error_feedback: bool = True  # If True, accumulate unselected gradients in residual buffer
+    gradient_magnitude_top_k_ratio_by_size: bool = False  # True면 파라미터 크기 기준으로 비율 계산, False면 개수 기준
+    gradient_magnitude_selection_mode: str = "layer"  # "layer" (레이어 단위) or "parameter" (파라미터 텐서 단위)
+    # Importance metric used when gradient_magnitude_* selection is enabled
+    # - "magnitude": 기존 로직 (pseudo_grad L2 norm)
+    # - "taylor": Taylor 1st order saliency (sum(|w * g|) per tensor)
+    gradient_importance_metric: Literal["magnitude", "taylor"] = "magnitude"
     residual_norm_threshold: float | None = None  # If residual norm exceeds this threshold, force communication for all parameters (None = disabled)
     # Token-weighted aggregation
     token_weighted_aggregation: bool = False  # If True, use token-weighted aggregation instead of uniform averaging
     # Outer optimization steps limit
     max_outer_optimization_steps: int | None = None  # If set, training will stop after this many outer optimization steps
+    # Max Staleness (강제 업데이트)
+    enable_max_staleness: bool = False  # If True, parameters not selected for max_staleness steps will be forced to update
+    max_staleness: int = 100  # Number of steps after which unselected parameters are forced to update
+    # Warm-up (서서히 줄이기)
+    enable_warmup: bool = False  # If True, send all parameters for first warmup_epochs, then gradually reduce sparsity
+    warmup_epochs: int = 5  # Number of epochs to send all parameters before applying sparsity
+    # Gradient Clipping
+    enable_gradient_clipping: bool = False  # If True, apply gradient clipping before outer optimizer update
+    gradient_clip_norm: float = 1.0  # Maximum gradient norm for clipping
 
     
     @field_validator('initial_peers', mode='before')
@@ -1010,6 +1023,10 @@ def train(config: Config):
                     log(f"  Using threshold: {config.hv.gradient_magnitude_threshold}")
                 if config.hv.gradient_magnitude_top_k_ratio is not None:
                     log(f"  Using top_k_ratio: {config.hv.gradient_magnitude_top_k_ratio}")
+                    if config.hv.gradient_magnitude_top_k_ratio_by_size:
+                        log(f"  Selection mode: by size (parameter elements)")
+                    else:
+                        log(f"  Selection mode: by count (parameter count)")
         
         diloco_args = dict(
             dht=dht,
@@ -1029,10 +1046,18 @@ def train(config: Config):
             selective_layer_patterns=config.hv.selective_layer_patterns,
             gradient_magnitude_threshold=config.hv.gradient_magnitude_threshold,
             gradient_magnitude_top_k_ratio=config.hv.gradient_magnitude_top_k_ratio,
+            gradient_magnitude_top_k_ratio_by_size=config.hv.gradient_magnitude_top_k_ratio_by_size,
+            gradient_magnitude_selection_mode=config.hv.gradient_magnitude_selection_mode,
+            gradient_importance_metric=config.hv.gradient_importance_metric,
             param_names=param_names,
             token_weighted_aggregation=config.hv.token_weighted_aggregation,
-            enable_error_feedback=config.hv.enable_error_feedback,
             residual_norm_threshold=config.hv.residual_norm_threshold,
+            enable_max_staleness=config.hv.enable_max_staleness,
+            max_staleness=config.hv.max_staleness,
+            enable_warmup=config.hv.enable_warmup,
+            warmup_epochs=config.hv.warmup_epochs,
+            enable_gradient_clipping=config.hv.enable_gradient_clipping,
+            gradient_clip_norm=config.hv.gradient_clip_norm,
         )
 
         diloco_args.update(get_compression_kwargs(config.hv.hivemind_compression))
@@ -1215,7 +1240,7 @@ def train(config: Config):
                         log(f"[TIMING] GPU local training time: {local_training_time:.6f} sec")
                 
                 # This will trigger inter-node synchronization if real_step % local_steps == 0
-                optimizer.step(scaler=scaler)
+                optimizer.step(scaler=scaler, current_loss=float(loss.detach().item()))
                 # todo(sami): refactor to use built in pytorch mechanism to handle scaler manually
                 # should allow to just do scaler.step(optimizer)
             else:
@@ -1223,6 +1248,8 @@ def train(config: Config):
             
             # Perform validation after inter-node synchronization (when real_step is multiple of local_steps)
             # All ranks must participate in validation for FSDP (not just local_rank == 0)
+            # Note: optimizer.step()이 완료되면 이미 update_main_param_after_outer_step()도 완료되어 있으므로
+            # 파라미터는 안정적인 상태입니다. 추가 동기화 대기는 불필요합니다 (성능 최적화).
             validation_metrics = {}
             if config.hv is not None and config.validation and validation_dataloader is not None and real_step > 0:
                 if int(real_step) % config.hv.local_steps == 0:
