@@ -178,7 +178,7 @@ class Logger(Protocol):
 class WandbLogger:
     def __init__(self, project, config, resume: bool):
         wandb.init(
-            project=project, config=config, resume="auto" if resume else None
+            project=project, config=config, resume="auto" if resume else None, settings=wandb.Settings(x_stats_sampling_interval=1.0)
         )  # make wandb reuse the same run id if possible
 
     def log(self, metrics: dict[str, Any]):

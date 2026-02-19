@@ -43,6 +43,7 @@ def wait_for_all_nodes_local_step_complete(
     epoch: int, 
     num_inner_steps: int,
     expected_num_peers: int,
+    prefix: str,  # averager의 고유 prefix (예: "{run_id}_grad_averager")
     log_fn=None,
     timeout: float = 300.0,
     check_interval: float = 0.1,
@@ -54,6 +55,7 @@ def wait_for_all_nodes_local_step_complete(
     :param epoch: 현재 epoch 번호
     :param num_inner_steps: 각 노드가 완료해야 하는 local step 수
     :param expected_num_peers: 예상되는 peer 수 (galaxy_size)
+    :param prefix: averager의 고유 prefix (간섭 방지를 위해 필수)
     :param log_fn: 로깅 함수 (None이면 logger.info 사용)
     :param timeout: 최대 대기 시간 (초)
     :param check_interval: 확인 간격 (초)
@@ -62,8 +64,8 @@ def wait_for_all_nodes_local_step_complete(
     if log_fn is None:
         log_fn = logger.info
     
-    RUN_ID = "OpenDiLoCo"
-    local_step_key = f"{RUN_ID}:local_step_complete:epoch_{epoch}"
+    # 각 averager의 고유 prefix를 사용하여 키 생성 (간섭 방지)
+    local_step_key = f"{prefix}:local_step_complete:epoch_{epoch}"
     worker_id = f"{socket.gethostname()}-pid{os.getpid()}"
     
     # 현재 노드의 local step 완료 상태를 DHT에 publish
@@ -102,17 +104,9 @@ def wait_for_all_nodes_local_step_complete(
     
     wait_time = time.time() - start_time
     
-    # 동기화 완료 후 상태를 짧은 시간 후 만료되도록 업데이트
+    # 동기화 완료 후 DHT에서 명시적으로 삭제 (다음 iteration에서 혼선 방지)
     now = get_dht_time()
-    local_step_payload = {
-        "epoch": epoch,
-        "local_steps_completed": num_inner_steps,
-        "completed": True,
-        "ts": now,
-        "host": socket.gethostname(),
-    }
-    exp = now + 5.0  # 5초 후 만료
-    dht.store(key=local_step_key, subkey=worker_id, value=local_step_payload, expiration_time=exp)
+    dht.store(key=local_step_key, subkey=worker_id, value=None, expiration_time=now - 1)
     
     return wait_time
 
@@ -393,6 +387,8 @@ class DiLoCoGradAverager(DecentralizedAverager, TokenWeightedAggregationMixin):
         # Warm-up (서서히 줄이기) 기능
         enable_warmup: bool = False,
         warmup_epochs: int = 5,  # 초기 N epoch 동안은 모든 파라미터 전송
+        # Galaxy size (고정된 peer 수)
+        galaxy_size: Optional[int] = None,
         **kwargs,
     ):
         if "client_mode" in kwargs:
@@ -425,6 +421,8 @@ class DiLoCoGradAverager(DecentralizedAverager, TokenWeightedAggregationMixin):
         self.token_count_key = None
         self.worker_id = None
         self.expected_num_peers = None
+        # Galaxy size 저장 (expected_num_peers의 fallback으로 사용)
+        self.galaxy_size = galaxy_size
 
         # Local step 동기화를 위한 정보 저장
         self.num_inner_steps = None  # 나중에 설정됨
@@ -789,10 +787,11 @@ class DiLoCoGradAverager(DecentralizedAverager, TokenWeightedAggregationMixin):
         :param check_interval: 확인 간격 (초)
         :returns: 모든 노드의 평균 importance score 리스트
         """
-        RUN_ID = "OpenDiLoCo"
+        # 각 averager의 고유 prefix를 사용하여 키 생성 (간섭 방지)
+        # self.prefix는 "{run_id}_grad_averager" 또는 "{run_id}_state_averager" 형식
         # Metric에 따라 DHT 키 분리 (magnitude와 taylor가 섞이지 않도록)
         metric_suffix = "magnitudes" if self.gradient_importance_metric == "magnitude" else "taylor"
-        magnitude_key = f"{RUN_ID}:gradient_{metric_suffix}:epoch_{epoch}"
+        magnitude_key = f"{self.prefix}:gradient_{metric_suffix}:epoch_{epoch}"
         worker_id = f"{socket.gethostname()}-pid{os.getpid()}"
         
         # 현재 노드의 gradient magnitude를 DHT에 publish
@@ -831,7 +830,13 @@ class DiLoCoGradAverager(DecentralizedAverager, TokenWeightedAggregationMixin):
                             all_magnitudes.append(magnitudes)
                             collected_count += 1
             
-            expected_count = self.expected_num_peers if self.expected_num_peers is not None else 2
+            # expected_num_peers가 설정되어 있으면 사용, 없으면 galaxy_size 사용, 둘 다 없으면 2 사용
+            if self.expected_num_peers is not None:
+                expected_count = self.expected_num_peers
+            elif self.galaxy_size is not None:
+                expected_count = self.galaxy_size
+            else:
+                expected_count = 2
             
             if collected_count >= expected_count and len(all_magnitudes) > 0:
                 break
@@ -847,16 +852,9 @@ class DiLoCoGradAverager(DecentralizedAverager, TokenWeightedAggregationMixin):
         magnitudes_array = np.array(all_magnitudes)
         averaged_magnitudes = magnitudes_array.mean(axis=0).tolist()
         
-        # 동기화 완료 후 상태를 짧은 시간 후 만료되도록 업데이트
+        # 동기화 완료 후 DHT에서 명시적으로 삭제 (다음 iteration에서 혼선 방지)
         now = get_dht_time()
-        magnitude_payload = {
-            "epoch": epoch,
-            "magnitudes": local_magnitudes,
-            "ts": now,
-            "host": socket.gethostname(),
-        }
-        exp = now + 5.0  # 5초 후 만료
-        self.dht.store(key=magnitude_key, subkey=worker_id, value=magnitude_payload, expiration_time=exp)
+        self.dht.store(key=magnitude_key, subkey=worker_id, value=None, expiration_time=now - 1)
         
         return averaged_magnitudes
 
@@ -1849,6 +1847,7 @@ class DiLoCoGradAverager(DecentralizedAverager, TokenWeightedAggregationMixin):
                     epoch=epoch,
                     num_inner_steps=self.num_inner_steps,
                     expected_num_peers=self.expected_num_peers,
+                    prefix=self.prefix,  # 각 averager의 고유 prefix 사용 (간섭 방지)
                     log_fn=lambda msg: None,  # 로그 제거
                     timeout=timeout if timeout is not None else 300.0,
                 )
@@ -2270,6 +2269,8 @@ class DiLoCoOptimizer(Optimizer):
         # Gradient Clipping 기능
         enable_gradient_clipping: bool = False,
         gradient_clip_norm: float = 1.0,
+        # Galaxy size (고정된 peer 수)
+        galaxy_size: Optional[int] = None,
         **kwargs,
     ):
         self._check_kwargs(kwargs)
@@ -2292,6 +2293,8 @@ class DiLoCoOptimizer(Optimizer):
         # Gradient Clipping 설정
         self.enable_gradient_clipping = enable_gradient_clipping
         self.gradient_clip_norm = gradient_clip_norm
+        # Galaxy size 저장 (expected_num_peers로 사용)
+        self.galaxy_size = galaxy_size
         if selective_layer_patterns is not None or gradient_magnitude_threshold is not None or gradient_magnitude_top_k_ratio is not None:
             if param_names is None:
                 # param_names가 제공되지 않으면 모델에서 직접 추출 시도
@@ -2427,8 +2430,8 @@ class DiLoCoOptimizer(Optimizer):
         grad_averager = DiLoCoGradAverager(
             dht=self.dht,
             prefix=f"{self.run_id}_grad_averager",
-            # cyshin
-            target_group_size=4,
+            # target_group_size를 galaxy_size로 설정 (모든 peer와 통신하도록)
+            target_group_size=self.galaxy_size if self.galaxy_size is not None else 4,
             bandwidth=100, 
             main_parameters=self.state_averager.main_parameters,
             offloaded_optimizer=self.state_averager.optimizer,
@@ -2453,6 +2456,7 @@ class DiLoCoOptimizer(Optimizer):
             max_staleness=self.max_staleness,
             enable_warmup=self.enable_warmup,
             warmup_epochs=self.warmup_epochs,
+            galaxy_size=self.galaxy_size,  # galaxy_size 전달
             **kwargs,
         )
         
@@ -2460,16 +2464,16 @@ class DiLoCoOptimizer(Optimizer):
         grad_averager.num_inner_steps = self.num_inner_steps
         
         # Token-weighted aggregation을 위한 설정 (활성화된 경우에만)
-        if self.token_weighted_aggregation:
-            RUN_ID = "OpenDiLoCo"
-            grad_averager.token_count_key = f"{RUN_ID}:tokens"
-            grad_averager.worker_id = f"{socket.gethostname()}-pid{os.getpid()}"
-            grad_averager.cumulative_tokens = 0
-            # expected_num_peers는 step() 호출 시점에 tracker에서 동적으로 설정됨
+        # token_count_key는 _init_token_weighted_aggregation()에서 prefix 기반으로 자동 생성됨
+        # 별도로 설정할 필요 없음 (각 averager의 고유 prefix 사용)
         
         return grad_averager
 
     def _make_state_averager(self, **kwargs) -> DiLoCoStateAverager:
+        # kwargs에 target_group_size가 없으면 galaxy_size 사용
+        if "target_group_size" not in kwargs:
+            kwargs["target_group_size"] = self.galaxy_size if self.galaxy_size is not None else 4
+        
         return DiLoCoStateAverager(
             dht=self.dht,
             prefix=f"{self.run_id}_state_averager",
@@ -2641,10 +2645,30 @@ class DiLoCoOptimizer(Optimizer):
                 self.diloco_grad_averager._current_step = self.tracker.real_step
                 
                 # Token-weighted aggregation 및 local step 동기화를 위한 expected_num_peers 설정
-                self.diloco_grad_averager.expected_num_peers = max(
-                    self.tracker.global_progress.num_peers,
-                    2  # 최소 2개 노드는 있어야 함
-                )
+                # galaxy_size가 설정되어 있으면 그것을 사용, 없으면 tracker 값 사용
+                if self.galaxy_size is not None:
+                    self.diloco_grad_averager.expected_num_peers = self.galaxy_size
+                    logger.log(
+                        self.status_loglevel,
+                        f"Using fixed galaxy_size ({self.galaxy_size}) for expected_num_peers"
+                    )
+                else:
+                    # galaxy_size가 없으면 tracker 값 사용 (하위 호환성)
+                    current_tracker_peers = self.tracker.global_progress.num_peers
+                    previous_expected_peers = getattr(self.diloco_grad_averager, 'expected_num_peers', None)
+                    
+                    # 이전 값이 있고 현재 tracker 값보다 크면 이전 값을 사용
+                    if previous_expected_peers is not None and previous_expected_peers > current_tracker_peers:
+                        logger.log(
+                            self.status_loglevel,
+                            f"Using previous expected_num_peers ({previous_expected_peers}) instead of tracker value ({current_tracker_peers})"
+                        )
+                        self.diloco_grad_averager.expected_num_peers = previous_expected_peers
+                    else:
+                        self.diloco_grad_averager.expected_num_peers = max(
+                            current_tracker_peers,
+                            2  # 최소 2개 노드는 있어야 함
+                        )
                 
                 self.diloco_grad_averager.step(
                     wait=True, timeout=self.averaging_timeout, control=self.scheduled_diloco_grads, 
@@ -2688,11 +2712,29 @@ class DiLoCoOptimizer(Optimizer):
 
             # Token-weighted aggregation을 위한 expected_num_peers 설정 (state_averager)
             if self.state_averager.token_weighted_aggregation:
-                # tracker에서 현재 peer 수를 가져와서 설정 (최소한의 예상 값)
-                self.state_averager.expected_num_peers = max(
-                    self.tracker.global_progress.num_peers,
-                    2  # 최소 2개 노드는 있어야 함
-                )
+                # galaxy_size가 설정되어 있으면 그것을 사용, 없으면 tracker 값 사용
+                if self.galaxy_size is not None:
+                    self.state_averager.expected_num_peers = self.galaxy_size
+                    logger.log(
+                        self.status_loglevel,
+                        f"StateAverager: Using fixed galaxy_size ({self.galaxy_size}) for expected_num_peers"
+                    )
+                else:
+                    # galaxy_size가 없으면 tracker 값 사용 (하위 호환성)
+                    current_tracker_peers = self.tracker.global_progress.num_peers
+                    previous_expected_peers = getattr(self.state_averager, 'expected_num_peers', None)
+                    
+                    if previous_expected_peers is not None and previous_expected_peers > current_tracker_peers:
+                        logger.log(
+                            self.status_loglevel,
+                            f"StateAverager: Using previous expected_num_peers ({previous_expected_peers}) instead of tracker value ({current_tracker_peers})"
+                        )
+                        self.state_averager.expected_num_peers = previous_expected_peers
+                    else:
+                        self.state_averager.expected_num_peers = max(
+                            current_tracker_peers,
+                            2  # 최소 2개 노드는 있어야 함
+                        )
 
             logger.info(f"Try outer optimizer step at  {self.tracker.real_step} step")
             

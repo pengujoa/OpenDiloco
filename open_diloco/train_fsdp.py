@@ -1058,6 +1058,7 @@ def train(config: Config):
             warmup_epochs=config.hv.warmup_epochs,
             enable_gradient_clipping=config.hv.enable_gradient_clipping,
             gradient_clip_norm=config.hv.gradient_clip_norm,
+            galaxy_size=config.hv.galaxy_size,  # 고정된 peer 수로 사용
         )
 
         diloco_args.update(get_compression_kwargs(config.hv.hivemind_compression))

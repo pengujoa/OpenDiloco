@@ -81,18 +81,26 @@ class TokenWeightedAggregationMixin:
                 return token_counts
             
             # expected_num_peers가 설정되어 있으면 그만큼 기다림
-            if self.expected_num_peers is not None:
+            # expected_num_peers가 없으면 galaxy_size를 fallback으로 사용
+            expected_count = self.expected_num_peers
+            if expected_count is None and hasattr(self, 'galaxy_size') and self.galaxy_size is not None:
+                expected_count = self.galaxy_size
+            
+            if expected_count is not None:
                 num_peers_with_tokens = len(token_counts)
-                if num_peers_with_tokens >= self.expected_num_peers:
+                if num_peers_with_tokens >= expected_count:
                     return token_counts
             
             # 타임아웃 확인
             elapsed_time = time.time() - start_time
             if elapsed_time >= max_wait_time:
                 num_peers_with_tokens = len(token_counts)
+                expected_count = self.expected_num_peers
+                if expected_count is None and hasattr(self, 'galaxy_size') and self.galaxy_size is not None:
+                    expected_count = self.galaxy_size
                 logger.warning(
                     f"Token-weighted aggregation: Timeout waiting for token counts. "
-                    f"Got {num_peers_with_tokens}/{self.expected_num_peers}"
+                    f"Got {num_peers_with_tokens}/{expected_count}"
                 )
                 return token_counts
             
