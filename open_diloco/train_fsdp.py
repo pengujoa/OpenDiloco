@@ -240,6 +240,8 @@ class HvConfig(BaseConfig):
     # Gradient Clipping
     enable_gradient_clipping: bool = False  # If True, apply gradient clipping before outer optimizer update
     gradient_clip_norm: float = 1.0  # Maximum gradient norm for clipping
+    # Throughput adaptive sizing
+    use_throughput_adaptive_sizing: bool = True  # If True, use throughput from previous rounds to adaptively adjust tensor partitioning
 
     
     @field_validator('initial_peers', mode='before')
@@ -286,6 +288,8 @@ class Config(BaseConfig):
     adjust_local_steps: bool = False  # If True, adjust local_steps based on node speed distribution; if False, use initial value
     # Validation
     validation: bool = False  # If True, run validation after each local_steps (inter-node synchronization)
+    # Initial LR adjustment
+    initial_lr_adjust: bool = False  # If True, adjust initial learning rate based on actual per_device_batch_size
     
     
 def get_dataloader(tokenizer, world_size, rank, local_rank, config: Config, dht: DHT | None = None) -> tuple[StatefulDataLoader, int, int]:
@@ -878,42 +882,47 @@ def train(config: Config):
     # but linear scaling is still a good starting point. For very small batch sizes,
     # we apply a more conservative scaling to avoid training instability.
     base_batch_size = 512  # Fixed base per_device batch size for learning rate scaling
-    # if False:
-    if actual_per_device_batch_size != base_batch_size:
-        # Linear scaling factor
-        lr_scale_factor = actual_per_device_batch_size / base_batch_size
-        
-        # For very small batch sizes (< 1/4 of base), apply more conservative scaling
-        # to avoid training instability due to high gradient noise
-        # Use sqrt scaling for very small batches: more conservative than linear
-        if actual_per_device_batch_size < base_batch_size / 4:
-            # Apply sqrt scaling for very small batches: sqrt(batch_new / batch_base)
-            conservative_scale_factor = math.sqrt(actual_per_device_batch_size / base_batch_size)
-            adjusted_lr = config.lr * conservative_scale_factor
-            scaling_method = "sqrt (conservative for small batch)"
-        else:
-            # Standard linear scaling for normal batch sizes
-            adjusted_lr = config.lr * lr_scale_factor
-            scaling_method = "linear"
-        
-        if rank == 0:
-            log(f"Inner Optimizer LR adjustment ({scaling_method}):")
-            log(f"  Base LR: {config.lr:.2e} (tuned for per_device_batch_size={base_batch_size})")
-            log(f"  Actual per_device_batch_size: {actual_per_device_batch_size}")
-            log(f"  Total batch_size: {actual_total_batch_size} (reference only)")
+    
+    # Initial LR adjustment (only if enabled)
+    if config.initial_lr_adjust:
+        if actual_per_device_batch_size != base_batch_size:
+            # Linear scaling factor
+            lr_scale_factor = actual_per_device_batch_size / base_batch_size
+            
+            # For very small batch sizes (< 1/4 of base), apply more conservative scaling
+            # to avoid training instability due to high gradient noise
+            # Use sqrt scaling for very small batches: more conservative than linear
             if actual_per_device_batch_size < base_batch_size / 4:
-                sqrt_factor = math.sqrt(actual_per_device_batch_size / base_batch_size)
-                log(f"  Linear scale factor: {lr_scale_factor:.3f}")
-                log(f"  Applied sqrt scale factor: {sqrt_factor:.3f} (conservative for small batch)")
+                # Apply sqrt scaling for very small batches: sqrt(batch_new / batch_base)
+                conservative_scale_factor = math.sqrt(actual_per_device_batch_size / base_batch_size)
+                adjusted_lr = config.lr * conservative_scale_factor
+                scaling_method = "sqrt (conservative for small batch)"
             else:
-                log(f"  Scale factor: {lr_scale_factor:.3f} (linear scaling)")
-            log(f"  Adjusted LR: {adjusted_lr:.2e}")
-        
-        # Update config.lr for optimizer initialization
-        config.lr = adjusted_lr
+                # Standard linear scaling for normal batch sizes
+                adjusted_lr = config.lr * lr_scale_factor
+                scaling_method = "linear"
+            
+            if rank == 0:
+                log(f"Inner Optimizer LR adjustment ({scaling_method}):")
+                log(f"  Base LR: {config.lr:.2e} (tuned for per_device_batch_size={base_batch_size})")
+                log(f"  Actual per_device_batch_size: {actual_per_device_batch_size}")
+                log(f"  Total batch_size: {actual_total_batch_size} (reference only)")
+                if actual_per_device_batch_size < base_batch_size / 4:
+                    sqrt_factor = math.sqrt(actual_per_device_batch_size / base_batch_size)
+                    log(f"  Linear scale factor: {lr_scale_factor:.3f}")
+                    log(f"  Applied sqrt scale factor: {sqrt_factor:.3f} (conservative for small batch)")
+                else:
+                    log(f"  Scale factor: {lr_scale_factor:.3f} (linear scaling)")
+                log(f"  Adjusted LR: {adjusted_lr:.2e}")
+            
+            # Update config.lr for optimizer initialization
+            config.lr = adjusted_lr
+        else:
+            if rank == 0:
+                log(f"Inner Optimizer LR: {config.lr:.2e} (no adjustment needed, per_device_batch_size={actual_per_device_batch_size} matches base)")
     else:
         if rank == 0:
-            log(f"Inner Optimizer LR: {config.lr:.2e} (no adjustment needed, per_device_batch_size={actual_per_device_batch_size} matches base)")
+            log(f"Inner Optimizer LR: {config.lr:.2e} (initial_lr_adjust=False, using configured LR without adjustment)")
 
     # Create validation dataloader if validation is enabled
     # Each rank gets a different portion of validation data (split like train_dataloader)
@@ -1062,6 +1071,11 @@ def train(config: Config):
         )
 
         diloco_args.update(get_compression_kwargs(config.hv.hivemind_compression))
+        
+        # Set averager_opts for throughput adaptive sizing
+        if "averager_opts" not in diloco_args:
+            diloco_args["averager_opts"] = {}
+        diloco_args["averager_opts"]["use_throughput_adaptive_sizing"] = config.hv.use_throughput_adaptive_sizing
 
         if config.hv.averaging_timeout is not None:
             diloco_args["averaging_timeout"] = config.hv.averaging_timeout

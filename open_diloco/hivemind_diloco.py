@@ -1614,7 +1614,11 @@ class DiLoCoGradAverager(DecentralizedAverager, TokenWeightedAggregationMixin):
         residual_forced_params = set()
         
         # Gradient magnitude 기반 tensor 선택 및 Token weight 계산을 병렬로 처리
-        has_magnitude_config = (self.gradient_magnitude_threshold is not None or self.gradient_magnitude_top_k_ratio is not None)
+        # top_k_ratio가 1.0이면 모든 파라미터를 선택하므로 magnitude 계산 불필요
+        has_magnitude_threshold = self.gradient_magnitude_threshold is not None
+        has_magnitude_top_k = (self.gradient_magnitude_top_k_ratio is not None and 
+                               self.gradient_magnitude_top_k_ratio != 1.0)
+        has_magnitude_config = has_magnitude_threshold or has_magnitude_top_k
         has_param_names = self.param_names is not None
         
         magnitudes = None
@@ -1687,7 +1691,13 @@ class DiLoCoGradAverager(DecentralizedAverager, TokenWeightedAggregationMixin):
         layer_magnitudes = None
         new_mask = None
         
-        if magnitudes is not None and has_param_names:
+        # effective_top_k_ratio가 1.0이면 모든 파라미터를 선택하므로 마스크 생성 불필요
+        if effective_top_k_ratio == 1.0 and has_param_names:
+            # 모든 파라미터를 선택하는 마스크 생성 (magnitude 계산 없이)
+            if self.param_names is not None:
+                new_mask = [True] * len(self.param_names)
+                logger.info(f"top_k_ratio=1.0: All {len(self.param_names)} parameters selected (magnitude calculation skipped)")
+        elif magnitudes is not None and has_param_names:
             if self.gradient_magnitude_selection_mode == "layer":
                 # 레이어 단위 선택 모드
                 # 파라미터 단위 magnitude를 레이어 단위로 집계
@@ -2353,6 +2363,7 @@ class DiLoCoOptimizer(Optimizer):
             tracker_opts["max_refresh_period"] = 2
 
         self.scheduled_diloco_grads: Optional[StepControl] = None
+        self.averager_opts = averager_opts or {}  # Store averager_opts for use in _make_gradient_averager and _make_state_averager
 
         super().__init__(
             optimizer=outer_optimizer,
@@ -2427,6 +2438,11 @@ class DiLoCoOptimizer(Optimizer):
                 # 따라서 외부에서 param_names를 제공해야 함
                 logger.warning("Cannot extract parameter names from optimizer. Please provide param_names when using selective layer update.")
         
+        # Merge averager_opts with kwargs for gradient averager
+        grad_averager_kwargs = {**kwargs}
+        if self.averager_opts:
+            grad_averager_kwargs.update(self.averager_opts)
+        
         grad_averager = DiLoCoGradAverager(
             dht=self.dht,
             prefix=f"{self.run_id}_grad_averager",
@@ -2457,7 +2473,7 @@ class DiLoCoOptimizer(Optimizer):
             enable_warmup=self.enable_warmup,
             warmup_epochs=self.warmup_epochs,
             galaxy_size=self.galaxy_size,  # galaxy_size 전달
-            **kwargs,
+            **grad_averager_kwargs,
         )
         
         # num_inner_steps를 grad_averager에 전달 (local step 동기화용)
@@ -2473,6 +2489,10 @@ class DiLoCoOptimizer(Optimizer):
         # kwargs에 target_group_size가 없으면 galaxy_size 사용
         if "target_group_size" not in kwargs:
             kwargs["target_group_size"] = self.galaxy_size if self.galaxy_size is not None else 4
+        
+        # Merge averager_opts with kwargs for state averager
+        if self.averager_opts:
+            kwargs.update(self.averager_opts)
         
         return DiLoCoStateAverager(
             dht=self.dht,
