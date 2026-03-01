@@ -4,6 +4,7 @@ Token-weighted aggregation mixin for DiLoCo averagers.
 This mixin provides token-weighted aggregation functionality that can be used
 by both DiLoCoGradAverager and DiLoCoStateAverager to avoid code duplication.
 """
+import math
 import time
 from typing import Dict, Optional
 
@@ -167,16 +168,24 @@ class TokenWeightedAggregationMixin:
             check_interval=0.1  # 0.1초마다 확인
         )
         
-        # 모든 노드의 token 수 합산
-        total_tokens = sum(token_counts.values())
+        # Weight 계산: token_weight_mode에 따라 다른 가중 함수 적용
+        token_weight_mode = getattr(self, 'token_weight_mode', 'linear')
         
-        # Weight 계산: 자신의 token 수 / 전체 token 수
-        if total_tokens > 0:
-            weight = self.cumulative_tokens / total_tokens
+        if token_weight_mode == "sqrt":
+            transformed_counts = {k: math.sqrt(v) for k, v in token_counts.items()}
+            local_transformed = math.sqrt(self.cumulative_tokens)
+        else:
+            transformed_counts = token_counts
+            local_transformed = self.cumulative_tokens
+        
+        total_transformed = sum(transformed_counts.values())
+        
+        if total_transformed > 0:
+            weight = local_transformed / total_transformed
             averaging_control.weight = weight
             logger.info(
-                f"{log_prefix}: local_tokens={self.cumulative_tokens}, "
-                f"total_tokens={total_tokens}, weight={weight:.6f}, num_peers={len(token_counts)}"
+                f"{log_prefix} [mode={token_weight_mode}]: local_tokens={self.cumulative_tokens}, "
+                f"total_tokens={sum(token_counts.values())}, weight={weight:.6f}, num_peers={len(token_counts)}"
             )
             # Weight 계산 후 DHT에서 token count 삭제 (다음 iteration에서 혼선 방지)
             self._delete_token_count_from_dht()

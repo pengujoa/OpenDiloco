@@ -110,6 +110,74 @@ def wait_for_all_nodes_local_step_complete(
     
     return wait_time
 
+
+def wait_for_all_nodes_validation_complete(
+    dht: DHT,
+    epoch: int,
+    expected_num_peers: int,
+    prefix: str,
+    log_fn=None,
+    timeout: float = 300.0,
+    check_interval: float = 0.1,
+) -> float:
+    """
+    모든 노드가 validation을 완료했는지 DHT를 통해 동기화합니다.
+
+    :param dht: DHT 인스턴스
+    :param epoch: 현재 epoch 번호
+    :param expected_num_peers: 예상되는 peer 수 (galaxy_size)
+    :param prefix: 고유 prefix (간섭 방지)
+    :param log_fn: 로깅 함수 (None이면 logger.info 사용)
+    :param timeout: 최대 대기 시간 (초)
+    :param check_interval: 확인 간격 (초)
+    :returns: 동기화 대기 시간 (초)
+    """
+    if log_fn is None:
+        log_fn = logger.info
+
+    validation_key = f"{prefix}:validation_complete:epoch_{epoch}"
+    worker_id = f"{socket.gethostname()}-pid{os.getpid()}"
+
+    now = get_dht_time()
+    payload = {
+        "epoch": epoch,
+        "completed": True,
+        "ts": now,
+        "host": socket.gethostname(),
+    }
+    exp = now + timeout
+    dht.store(key=validation_key, subkey=worker_id, value=payload, expiration_time=exp)
+
+    start_time = time.time()
+    while True:
+        elapsed_time = time.time() - start_time
+        if elapsed_time > timeout:
+            log_fn(f"Validation sync timeout after {timeout:.1f}s (epoch {epoch})")
+            break
+
+        res = dht.get(validation_key, latest=True)
+        root = unwrap(res) if res else None
+        completed_count = 0
+
+        if isinstance(root, dict):
+            for k, v in root.items():
+                p = unwrap(v)
+                if isinstance(p, dict) and p.get("completed") is True and p.get("epoch") == epoch:
+                    completed_count += 1
+
+        if completed_count >= expected_num_peers:
+            break
+
+        time.sleep(check_interval)
+
+    wait_time = time.time() - start_time
+
+    now = get_dht_time()
+    dht.store(key=validation_key, subkey=worker_id, value=None, expiration_time=now - 1)
+
+    return wait_time
+
+
 try:
     from .utils import found_inf_grad
     from .token_weighted_aggregation import TokenWeightedAggregationMixin
@@ -137,6 +205,7 @@ class DiLoCoStateAverager(TrainingStateAverager, TokenWeightedAggregationMixin):
         inner_optimizer: TorchOptimizer,
         scheduler: Optional[SchedulerFactory] = None,
         token_weighted_aggregation: bool = False,
+        token_weight_mode: str = "linear",
         **kwargs,
     ):
         self.inner_optimizer = inner_optimizer
@@ -144,6 +213,7 @@ class DiLoCoStateAverager(TrainingStateAverager, TokenWeightedAggregationMixin):
 
         # Token-weighted aggregation 지원 (mixin 초기화)
         self.token_weighted_aggregation = token_weighted_aggregation
+        self.token_weight_mode = token_weight_mode
         self.cumulative_tokens = 0
         self.token_count_key = None
         self.worker_id = None
@@ -379,6 +449,7 @@ class DiLoCoGradAverager(DecentralizedAverager, TokenWeightedAggregationMixin):
         gradient_magnitude_selection_mode: str = "layer",  # "layer" or "parameter"
         gradient_importance_metric: str = "magnitude",  # "magnitude" or "taylor"
         token_weighted_aggregation: bool = False,
+        token_weight_mode: str = "linear",  # "linear" or "sqrt"
         residual_norm_threshold: Optional[float] = None,
         enable_update_logs: bool = False,
         # Max Staleness (강제 업데이트) 기능
@@ -417,6 +488,7 @@ class DiLoCoGradAverager(DecentralizedAverager, TokenWeightedAggregationMixin):
         
         # Token-weighted aggregation 지원 (mixin 초기화)
         self.token_weighted_aggregation = token_weighted_aggregation
+        self.token_weight_mode = token_weight_mode
         self.cumulative_tokens = 0
         self.token_count_key = None
         self.worker_id = None
@@ -1624,14 +1696,13 @@ class DiLoCoGradAverager(DecentralizedAverager, TokenWeightedAggregationMixin):
         magnitudes = None
         new_mask = None
         
-        # Gradient importance scores 수집 함수 (병렬 실행용, 내부에서 시간 측정)
+        # Gradient importance scores 수집 함수 (병렬 실행용)
         def collect_magnitudes():
             if has_magnitude_config and has_param_names:
                 time_start = time.perf_counter()
-                # Metric에 따라 magnitude 또는 taylor 계산
                 if self.gradient_importance_metric == "taylor":
                     local_scores = self._compute_taylor_scores()
-                else:  # magnitude (default)
+                else:
                     local_scores = self._compute_gradient_magnitudes()
                 
                 magnitudes = self._collect_and_average_gradient_magnitudes(
@@ -1639,41 +1710,51 @@ class DiLoCoGradAverager(DecentralizedAverager, TokenWeightedAggregationMixin):
                     epoch=epoch if epoch is not None else 0,
                     timeout=timeout if timeout is not None else 300.0
                 )
-                time_end = time.perf_counter()
-                execution_time = time_end - time_start
-                return magnitudes, execution_time
-            return None, 0.0
+                elapsed = time.perf_counter() - time_start
+                logger.info(f"[TIMING] Gradient magnitude selection: {elapsed:.6f} sec")
+                return magnitudes
+            return None
         
-        # Token weight 계산 함수 (병렬 실행용, 내부에서 시간 측정)
+        # Token weight 계산 함수 (병렬 실행용)
         def compute_token_weight():
             if self.token_weighted_aggregation and control is not None:
                 time_start = time.perf_counter()
                 weight = self._compute_token_weight(control, log_prefix="GradAverager Token-weighted aggregation")
-                time_end = time.perf_counter()
-                execution_time = time_end - time_start
-                return weight, execution_time
-            return None, 0.0
+                elapsed = time.perf_counter() - time_start
+                logger.info(f"[TIMING] Token weight sync: {elapsed:.6f} sec")
+                return weight
+            return None
         
-        # 병렬로 실행
+        # Local step 동기화 (모든 노드가 local steps를 완료할 때까지 대기)
         sync_wait_time = 0.0
+        if (wait and self.num_inner_steps is not None and epoch is not None and self.expected_num_peers is not None):
+            try:
+                sync_wait_time = wait_for_all_nodes_local_step_complete(
+                    dht=self.dht,
+                    epoch=epoch,
+                    num_inner_steps=self.num_inner_steps,
+                    expected_num_peers=self.expected_num_peers,
+                    prefix=self.prefix,
+                    log_fn=lambda msg: None,
+                    timeout=timeout if timeout is not None else 300.0,
+                )
+            except Exception as e:
+                logger.warning(f"Failed to synchronize local step completion via DHT: {e}. Proceeding anyway.")
+
+        # 병렬로 실행
         token_weight_result = None
-        token_weight_wait_time = 0.0
-        magnitude_selection_time = 0.0
         
         if (has_magnitude_config and has_param_names) and self.token_weighted_aggregation:
-            # 두 작업 모두 병렬 실행
             with ThreadPoolExecutor(max_workers=2) as executor:
                 magnitude_future = executor.submit(collect_magnitudes)
                 token_weight_future = executor.submit(compute_token_weight)
                 
-                magnitudes, magnitude_selection_time = magnitude_future.result()
-                token_weight_result, token_weight_wait_time = token_weight_future.result()
+                magnitudes = magnitude_future.result()
+                token_weight_result = token_weight_future.result()
         elif has_magnitude_config and has_param_names:
-            # Gradient magnitude만 실행
-            magnitudes, magnitude_selection_time = collect_magnitudes()
+            magnitudes = collect_magnitudes()
         elif self.token_weighted_aggregation:
-            # Token weight만 실행
-            token_weight_result, token_weight_wait_time = compute_token_weight()
+            token_weight_result = compute_token_weight()
         
         # Warm-up: 초기 epoch 동안은 모든 레이어 전송
         effective_top_k_ratio = self.gradient_magnitude_top_k_ratio
@@ -1831,10 +1912,8 @@ class DiLoCoGradAverager(DecentralizedAverager, TokenWeightedAggregationMixin):
                 except Exception as e:
                     logger.warning(f"Failed to send _update_averaged_tensors: {e}")
         
-        # Token weight 설정
-        if token_weight_result is not None:
-            sync_wait_time = token_weight_wait_time
-        elif 'weight' in kwargs:
+        # Token weight 설정 (token_weight_result가 있으면 _compute_token_weight에서 이미 설정됨)
+        if token_weight_result is None and 'weight' in kwargs:
             control.weight = kwargs['weight']
             kwargs.pop('weight', None)
         
@@ -1848,29 +1927,8 @@ class DiLoCoGradAverager(DecentralizedAverager, TokenWeightedAggregationMixin):
 
         control.allow_allreduce()
 
-        # Local step 동기화 (token_weighted_aggregation이 비활성화된 경우만)
-        if (not self.token_weighted_aggregation and 
-            wait and self.num_inner_steps is not None and epoch is not None and self.expected_num_peers is not None):
-            try:
-                sync_wait_time = wait_for_all_nodes_local_step_complete(
-                    dht=self.dht,
-                    epoch=epoch,
-                    num_inner_steps=self.num_inner_steps,
-                    expected_num_peers=self.expected_num_peers,
-                    prefix=self.prefix,  # 각 averager의 고유 prefix 사용 (간섭 방지)
-                    log_fn=lambda msg: None,  # 로그 제거
-                    timeout=timeout if timeout is not None else 300.0,
-                )
-            except Exception as e:
-                logger.warning(f"Failed to synchronize local step completion via DHT: {e}. Proceeding with control.result() anyway.")
-
         # 시간 측정 로그 출력
-        logger.log(
-            logging.INFO,
-            f"[TIMING] Gradient magnitude selection: {magnitude_selection_time:.6f} sec, "
-            f"Token weight sync: {token_weight_wait_time:.6f} sec, "
-            f"Sync wait (GPU idle): {sync_wait_time:.6f} sec"
-        )
+        logger.info(f"[TIMING] Sync wait (GPU idle): {sync_wait_time:.6f} sec")
         
         # return control.result(timeout) if wait else control
         if wait:
@@ -2268,6 +2326,7 @@ class DiLoCoOptimizer(Optimizer):
         gradient_importance_metric: str = "magnitude",  # "magnitude" or "taylor"
         param_names: Optional[List[str]] = None,
         token_weighted_aggregation: bool = False,
+        token_weight_mode: str = "linear",  # "linear" or "sqrt"
         residual_norm_threshold: Optional[float] = None,
         enable_update_logs: bool = False,
         # Max Staleness (강제 업데이트) 기능
@@ -2293,6 +2352,7 @@ class DiLoCoOptimizer(Optimizer):
         self.gradient_magnitude_selection_mode = gradient_magnitude_selection_mode
         self.gradient_importance_metric = gradient_importance_metric
         self.token_weighted_aggregation = token_weighted_aggregation
+        self.token_weight_mode = token_weight_mode
         self.residual_norm_threshold = residual_norm_threshold
         self.enable_update_logs = enable_update_logs
         # Max Staleness 및 Warm-up 설정
@@ -2466,6 +2526,7 @@ class DiLoCoOptimizer(Optimizer):
             gradient_magnitude_selection_mode=self.gradient_magnitude_selection_mode,
             gradient_importance_metric=getattr(self, 'gradient_importance_metric', 'magnitude'),
             token_weighted_aggregation=self.token_weighted_aggregation,
+            token_weight_mode=self.token_weight_mode,
             residual_norm_threshold=self.residual_norm_threshold,
             enable_update_logs=self.enable_update_logs,
             enable_max_staleness=self.enable_max_staleness,
