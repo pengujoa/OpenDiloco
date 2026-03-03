@@ -10,7 +10,10 @@ from torch.utils.data import IterableDataset
 import wandb
 
 
-_WRAPPED_NAME_TO_REMOVE = ["_forward_module.", "_fsdp_wrapped_module.", "_orig_mod."]
+_WRAPPED_NAME_TO_REMOVE = [
+    "_forward_module.", "_fsdp_wrapped_module.", "_orig_mod.",
+    "_tp_wrapped.",
+]
 
 
 def _remove_fsdp_prefix(name: str) -> str:
@@ -116,6 +119,13 @@ def get_compression_kwargs(hivemind_compression: str | None) -> dict:
 
         ret_kwargs["grad_compression"] = BlockwiseQuantization()
         ret_kwargs["state_averaging_compression"] = BlockwiseQuantization()
+
+    elif hivemind_compression == "sign1bit":
+        from hivemind.compression.sign_compression import SignBitCompression
+        from hivemind import NoCompression
+
+        ret_kwargs["grad_compression"] = SignBitCompression()
+        ret_kwargs["state_averaging_compression"] = NoCompression()
     else:
         raise ValueError(f"Invalid hivemind_compression: {hivemind_compression}")
     return ret_kwargs

@@ -74,12 +74,20 @@ def save_checkpoint(
     fs_storage_writer = dcp.FsspecWriter(checkpoint_path, sync_files=False)
     # for some reason sync_files = True try to call stream.fileno which is not supported with gcp ffspec storage.
 
-    model_state_dict, optimizer_state_dict = get_state_dict(model, optimizer)
-    dcp_state_dict = {
-        "model": model_state_dict,
-        "optimizer": optimizer_state_dict,
-    }
-    dcp.save(dcp_state_dict, storage_writer=fs_storage_writer)
+    try:
+        model_state_dict, optimizer_state_dict = get_state_dict(model, optimizer)
+        dcp_state_dict = {
+            "model": model_state_dict,
+            "optimizer": optimizer_state_dict,
+        }
+        dcp.save(dcp_state_dict, storage_writer=fs_storage_writer)
+    except Exception as e:
+        logger.warning(f"DCP get_state_dict failed ({e}), falling back to plain state_dict")
+        dcp_state_dict = {
+            "model": model.state_dict(),
+            "optimizer": optimizer.state_dict(),
+        }
+        dcp.save(dcp_state_dict, storage_writer=fs_storage_writer)
     if data_loader is not None:
         rank_state_dict = {}
         rank_state_dict["data_loader"] = data_loader.state_dict()
@@ -128,8 +136,13 @@ def load_checkpoint(
     # 1. Load distributed states
     fs_storage_reader = dcp.FsspecReader(checkpoint_path)
 
-    model_state_dict, optimizer_state_dict = get_state_dict(model, optimizer)
-    
+    try:
+        model_state_dict, optimizer_state_dict = get_state_dict(model, optimizer)
+    except Exception as e:
+        logger.warning(f"DCP get_state_dict failed ({e}), falling back to plain state_dict")
+        model_state_dict = model.state_dict()
+        optimizer_state_dict = optimizer.state_dict()
+
     if lora:
         model_state_dict_cnvt = {}
         optimizer_state_dict_cnvt = {"state":{}, "param_groups":[]}
@@ -149,12 +162,18 @@ def load_checkpoint(
         }
 
     dcp.load(dcp_state_dict, storage_reader=fs_storage_reader)
-    set_state_dict(
-        model,
-        optimizer,
-        model_state_dict=model_state_dict,
-        optim_state_dict=optimizer_state_dict,
-    )
+    try:
+        set_state_dict(
+            model,
+            optimizer,
+            model_state_dict=model_state_dict,
+            optim_state_dict=optimizer_state_dict,
+        )
+    except Exception as e:
+        logger.warning(f"DCP set_state_dict failed ({e}), falling back to load_state_dict")
+        model.load_state_dict(dcp_state_dict.get("model", model_state_dict), strict=False)
+        if "optimizer" in dcp_state_dict:
+            optimizer.load_state_dict(dcp_state_dict["optimizer"])
     if lora & (dataset!="allenai/c4"):
         pass
     else:

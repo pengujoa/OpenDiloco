@@ -460,6 +460,8 @@ class DiLoCoGradAverager(DecentralizedAverager, TokenWeightedAggregationMixin):
         warmup_epochs: int = 5,  # 초기 N epoch 동안은 모든 파라미터 전송
         # Galaxy size (고정된 peer 수)
         galaxy_size: Optional[int] = None,
+        # Outer sign update: 통신 전에 pseudo-gradient에 sign()을 적용
+        outer_sign_update: bool = False,
         **kwargs,
     ):
         if "client_mode" in kwargs:
@@ -495,6 +497,8 @@ class DiLoCoGradAverager(DecentralizedAverager, TokenWeightedAggregationMixin):
         self.expected_num_peers = None
         # Galaxy size 저장 (expected_num_peers의 fallback으로 사용)
         self.galaxy_size = galaxy_size
+        # Outer sign update: 통신 전에 sign() 적용 여부
+        self.outer_sign_update = outer_sign_update
 
         # Local step 동기화를 위한 정보 저장
         self.num_inner_steps = None  # 나중에 설정됨
@@ -1996,17 +2000,17 @@ class DiLoCoGradAverager(DecentralizedAverager, TokenWeightedAggregationMixin):
                                 f"이는 초기화 시점과 step 시점의 param_update_mask가 다르거나, "
                                 f"opt_parameters와 main_parameters의 순서가 일치하지 않을 수 있습니다."
                             )
-                        # Gradient 정보 기록 (enable_update_logs가 True인 경우에만)
-                        averaged_grads[grad_idx].copy_(grad, non_blocking=True)
                         if self.enable_update_logs and update_records:
-                            # 업데이트 정보 기록 (gradient norm 및 선택 여부 포함)
                             update_records.append({
                                 'param_idx': param_idx,
                                 'param_name': param_name,
                                 'grad_norm': float(grad.norm().item()),
-                                'was_selected': True,  # 이 블록에 들어왔으므로 선택됨
-                                'was_forced_by_residual': False,  # residual은 더 이상 사용하지 않음
+                                'was_selected': True,
+                                'was_forced_by_residual': False,
                             })
+                        if self.outer_sign_update:
+                            grad = torch.sign(grad)
+                        averaged_grads[grad_idx].copy_(grad, non_blocking=True)
                         
                         updated_param_names.append(param_name)
                         grad_idx += 1
@@ -2031,19 +2035,19 @@ class DiLoCoGradAverager(DecentralizedAverager, TokenWeightedAggregationMixin):
                             f"grad의 크기는 {grad.shape}입니다. param_idx={param_idx}, param_name={param_name}. "
                             f"opt_parameters와 main_parameters의 순서가 일치하지 않을 수 있습니다."
                         )
-                    # Gradient 정보 기록 (enable_update_logs가 True인 경우에만)
-                    averaged_grads[grad_idx].copy_(grad, non_blocking=True)
                     if self.enable_update_logs and update_records:
-                        # 업데이트 정보 기록 (gradient norm 및 선택 여부 포함)
                         update_records.append({
                             'param_idx': param_idx,
                             'param_name': param_name,
                             'grad_norm': float(grad.norm().item()),
-                            'was_selected': True,  # 이 블록에 들어왔으므로 선택됨
-                            'was_forced_by_residual': False,  # residual은 더 이상 사용하지 않음
+                            'was_selected': True,
+                            'was_forced_by_residual': False,
                         })
+                    if self.outer_sign_update:
+                        grad = torch.sign(grad)
+                    averaged_grads[grad_idx].copy_(grad, non_blocking=True)
                     
-                    if not updated_param_names:  # 첫 번째 호출 시에만 로깅
+                    if not updated_param_names:
                         updated_param_names.append(param_name)
                     grad_idx += 1
                 param_idx += 1
@@ -2340,6 +2344,12 @@ class DiLoCoOptimizer(Optimizer):
         gradient_clip_norm: float = 1.0,
         # Galaxy size (고정된 peer 수)
         galaxy_size: Optional[int] = None,
+        # Outer sign update: pseudo-gradient에 sign()을 적용
+        outer_sign_update: bool = False,
+        # Outer LR scheduling (sign update 시 필수)
+        outer_lr_scheduler_type: str = "constant",  # "constant", "cosine", "linear"
+        outer_warmup_steps: int = 0,
+        max_outer_optimization_steps: Optional[int] = None,
         **kwargs,
     ):
         self._check_kwargs(kwargs)
@@ -2365,6 +2375,10 @@ class DiLoCoOptimizer(Optimizer):
         self.gradient_clip_norm = gradient_clip_norm
         # Galaxy size 저장 (expected_num_peers로 사용)
         self.galaxy_size = galaxy_size
+        # Outer sign update 저장
+        self.outer_sign_update = outer_sign_update
+        if outer_sign_update:
+            logger.info("Outer sign update ENABLED: sign(Δθ) will be sent before communication (Majority Vote)")
         if selective_layer_patterns is not None or gradient_magnitude_threshold is not None or gradient_magnitude_top_k_ratio is not None:
             if param_names is None:
                 # param_names가 제공되지 않으면 모델에서 직접 추출 시도
@@ -2445,11 +2459,68 @@ class DiLoCoOptimizer(Optimizer):
         # state_averager에 grad_averager 참조 설정 (skip된 파라미터 보호를 위해)
         self.state_averager.grad_averager = self.diloco_grad_averager
 
+        # Outer LR scheduler 생성
+        self.outer_lr_scheduler = self._create_outer_lr_scheduler(
+            outer_lr_scheduler_type, outer_warmup_steps, max_outer_optimization_steps
+        )
+
         # Model Parallel 지원을 위한 outer step hook
         # pre_outer_step_hook: _update_global_epoch 시작 시 호출 (TP/PP gather용)
         # post_outer_step_hook: _update_global_epoch 종료 시 호출 (TP/PP scatter용)
         self.pre_outer_step_hook: Optional[Callable] = None
         self.post_outer_step_hook: Optional[Callable] = None
+
+    def _create_outer_lr_scheduler(
+        self, scheduler_type: str, warmup_steps: int, max_steps: Optional[int]
+    ) -> Optional[torch.optim.lr_scheduler.LambdaLR]:
+        """Outer optimizer용 LR scheduler 생성.
+        
+        sign update 시 gradient magnitude가 ±1로 고정되므로
+        LR이 step size의 유일한 제어 변수가 됩니다.
+        """
+        if scheduler_type == "constant" and warmup_steps == 0:
+            return None
+
+        if max_steps is None or max_steps <= 0:
+            logger.warning(
+                "outer_lr_scheduler_type=%s but max_outer_optimization_steps is not set. "
+                "Outer LR scheduling disabled.", scheduler_type
+            )
+            return None
+
+        outer_optimizer = self.state_averager.optimizer
+        base_lr = outer_optimizer.param_groups[0]["lr"]
+
+        if scheduler_type == "cosine":
+            import math
+            def lr_lambda(current_step: int) -> float:
+                if current_step < warmup_steps:
+                    return max(current_step / max(warmup_steps, 1), 1e-8)
+                progress = (current_step - warmup_steps) / max(max_steps - warmup_steps, 1)
+                return max(0.5 * (1.0 + math.cos(math.pi * progress)), 1e-8)
+
+        elif scheduler_type == "linear":
+            def lr_lambda(current_step: int) -> float:
+                if current_step < warmup_steps:
+                    return max(current_step / max(warmup_steps, 1), 1e-8)
+                progress = (current_step - warmup_steps) / max(max_steps - warmup_steps, 1)
+                return max(1.0 - progress, 1e-8)
+
+        elif scheduler_type == "constant":
+            def lr_lambda(current_step: int) -> float:
+                if current_step < warmup_steps:
+                    return max(current_step / max(warmup_steps, 1), 1e-8)
+                return 1.0
+
+        else:
+            raise ValueError(f"Unknown outer_lr_scheduler_type: {scheduler_type}")
+
+        scheduler = torch.optim.lr_scheduler.LambdaLR(outer_optimizer, lr_lambda)
+        logger.info(
+            f"Outer LR scheduler created: type={scheduler_type}, warmup={warmup_steps}, "
+            f"max_steps={max_steps}, base_lr={base_lr}"
+        )
+        return scheduler
 
     def _check_kwargs(self, kwargs) -> None:
         """DiLoCo Optimizer only support a subset of Hivemind Optimizer kwargs.
@@ -2508,6 +2579,8 @@ class DiLoCoOptimizer(Optimizer):
         grad_averager_kwargs = {**kwargs}
         if self.averager_opts:
             grad_averager_kwargs.update(self.averager_opts)
+        if self.outer_sign_update:
+            grad_averager_kwargs["return_deltas"] = False
         
         grad_averager = DiLoCoGradAverager(
             dht=self.dht,
@@ -2540,6 +2613,7 @@ class DiLoCoOptimizer(Optimizer):
             enable_warmup=self.enable_warmup,
             warmup_epochs=self.warmup_epochs,
             galaxy_size=self.galaxy_size,  # galaxy_size 전달
+            outer_sign_update=self.outer_sign_update,
             **grad_averager_kwargs,
         )
         
@@ -2860,6 +2934,15 @@ class DiLoCoOptimizer(Optimizer):
                 f"Time taken for state_averager_step: {time_1_state_averager_step - time_0_state_averager_step} sec",
             )
 
+            # Outer LR scheduler step (outer optimizer step 이후)
+            if self.outer_lr_scheduler is not None and should_perform_optimizer_step:
+                self.outer_lr_scheduler.step()
+                current_outer_lr = self.state_averager.optimizer.param_groups[0]["lr"]
+                logger.log(
+                    self.status_loglevel,
+                    f"Outer LR scheduler stepped: lr={current_outer_lr:.8f} (epoch={self.local_epoch})"
+                )
+
             if not should_average_state and self.scheduled_state is not None and not self.scheduled_state.done():
                 self.scheduled_state.cancel()
             self.scheduled_state = None
@@ -2952,11 +3035,21 @@ class DiLoCoOptimizer(Optimizer):
         """Load averaged gradients from diloco_grad_averager into outer optimizer's gradient buffers
         
         custom_gradients=True이므로 통신된 averaged gradient를 수동으로 outer optimizer에 로드합니다.
+        outer_sign_update=True인 경우, gradient에 sign()을 적용하여 uniform magnitude로 변환합니다.
         """
         outer_params = [param for group in self.state_averager.optimizer.param_groups for param in group["params"]]
         
         # param_update_mask 확인 (selective layer update가 활성화된 경우)
         param_update_mask = getattr(self.diloco_grad_averager, 'param_update_mask', None)
+        
+        def _apply_grad(opt_param, grad_tensor):
+            """averaged gradient를 opt_param.grad에 설정 (sign 변환 포함)"""
+            if self.outer_sign_update:
+                grad_tensor = torch.sign(grad_tensor)
+            if opt_param.grad is None:
+                opt_param.grad = grad_tensor.clone()
+            else:
+                opt_param.grad.copy_(grad_tensor, non_blocking=True)
         
         # diloco_grad_averager에서 averaged gradient 가져오기
         with self.diloco_grad_averager.get_tensors() as averaged_grads:
@@ -2966,34 +3059,23 @@ class DiLoCoOptimizer(Optimizer):
             for opt_param in outer_params:
                 if param_update_mask is not None:
                     if param_update_mask[param_idx]:
-                        # 선택된 파라미터: averaged gradient를 opt_param.grad에 설정
                         if grad_idx >= len(averaged_grads):
                             raise RuntimeError(
                                 f"grad_idx ({grad_idx})가 averaged_grads의 길이 ({len(averaged_grads)})를 초과했습니다."
                             )
-                        averaged_grad = averaged_grads[grad_idx]
-                        if opt_param.grad is None:
-                            opt_param.grad = averaged_grad.clone()
-                        else:
-                            opt_param.grad.copy_(averaged_grad, non_blocking=True)
+                        _apply_grad(opt_param, averaged_grads[grad_idx])
                         grad_idx += 1
                     else:
-                        # Skip된 파라미터: gradient를 0으로 설정
                         if opt_param.grad is None:
                             opt_param.grad = torch.zeros_like(opt_param)
                         else:
                             opt_param.grad.zero_()
                 else:
-                    # 모든 파라미터 업데이트: averaged gradient를 opt_param.grad에 설정
                     if grad_idx >= len(averaged_grads):
                         raise RuntimeError(
                             f"grad_idx ({grad_idx})가 averaged_grads의 길이 ({len(averaged_grads)})를 초과했습니다."
                         )
-                    averaged_grad = averaged_grads[grad_idx]
-                    if opt_param.grad is None:
-                        opt_param.grad = averaged_grad.clone()
-                    else:
-                        opt_param.grad.copy_(averaged_grad, non_blocking=True)
+                    _apply_grad(opt_param, averaged_grads[grad_idx])
                     grad_idx += 1
                 param_idx += 1
 

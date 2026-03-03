@@ -167,12 +167,11 @@ def measure_steps_per_second_with_model(
     gradient_accumulation_steps=1, vocab_size=32000,
 ):
     """
-    실제 FSDP 모델을 사용하여 학습 속도를 측정합니다.
-    축소 모델 대신 실제 학습에 쓰이는 모델로 벤치마크하여,
-    이기종 GPU 간 속도 비율을 정확하게 측정합니다.
+    실제 모델을 사용하여 학습 속도를 측정합니다.
+    FSDP, TP, PP 등 다양한 병렬화 전략의 모델을 지원합니다.
 
     Args:
-        model: FSDP-wrapped model (already on GPU)
+        model: wrapped model (FSDP, TP, PP, or plain — already on GPU)
         batch_size: per-device micro batch size
         seq_length: sequence length
         precision: "fp16-mixed", "bf16-mixed", or "32-true"
@@ -226,8 +225,10 @@ def measure_steps_per_second_with_model(
                     loss = outputs.loss / gradient_accumulation_steps
                 temp_scaler.scale(loss).backward()
         if use_scaler:
-            temp_scaler.unscale_(temp_optimizer)
-        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            from model_parallel_utils import mp_scaler_unscale_
+            mp_scaler_unscale_(temp_scaler, temp_optimizer, model)
+        from model_parallel_utils import mp_clip_grad_norm_
+        mp_clip_grad_norm_(model, 1.0)
         temp_scaler.step(temp_optimizer)
         temp_scaler.update()
 
@@ -259,7 +260,7 @@ def measure_steps_per_second_with_model(
     variance = sum((x - mean_steps_per_sec) ** 2 for x in elapsed_times) / len(elapsed_times)
     std_steps_per_sec = variance ** 0.5
 
-    print(f"[Speed Profiler] Actual FSDP model benchmark (GA={gradient_accumulation_steps})")
+    print(f"[Speed Profiler] Model benchmark (GA={gradient_accumulation_steps})")
     print(f"[Speed Profiler] Runs: {NUM_RUNS}, Steps/run: {BENCHMARK_STEPS}")
     print(f"[Speed Profiler] Mean: {mean_steps_per_sec:.4f}, Median: {median_steps_per_sec:.4f}, Std: {std_steps_per_sec:.4f} steps/sec")
     print(f"[Speed Profiler] Individual runs: {[f'{x:.4f}' for x in elapsed_times]}")

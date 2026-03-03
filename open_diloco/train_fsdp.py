@@ -208,7 +208,7 @@ class HvConfig(BaseConfig):
     announce_maddrs: list[str] | None = None
     matchmaking_time: float | None = None
     averaging_timeout: float | None = None
-    hivemind_compression: Literal["fp16", "scaled-fp16", "uniform8bit", "quantile8bit", "blockwise8bit"] | None = None
+    hivemind_compression: Literal["fp16", "scaled-fp16", "uniform8bit", "quantile8bit", "blockwise8bit", "sign1bit"] | None = None
     all_reduce_strategy: AllReduceStrategy = AllReduceStrategy.WAIT_FOR_ALL
     timeout_waiting_for_peers: float | None = None
     skip_load_from_peers: bool = False
@@ -241,6 +241,11 @@ class HvConfig(BaseConfig):
     # Gradient Clipping
     enable_gradient_clipping: bool = False  # If True, apply gradient clipping before outer optimizer update
     gradient_clip_norm: float = 1.0  # Maximum gradient norm for clipping
+    # Outer sign update: pseudo-gradient에 sign()을 적용하여 Lion처럼 uniform magnitude로 업데이트
+    outer_sign_update: bool = False
+    # Outer LR scheduling (outer_sign_update=True일 때 필수적 - sign update로 magnitude 정보가 사라지므로 LR이 step size의 유일한 제어 변수)
+    outer_lr_scheduler_type: Literal["constant", "cosine", "linear"] = "constant"
+    outer_warmup_steps: int = 0  # outer optimization step 기준 warmup
     # Throughput adaptive sizing
     use_throughput_adaptive_sizing: bool = True  # If True, use throughput from previous rounds to adaptively adjust tensor partitioning
 
@@ -989,6 +994,19 @@ def train(config: Config):
 
     if config.hv is not None:
         outer_optimizer = partial(torch.optim.SGD, lr=config.hv.outer_lr, momentum=0.9, nesterov=True)
+        log(f"Using Nesterov SGD outer optimizer (lr={config.hv.outer_lr})")
+        if config.hv.outer_sign_update:
+            log(f"Outer sign update ENABLED: pseudo-gradients will be converted to sign() before outer optimizer step")
+            if config.hv.hivemind_compression == "sign1bit":
+                log(f"hivemind_compression='sign1bit': 1-bit packing enabled (return_deltas=False)")
+            elif config.hv.hivemind_compression is not None:
+                log(f"hivemind_compression='{config.hv.hivemind_compression}' (not 'sign1bit'). 1-bit packing disabled.")
+            else:
+                log(f"hivemind_compression not set: using default NoCompression (return_deltas=False)")
+            if config.hv.outer_lr_scheduler_type != "constant" or config.hv.outer_warmup_steps > 0:
+                log(f"Outer LR scheduling: type={config.hv.outer_lr_scheduler_type}, warmup={config.hv.outer_warmup_steps}, max_steps={config.hv.max_outer_optimization_steps}")
+            elif config.hv.outer_lr_scheduler_type == "constant" and config.hv.outer_warmup_steps == 0:
+                log(f"WARNING: outer_sign_update=True but outer_lr_scheduler_type='constant'. Consider enabling LR decay for better convergence.")
 
     if config.inner_optimizer_type == "lion":
         def scheduler_fn(opt):
@@ -1101,6 +1119,10 @@ def train(config: Config):
             enable_gradient_clipping=config.hv.enable_gradient_clipping,
             gradient_clip_norm=config.hv.gradient_clip_norm,
             galaxy_size=config.hv.galaxy_size,  # 고정된 peer 수로 사용
+            outer_sign_update=config.hv.outer_sign_update,
+            outer_lr_scheduler_type=config.hv.outer_lr_scheduler_type,
+            outer_warmup_steps=config.hv.outer_warmup_steps,
+            max_outer_optimization_steps=config.hv.max_outer_optimization_steps,
         )
 
         diloco_args.update(get_compression_kwargs(config.hv.hivemind_compression))
