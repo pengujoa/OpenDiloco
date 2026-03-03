@@ -2445,6 +2445,12 @@ class DiLoCoOptimizer(Optimizer):
         # state_averager에 grad_averager 참조 설정 (skip된 파라미터 보호를 위해)
         self.state_averager.grad_averager = self.diloco_grad_averager
 
+        # Model Parallel 지원을 위한 outer step hook
+        # pre_outer_step_hook: _update_global_epoch 시작 시 호출 (TP/PP gather용)
+        # post_outer_step_hook: _update_global_epoch 종료 시 호출 (TP/PP scatter용)
+        self.pre_outer_step_hook: Optional[Callable] = None
+        self.post_outer_step_hook: Optional[Callable] = None
+
     def _check_kwargs(self, kwargs) -> None:
         """DiLoCo Optimizer only support a subset of Hivemind Optimizer kwargs.
         This function raise an error if some kwargs are not supported"""
@@ -2681,6 +2687,9 @@ class DiLoCoOptimizer(Optimizer):
 
         NOTE: this has been mostly copied from hivemind.Optimizer._update_global_epoch, except highlighted lines
         """
+        if self.pre_outer_step_hook is not None:
+            self.pre_outer_step_hook()
+
         assert self._schema_hash == self._compute_schema_hash(), "parameters changed during iteration"
         _epoch_start_time = time.perf_counter()
 
@@ -2874,6 +2883,10 @@ class DiLoCoOptimizer(Optimizer):
                 self.status_loglevel,
                 f"Time taken for update_main_param: {time_1_update_main_param - time_0_update_main_param} sec",
             )
+
+            if self.post_outer_step_hook is not None:
+                self.post_outer_step_hook()
+
             logger.log(self.status_loglevel, f"Transitioning to epoch {self.local_epoch}")
 
     def _make_progress_tracker(self, target_batch_size: int, **kwargs) -> DiloCoProgressTracker:
@@ -2997,15 +3010,16 @@ class DiLoCoOptimizer(Optimizer):
         
         Note: inner optimizer의 파라미터는 main_parameters와 같은 객체를 참조하므로,
         실제로는 복사가 필요 없지만, 명시적으로 동기화를 보장하기 위해 유지됩니다.
-        PyTorch Optimizer는 파라미터 객체 자체를 참조하므로 별도 복사가 필요 없으나,
-        안전을 위해 방향을 Main → Inner로 명확히 합니다.
+
+        Model Parallel (TP/PP) 모드: inner optimizer의 파라미터가 DTensor일 수 있음.
+        이 경우 post_outer_step_hook이 scatter를 처리하므로 여기서는 skip.
         """
+        if self.post_outer_step_hook is not None:
+            return
+
         opt_parameters = [param for group in self.inner_optimizer.param_groups for param in group["params"]]
         
         for main_param, opt_param in zip(self.state_averager.main_parameters, opt_parameters):
-            # inner optimizer의 파라미터와 main_parameters는 같은 객체를 참조하므로,
-            # _apply_optimizer_parameters_()에서 이미 선택적 업데이트가 처리되었습니다.
-            # 여기서는 모든 파라미터를 복사해도 됩니다 (같은 객체이므로 결과는 동일).
             main_param.data.copy_(opt_param.data, non_blocking=True)
 
     def _maybe_schedule_gradient_averaging(self) -> None:

@@ -47,6 +47,7 @@ from transformers import (
     LlamaConfig,
     LlamaForCausalLM,
     get_cosine_schedule_with_warmup,
+    get_linear_schedule_with_warmup,
 )
 from torch.distributed.fsdp import (
     FullyShardedDataParallel as FSDP,
@@ -270,6 +271,14 @@ class Config(BaseConfig):
     total_steps: int = 88_000
     sharding_strategy: str = "NO_SHARD"
     precision: Literal["fp16-mixed", "bf16-mixed", "32-true"] = "fp16-mixed"
+    # Inner optimizer selection: "adamw" or "lion"
+    # Lion 선택 시 lr/weight_decay가 자동 스케일링됨 (lion_lr_scale, lion_wd_scale)
+    inner_optimizer_type: Literal["adamw", "lion"] = "adamw"
+    inner_weight_decay: float = 0.1
+    inner_betas: tuple[float, float] = (0.9, 0.95)
+    lion_lr_scale: float = 0.3      # Lion 사용 시 lr *= lion_lr_scale (논문 권장: 0.1~0.3)
+    lion_wd_scale: float = 3.0      # Lion 사용 시 weight_decay *= lion_wd_scale (논문 권장: 3~10)
+    lion_betas: tuple[float, float] = (0.95, 0.98)  # 언어 모델링 권장값 (vision 기본값: 0.9, 0.99)
     # Checkpointing and logging
     project: str = "hivemind_debug"
     metric_logger_type: Literal["wandb", "dummy"] = "wandb"
@@ -761,40 +770,27 @@ def train(config: Config):
 
     train_dataloader, actual_total_batch_size, actual_per_device_batch_size = get_dataloader(tokenizer, world_size, rank, local_rank, config, dht=dht if config.hv is not None else None)
     
-    # Adjust Inner Optimizer (AdamW) learning rate based on actual per_device batch size
+    # Adjust Inner Optimizer learning rate based on actual per_device batch size
     # Using Linear Scaling Rule: LR_new = LR_base * (batch_size_new / batch_size_base)
-    # 
     # Reference: "Accurate, Large Minibatch SGD: Training ImageNet in 1 Hour" (Goyal et al., 2017)
-    # 
-    # base_batch_size: the per_device batch size that the learning rate was originally tuned for
-    # Fixed to 512 - the reference per_device batch size where LR was optimized
-    # 
-    # Note: AdamW is adaptive and may be less sensitive to batch size scaling than SGD,
-    # but linear scaling is still a good starting point. For very small batch sizes,
-    # we apply a more conservative scaling to avoid training instability.
+    # For very small batch sizes (< 1/4 base), sqrt scaling is used for stability.
     base_batch_size = 512  # Fixed base per_device batch size for learning rate scaling
     
     # Initial LR adjustment (only if enabled)
     if config.initial_lr_adjust:
         if actual_per_device_batch_size != base_batch_size:
-            # Linear scaling factor
             lr_scale_factor = actual_per_device_batch_size / base_batch_size
             
-            # For very small batch sizes (< 1/4 of base), apply more conservative scaling
-            # to avoid training instability due to high gradient noise
-            # Use sqrt scaling for very small batches: more conservative than linear
             if actual_per_device_batch_size < base_batch_size / 4:
-                # Apply sqrt scaling for very small batches: sqrt(batch_new / batch_base)
                 conservative_scale_factor = math.sqrt(actual_per_device_batch_size / base_batch_size)
                 adjusted_lr = config.lr * conservative_scale_factor
                 scaling_method = "sqrt (conservative for small batch)"
             else:
-                # Standard linear scaling for normal batch sizes
                 adjusted_lr = config.lr * lr_scale_factor
                 scaling_method = "linear"
             
             if rank == 0:
-                log(f"Inner Optimizer LR adjustment ({scaling_method}):")
+                log(f"Inner Optimizer ({config.inner_optimizer_type}) LR adjustment ({scaling_method}):")
                 log(f"  Base LR: {config.lr:.2e} (tuned for per_device_batch_size={base_batch_size})")
                 log(f"  Actual per_device_batch_size: {actual_per_device_batch_size}")
                 log(f"  Total batch_size: {actual_total_batch_size} (reference only)")
@@ -806,14 +802,26 @@ def train(config: Config):
                     log(f"  Scale factor: {lr_scale_factor:.3f} (linear scaling)")
                 log(f"  Adjusted LR: {adjusted_lr:.2e}")
             
-            # Update config.lr for optimizer initialization
             config.lr = adjusted_lr
         else:
             if rank == 0:
-                log(f"Inner Optimizer LR: {config.lr:.2e} (no adjustment needed, per_device_batch_size={actual_per_device_batch_size} matches base)")
+                log(f"Inner Optimizer ({config.inner_optimizer_type}) LR: {config.lr:.2e} (no adjustment needed, per_device_batch_size={actual_per_device_batch_size} matches base)")
     else:
         if rank == 0:
-            log(f"Inner Optimizer LR: {config.lr:.2e} (initial_lr_adjust=False, using configured LR without adjustment)")
+            log(f"Inner Optimizer ({config.inner_optimizer_type}) LR: {config.lr:.2e} (initial_lr_adjust=False, using configured LR without adjustment)")
+
+    # Lion optimizer auto-scaling: AdamW 기준 하이퍼파라미터를 Lion에 맞게 자동 변환
+    if config.inner_optimizer_type == "lion":
+        original_lr = config.lr
+        original_wd = config.inner_weight_decay
+        config.lr = config.lr * config.lion_lr_scale
+        config.inner_weight_decay = config.inner_weight_decay * config.lion_wd_scale
+        config.inner_betas = config.lion_betas
+        if rank == 0:
+            log(f"Lion auto-scaling applied:")
+            log(f"  LR: {original_lr:.2e} * {config.lion_lr_scale} = {config.lr:.2e}")
+            log(f"  Weight Decay: {original_wd:.2e} * {config.lion_wd_scale} = {config.inner_weight_decay:.2e}")
+            log(f"  Betas: {config.inner_betas}")
 
     # Create validation dataloader if validation is enabled
     # Each rank gets a different portion of validation data (split like train_dataloader)
@@ -971,17 +979,35 @@ def train(config: Config):
         model = torch.compile(model)
 
     # Setup optimizers
-    inner_optimizer = partial(torch.optim.AdamW, lr=config.lr, weight_decay=0.1, betas=(0.9, 0.95))  # noqa: F821
+    if config.inner_optimizer_type == "lion":
+        from lion_optimizer import Lion
+        inner_optimizer = partial(Lion, lr=config.lr, weight_decay=config.inner_weight_decay, betas=config.inner_betas)
+        log(f"Using Lion inner optimizer (lr={config.lr}, wd={config.inner_weight_decay}, betas={config.inner_betas})")
+    else:
+        inner_optimizer = partial(torch.optim.AdamW, lr=config.lr, weight_decay=config.inner_weight_decay, betas=config.inner_betas)
+        log(f"Using AdamW inner optimizer (lr={config.lr}, wd={config.inner_weight_decay}, betas={config.inner_betas})")
 
     if config.hv is not None:
         outer_optimizer = partial(torch.optim.SGD, lr=config.hv.outer_lr, momentum=0.9, nesterov=True)
 
-    def scheduler_fn(opt):
-        return get_cosine_schedule_with_warmup(
-            opt,
-            num_warmup_steps=config.warmup_steps,
-            num_training_steps=config.total_steps,
-        )
+    if config.inner_optimizer_type == "lion":
+        def scheduler_fn(opt):
+            return get_linear_schedule_with_warmup(
+                opt,
+                num_warmup_steps=config.warmup_steps,
+                num_training_steps=config.total_steps,
+            )
+        if rank == 0:
+            log(f"Using linear decay schedule for Lion (warmup={config.warmup_steps}, total={config.total_steps})")
+    else:
+        def scheduler_fn(opt):
+            return get_cosine_schedule_with_warmup(
+                opt,
+                num_warmup_steps=config.warmup_steps,
+                num_training_steps=config.total_steps,
+            )
+        if rank == 0:
+            log(f"Using cosine decay schedule for AdamW (warmup={config.warmup_steps}, total={config.total_steps})")
 
     if config.hv is not None:
         if resume_from_ckpt:
