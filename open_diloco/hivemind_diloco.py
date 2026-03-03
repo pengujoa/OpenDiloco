@@ -1778,10 +1778,13 @@ class DiLoCoGradAverager(DecentralizedAverager, TokenWeightedAggregationMixin):
         
         # effective_top_k_ratio가 1.0이면 모든 파라미터를 선택하므로 마스크 생성 불필요
         if effective_top_k_ratio == 1.0 and has_param_names:
-            # 모든 파라미터를 선택하는 마스크 생성 (magnitude 계산 없이)
             if self.param_names is not None:
-                new_mask = [True] * len(self.param_names)
-                logger.info(f"top_k_ratio=1.0: All {len(self.param_names)} parameters selected (magnitude calculation skipped)")
+                if self.param_update_mask is None:
+                    new_mask = [True] * len(self.param_names)
+                    logger.info(f"top_k_ratio=1.0: All {len(self.param_names)} parameters selected (initial mask set)")
+                else:
+                    new_mask = None
+                    logger.info(f"top_k_ratio=1.0: All {len(self.param_names)} parameters selected (magnitude calculation skipped)")
         elif magnitudes is not None and has_param_names:
             if self.gradient_magnitude_selection_mode == "layer":
                 # 레이어 단위 선택 모드
@@ -1960,6 +1963,9 @@ class DiLoCoGradAverager(DecentralizedAverager, TokenWeightedAggregationMixin):
         timestamp = datetime.now().isoformat() if self.enable_update_logs else None
         update_records = [] if self.enable_update_logs else None
         
+        # Raw pseudo gradient 통계 수집 (sign/통신 전)
+        raw_grad_stats = []
+        
         with self.get_tensors() as averaged_grads:
             param_idx = 0
             grad_idx = 0  # averaged_grads의 인덱스
@@ -2008,6 +2014,15 @@ class DiLoCoGradAverager(DecentralizedAverager, TokenWeightedAggregationMixin):
                                 'was_selected': True,
                                 'was_forced_by_residual': False,
                             })
+                        raw_grad_stats.append({
+                            'name': param_name,
+                            'mean': float(grad.mean().item()),
+                            'abs_mean': float(grad.abs().mean().item()),
+                            'std': float(grad.std().item()) if grad.numel() > 1 else 0.0,
+                            'norm': float(grad.norm().item()),
+                            'numel': grad.numel(),
+                            'pos_ratio': float((grad > 0).sum().item()) / max(grad.numel(), 1),
+                        })
                         if self.outer_sign_update:
                             grad = torch.sign(grad)
                         averaged_grads[grad_idx].copy_(grad, non_blocking=True)
@@ -2043,6 +2058,15 @@ class DiLoCoGradAverager(DecentralizedAverager, TokenWeightedAggregationMixin):
                             'was_selected': True,
                             'was_forced_by_residual': False,
                         })
+                    raw_grad_stats.append({
+                        'name': param_name,
+                        'mean': float(grad.mean().item()),
+                        'abs_mean': float(grad.abs().mean().item()),
+                        'std': float(grad.std().item()) if grad.numel() > 1 else 0.0,
+                        'norm': float(grad.norm().item()),
+                        'numel': grad.numel(),
+                        'pos_ratio': float((grad > 0).sum().item()) / max(grad.numel(), 1),
+                    })
                     if self.outer_sign_update:
                         grad = torch.sign(grad)
                     averaged_grads[grad_idx].copy_(grad, non_blocking=True)
@@ -2056,6 +2080,89 @@ class DiLoCoGradAverager(DecentralizedAverager, TokenWeightedAggregationMixin):
             # 파라미터 업데이트 이력 저장 (enable_update_logs가 True인 경우에만)
             if self.enable_update_logs and update_records:
                 self._save_parameter_updates_to_file(update_records, epoch, step, timestamp)
+        
+        # Raw pseudo gradient 통계 저장 (DiLoCoOptimizer에서 함께 로깅하기 위해)
+        self._raw_pseudo_grad_stats = raw_grad_stats
+        
+        # Per-tensor abs_mean을 DHT에 publish (adaptive_mean 모드용)
+        # abs_mean 리스트를 저장해두고, outer_sign_mode == "adaptive_mean"일 때 DHT로 공유
+        self._local_abs_means = [s['abs_mean'] for s in raw_grad_stats]
+        self._publish_abs_means_to_dht(epoch)
+
+    def _publish_abs_means_to_dht(self, epoch: Optional[int], ttl: float = 300.0):
+        """per-tensor mean(|pseudo_grad|) 스칼라를 DHT에 publish (adaptive_mean 모드용)"""
+        if not hasattr(self, '_local_abs_means') or self._local_abs_means is None:
+            return
+        if self.dht is None:
+            return
+        
+        worker_id = getattr(self, 'worker_id', None) or str(self.dht.peer_id)
+        key = f"{self.prefix}_abs_means_epoch_{epoch if epoch is not None else 'current'}"
+        now = get_dht_time()
+        payload = {
+            "abs_means": self._local_abs_means,
+            "ts": now,
+            "host": socket.gethostname(),
+        }
+        self.dht.store(key=key, subkey=worker_id, value=payload, expiration_time=now + ttl)
+        logger.info(f"Published {len(self._local_abs_means)} abs_mean values to DHT (epoch={epoch})")
+
+    def _read_abs_means_from_dht(
+        self, epoch: Optional[int], max_wait_time: float = 300.0, check_interval: float = 0.1
+    ) -> list:
+        """DHT에서 모든 노드의 per-tensor abs_mean을 읽고 단순 평균 계산"""
+        if self.dht is None:
+            return self._local_abs_means or []
+        
+        key = f"{self.prefix}_abs_means_epoch_{epoch if epoch is not None else 'current'}"
+        expected_count = self.expected_num_peers
+        if expected_count is None and hasattr(self, 'galaxy_size') and self.galaxy_size is not None:
+            expected_count = self.galaxy_size
+        
+        start_time = time.time()
+        all_abs_means = []
+        
+        while True:
+            res = self.dht.get(key, latest=True)
+            if res is not None:
+                root = res.value if hasattr(res, 'value') else res
+                if isinstance(root, dict):
+                    all_abs_means = []
+                    for subkey, v in root.items():
+                        val = v.value if hasattr(v, 'value') else v
+                        if isinstance(val, dict) and "abs_means" in val:
+                            all_abs_means.append(val["abs_means"])
+                    
+                    if expected_count is not None and len(all_abs_means) >= expected_count:
+                        break
+            
+            if time.time() - start_time >= max_wait_time:
+                logger.warning(
+                    f"abs_means DHT read timeout: got {len(all_abs_means)}/{expected_count} peers"
+                )
+                break
+            time.sleep(check_interval)
+        
+        if not all_abs_means:
+            return self._local_abs_means or []
+        
+        # 단순 평균 (token-weighted 없이)
+        num_peers = len(all_abs_means)
+        num_tensors = len(all_abs_means[0])
+        averaged = []
+        for t_idx in range(num_tensors):
+            total = sum(peer[t_idx] for peer in all_abs_means if t_idx < len(peer))
+            count = sum(1 for peer in all_abs_means if t_idx < len(peer))
+            averaged.append(total / max(count, 1))
+        
+        logger.info(f"Averaged abs_means from {num_peers} peers ({num_tensors} tensors)")
+        
+        # DHT 정리
+        worker_id = getattr(self, 'worker_id', None) or str(self.dht.peer_id)
+        now = get_dht_time()
+        self.dht.store(key=key, subkey=worker_id, value=None, expiration_time=now - 1)
+        
+        return averaged
 
     def _save_parameter_updates_to_file_sync(
         self,
@@ -2346,6 +2453,8 @@ class DiLoCoOptimizer(Optimizer):
         galaxy_size: Optional[int] = None,
         # Outer sign update: pseudo-gradient에 sign()을 적용
         outer_sign_update: bool = False,
+        # outer_sign_mode: "fixed_lr" (기존) or "adaptive_mean" (텐서별 mean(|pseudo_grad|) step size)
+        outer_sign_mode: str = "fixed_lr",
         # Outer LR scheduling (sign update 시 필수)
         outer_lr_scheduler_type: str = "constant",  # "constant", "cosine", "linear"
         outer_warmup_steps: int = 0,
@@ -2377,8 +2486,15 @@ class DiLoCoOptimizer(Optimizer):
         self.galaxy_size = galaxy_size
         # Outer sign update 저장
         self.outer_sign_update = outer_sign_update
+        self.outer_sign_mode = outer_sign_mode if outer_sign_update else "fixed_lr"
         if outer_sign_update:
-            logger.info("Outer sign update ENABLED: sign(Δθ) will be sent before communication (Majority Vote)")
+            if self.outer_sign_mode == "adaptive_mean":
+                logger.info(
+                    "Outer sign update ENABLED [adaptive_mean]: "
+                    "update = mean(|pseudo_grad|) × sign(majority_vote), outer_lr as global multiplier"
+                )
+            else:
+                logger.info("Outer sign update ENABLED [fixed_lr]: update = outer_lr × sign(majority_vote)")
         if selective_layer_patterns is not None or gradient_magnitude_threshold is not None or gradient_magnitude_top_k_ratio is not None:
             if param_names is None:
                 # param_names가 제공되지 않으면 모델에서 직접 추출 시도
@@ -2869,6 +2985,14 @@ class DiLoCoOptimizer(Optimizer):
 
             assert self.state_averager.custom_gradients, "custom gradient must be enable for syncing pseudo gradients"
 
+            # adaptive_mean 모드: DHT에서 per-tensor abs_means 읽기 + 평균 계산
+            if self.outer_sign_mode == "adaptive_mean" and self.tracker.global_progress.num_peers > 1:
+                self._averaged_abs_means = self.diloco_grad_averager._read_abs_means_from_dht(
+                    epoch=self.local_epoch
+                )
+            else:
+                self._averaged_abs_means = None
+
             # 통신된 averaged gradient를 outer optimizer에 로드
             # custom_gradients=True이므로 수동으로 averaged gradient를 로드해야 합니다.
             if self.tracker.global_progress.num_peers > 1:
@@ -3041,11 +3165,41 @@ class DiLoCoOptimizer(Optimizer):
         
         # param_update_mask 확인 (selective layer update가 활성화된 경우)
         param_update_mask = getattr(self.diloco_grad_averager, 'param_update_mask', None)
+        param_names = getattr(self.diloco_grad_averager, 'param_names', None)
         
-        def _apply_grad(opt_param, grad_tensor):
-            """averaged gradient를 opt_param.grad에 설정 (sign 변환 포함)"""
+        # Per-tensor pseudo gradient 통계 수집
+        grad_stats = []
+        averaged_abs_means = getattr(self, '_averaged_abs_means', None)
+        # adaptive_mean에서 사용할 abs_mean 인덱스 (선택된 텐서만 카운트)
+        abs_mean_idx = 0
+        
+        def _apply_grad(opt_param, grad_tensor, tensor_name):
+            """averaged gradient를 opt_param.grad에 설정 (sign/adaptive_mean 변환 포함), 통계 수집"""
+            nonlocal abs_mean_idx
+            # 통계는 sign 적용 전 (averaged pseudo gradient 원본) 기준으로 수집
+            stats = {
+                'name': tensor_name,
+                'mean': float(grad_tensor.mean().item()),
+                'abs_mean': float(grad_tensor.abs().mean().item()),
+                'std': float(grad_tensor.std().item()) if grad_tensor.numel() > 1 else 0.0,
+                'norm': float(grad_tensor.norm().item()),
+                'numel': grad_tensor.numel(),
+                'pos_ratio': float((grad_tensor > 0).sum().item()) / max(grad_tensor.numel(), 1),
+            }
+            
             if self.outer_sign_update:
-                grad_tensor = torch.sign(grad_tensor)
+                if self.outer_sign_mode == "adaptive_mean" and averaged_abs_means is not None:
+                    # adaptive_mean: magnitude = averaged mean(|pseudo_grad|), direction = sign(majority_vote)
+                    scale = averaged_abs_means[abs_mean_idx] if abs_mean_idx < len(averaged_abs_means) else 1e-8
+                    scale = max(scale, 1e-8)
+                    grad_tensor = scale * torch.sign(grad_tensor)
+                    stats['adaptive_scale'] = scale
+                    abs_mean_idx += 1
+                else:
+                    grad_tensor = torch.sign(grad_tensor)
+            
+            grad_stats.append(stats)
+            
             if opt_param.grad is None:
                 opt_param.grad = grad_tensor.clone()
             else:
@@ -3057,13 +3211,14 @@ class DiLoCoOptimizer(Optimizer):
             grad_idx = 0
             
             for opt_param in outer_params:
+                tensor_name = param_names[param_idx] if param_names and param_idx < len(param_names) else f"param_{param_idx}"
                 if param_update_mask is not None:
                     if param_update_mask[param_idx]:
                         if grad_idx >= len(averaged_grads):
                             raise RuntimeError(
                                 f"grad_idx ({grad_idx})가 averaged_grads의 길이 ({len(averaged_grads)})를 초과했습니다."
                             )
-                        _apply_grad(opt_param, averaged_grads[grad_idx])
+                        _apply_grad(opt_param, averaged_grads[grad_idx], tensor_name)
                         grad_idx += 1
                     else:
                         if opt_param.grad is None:
@@ -3075,10 +3230,131 @@ class DiLoCoOptimizer(Optimizer):
                         raise RuntimeError(
                             f"grad_idx ({grad_idx})가 averaged_grads의 길이 ({len(averaged_grads)})를 초과했습니다."
                         )
-                    _apply_grad(opt_param, averaged_grads[grad_idx])
+                    _apply_grad(opt_param, averaged_grads[grad_idx], tensor_name)
                     grad_idx += 1
                 param_idx += 1
+        
+        # Per-tensor pseudo gradient 통계 출력 (raw + averaged)
+        raw_stats = getattr(self.diloco_grad_averager, '_raw_pseudo_grad_stats', None)
+        self._log_pseudo_grad_stats(raw_stats, grad_stats)
 
+    @staticmethod
+    def _format_grad_stats_table(title: str, stats: list) -> list:
+        """pseudo gradient 통계를 테이블 형태의 문자열 리스트로 포맷팅"""
+        has_adaptive = any('adaptive_scale' in s for s in stats)
+        
+        lines = []
+        lines.append(f"  {title}")
+        header = f"  {'Tensor Name':<55s} {'Mean':>12s} {'|Mean|':>12s} {'Std':>12s} {'L2 Norm':>12s} {'Pos%':>7s} {'Numel':>10s}"
+        sep = f"  {'-'*55} {'-'*12} {'-'*12} {'-'*12} {'-'*12} {'-'*7} {'-'*10}"
+        if has_adaptive:
+            header += f" {'AdaptScale':>12s}"
+            sep += f" {'-'*12}"
+        lines.append(header)
+        lines.append(sep)
+        
+        total_numel = 0
+        weighted_mean_sum = 0.0
+        weighted_abs_mean_sum = 0.0
+        
+        for s in stats:
+            name = s['name']
+            if len(name) > 55:
+                name = '...' + name[-52:]
+            row = (
+                f"  {name:<55s} {s['mean']:>12.6f} {s['abs_mean']:>12.6f} "
+                f"{s['std']:>12.6f} {s['norm']:>12.4f} {s['pos_ratio']*100:>6.1f}% {s['numel']:>10d}"
+            )
+            if has_adaptive:
+                scale = s.get('adaptive_scale', 0.0)
+                row += f" {scale:>12.8f}"
+            lines.append(row)
+            total_numel += s['numel']
+            weighted_mean_sum += s['mean'] * s['numel']
+            weighted_abs_mean_sum += s['abs_mean'] * s['numel']
+        
+        global_mean = weighted_mean_sum / max(total_numel, 1)
+        global_abs_mean = weighted_abs_mean_sum / max(total_numel, 1)
+        lines.append(sep)
+        lines.append(f"  {'[Global Weighted Average]':<55s} {global_mean:>12.6f} {global_abs_mean:>12.6f}")
+        return lines
+
+    def _log_pseudo_grad_stats(self, raw_stats: list | None, averaged_stats: list):
+        """매 outer epoch마다 tensor별 pseudo gradient 통계를 shell 출력 + CSV 저장
+        
+        raw_stats: 통신 전, sign() 전 원본 pseudo gradient (이 노드만의 값)
+        averaged_stats: 통신 후, sign() 전 averaged pseudo gradient (노드 간 평균)
+        """
+        if not averaged_stats:
+            return
+        
+        epoch = self.local_epoch
+        
+        # Shell 출력
+        lines = [f"\n{'='*120}"]
+        lines.append(f"  Pseudo Gradient Statistics  (outer epoch {epoch})")
+        lines.append(f"{'='*120}")
+        
+        if raw_stats:
+            lines.extend(self._format_grad_stats_table(
+                f"[Local Raw]  Before sign() & communication  ({len(raw_stats)} tensors)", raw_stats
+            ))
+            lines.append("")
+        
+        lines.extend(self._format_grad_stats_table(
+            f"[Averaged]   After communication, before sign()  ({len(averaged_stats)} tensors)", averaged_stats
+        ))
+        
+        lines.append(f"{'='*120}")
+        logger.info('\n'.join(lines))
+        
+        # CSV 저장
+        self._save_pseudo_grad_stats_csv(epoch, raw_stats, averaged_stats)
+
+    def _save_pseudo_grad_stats_csv(
+        self, epoch: int, raw_stats: list | None, averaged_stats: list
+    ):
+        """pseudo gradient 통계를 CSV로 저장 (append 방식으로 epoch마다 누적)"""
+        import csv
+        
+        log_dir = getattr(self.diloco_grad_averager, 'log_dir', './parameter_tracking_logs')
+        os.makedirs(log_dir, exist_ok=True)
+        
+        has_adaptive = any('adaptive_scale' in s for s in averaged_stats)
+        
+        def _append_csv(filepath: str, stats: list, epoch: int):
+            write_header = not os.path.exists(filepath)
+            fieldnames = [
+                'epoch', 'tensor_name', 'mean', 'abs_mean', 'std',
+                'l2_norm', 'pos_ratio', 'numel',
+            ]
+            if has_adaptive:
+                fieldnames.append('adaptive_scale')
+            try:
+                with open(filepath, 'a', newline='') as f:
+                    writer = csv.DictWriter(f, fieldnames=fieldnames)
+                    if write_header:
+                        writer.writeheader()
+                    for s in stats:
+                        row = {
+                            'epoch': epoch,
+                            'tensor_name': s['name'],
+                            'mean': f"{s['mean']:.8f}",
+                            'abs_mean': f"{s['abs_mean']:.8f}",
+                            'std': f"{s['std']:.8f}",
+                            'l2_norm': f"{s['norm']:.6f}",
+                            'pos_ratio': f"{s['pos_ratio']:.6f}",
+                            'numel': s['numel'],
+                        }
+                        if has_adaptive:
+                            row['adaptive_scale'] = f"{s.get('adaptive_scale', 0.0):.8f}"
+                        writer.writerow(row)
+            except Exception as e:
+                logger.warning(f"Failed to save pseudo grad stats CSV: {e}")
+        
+        if raw_stats:
+            _append_csv(os.path.join(log_dir, 'pseudo_grad_stats_local_raw.csv'), raw_stats, epoch)
+        _append_csv(os.path.join(log_dir, 'pseudo_grad_stats_averaged.csv'), averaged_stats, epoch)
 
     def update_main_param_after_outer_step(self):
         """Update the inner optimizer parameters with the main parameters after outer step

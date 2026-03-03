@@ -6,14 +6,23 @@ dataset_name_or_path = "$C4"
 
 # Training optimization
 lr = 4e-4
+warmup_steps = 1000
+max_steps = 88000
+# Inner optimizer: "adamw" (default) or "lion"
+# lr, inner_weight_decay, inner_betas는 AdamW 기준으로 설정
+# Lion 선택 시 lion_lr_scale, lion_wd_scale, lion_betas로 자동 변환됨
+inner_optimizer_type = "adamw"
+# Lion auto-scaling (inner_optimizer_type = "lion" 일 때만 적용)
+lion_lr_scale = 0.3         # lr *= 0.3  (논문 권장: 0.1~0.3)
+lion_wd_scale = 3.0         # weight_decay *= 3.0  (논문 권장: 3~10)
+lion_betas = [0.95, 0.98]  # 언어 모델링 권장값 (vision: [0.9, 0.99])
+validation = true
 per_device_train_batch_size = 4
 total_batch_size = 16
 precision = "fp16-mixed"
-warmup_steps = 1000
-max_steps = 88000
-adjust_local_steps = false
-validation = true
-initial_lr_adjust = false  # If true, adjust initial learning rate based on actual per_device_batch_size
+# parallelism = "tp"  # "tp" (tensor parallel) or "pp" (pipeline parallel) — only used by train_mp.py
+adjust_local_steps = true
+initial_lr_adjust = true
 
 # Project and logging
 project = "${EXP}-${WORLD_RANK}"
@@ -28,22 +37,27 @@ path = "${EXP}_ckpt"
 
 # Hivemind configuration
 [hv]
+galaxy_size = 4
 local_steps = 50
+max_outer_optimization_steps = 500
 matchmaking_time = 300
 averaging_timeout = 1800
 skip_load_from_peers = true
 initial_peers = ["$PEER"]
-galaxy_size = 4
 world_rank = "${WORLD_RANK}"
-# selective_layer_patterns = ["model.layers.0", "model.layers.1", "lm_head"]
+
+token_weighted_aggregation = true
+token_weight_mode = "sqrt"  # "sqrt" (w ∝ tokens) or "sqrt" (w ∝ √tokens)
+
+# Throughput Adaptive Sizing - 이전 round의 throughput 값을 기반으로 텐서 크기 조정
+use_throughput_adaptive_sizing = true  # true면 throughput 기반 조정 활성화, false면 균등 분할 사용
+
 gradient_magnitude_top_k_ratio = 1.0  # top-k% 선택 (Input/Output 레이어는 항상 포함)
 gradient_magnitude_top_k_ratio_by_size = true  # true면 크기 기준으로 비율 계산, false면 개수 기준
 gradient_magnitude_selection_mode = "layer"  # "layer" (레이어 단위) or "parameter" (파라미터 텐서 단위)
 gradient_importance_metric = "magnitude"  # (default) pseudo-grad L2 norm
 # gradient_importance_metric = "taylor"     # Taylor 1st order saliency: sum(|w * g|)
-token_weighted_aggregation = false
 # residual_norm_threshold = 1.0  # If residual norm exceeds this threshold, force communication for all parameters (None = disabled)
-max_outer_optimization_steps = 200
 
 # Max Staleness (강제 업데이트) - 레이어가 N번 이상 선택되지 않으면 강제로 포함 (레이어 단위 관리)
 enable_max_staleness = false
@@ -53,9 +67,31 @@ max_staleness = 10  # 레이어가 N번 이상 선택되지 않으면 강제 포
 enable_warmup = false
 warmup_epochs = 5  # 초기 N epoch 동안은 모든 레이어 전송
 
+# ─── Outer Sign Update ───────────────────────────────────────────────────────
+# pseudo-gradient에 sign()을 적용하여 1-bit 통신 + majority vote로 방향 결정
+# 기존 동작(sign 안 씀)으로 돌아가려면 outer_sign_update = false
+outer_sign_update = true
+
+# outer_sign_mode: sign update 시 업데이트 크기(magnitude)를 결정하는 방식
+#   "fixed_lr"      — 고정 outer_lr 사용 (기존 방식). outer_lr_scheduler_type으로 decay 가능
+#   "adaptive_mean"  — 텐서별 mean(|raw_pseudo_grad|)를 step size로 사용.
+#                     outer_lr은 global multiplier로 작동 (1.0 권장).
+#                     학습 수렴 시 magnitude가 자연 감소 → implicit LR decay.
+outer_sign_mode = "adaptive_mean"
+
+# outer_lr: fixed_lr 모드에서는 step size, adaptive_mean 모드에서는 global multiplier
+outer_lr = 1.0
+
+# Outer LR scheduling (fixed_lr 모드에서 주로 사용)
+# "constant" (스케줄링 없음), "cosine" (cosine annealing), "linear" (linear decay)
+outer_lr_scheduler_type = "constant"
+outer_warmup_steps = 0  # outer optimization step 기준 warmup (0이면 warmup 없음)
+
+# Hivemind compression: outer_sign_update=true일 때 자동으로 "sign1bit" 설정됨
+# 수동 설정 시 사용 가능한 값: "fp16", "scaled-fp16", "uniform8bit", "quantile8bit", "blockwise8bit", "sign1bit"
+# outer_sign_update=true면 1-bit packing으로 32x 통신 절감 (sign1bit)
+hivemind_compression = "sign1bit"
+
 # Gradient Clipping - Outer optimizer 업데이트 전에 gradient clipping 적용
 enable_gradient_clipping = false
 gradient_clip_norm = 2.0  # 최대 gradient norm
-
-# Throughput Adaptive Sizing - 이전 round의 throughput 값을 기반으로 텐서 크기 조정
-use_throughput_adaptive_sizing = false  # true면 throughput 기반 조정 활성화, false면 균등 분할 사용
