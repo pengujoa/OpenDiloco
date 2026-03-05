@@ -1,4 +1,5 @@
 from enum import Enum
+import math
 import time
 from typing import Any, Callable, Dict, Iterator, List, Optional, Union
 import numpy as np
@@ -462,6 +463,13 @@ class DiLoCoGradAverager(DecentralizedAverager, TokenWeightedAggregationMixin):
         galaxy_size: Optional[int] = None,
         # Outer sign update: 통신 전에 pseudo-gradient에 sign()을 적용
         outer_sign_update: bool = False,
+        # ─── Nesterov-Lion sign momentum ──────────────────────────────────────
+        outer_sign_momentum: bool = False,
+        outer_sign_beta1: float = 0.95,
+        outer_sign_beta2: float = 0.98,
+        outer_sign_nesterov: bool = True,
+        outer_sign_nesterov_mu: float = 0.9,
+        outer_sign_bias_correction: bool = False,
         **kwargs,
     ):
         if "client_mode" in kwargs:
@@ -499,6 +507,22 @@ class DiLoCoGradAverager(DecentralizedAverager, TokenWeightedAggregationMixin):
         self.galaxy_size = galaxy_size
         # Outer sign update: 통신 전에 sign() 적용 여부
         self.outer_sign_update = outer_sign_update
+        # ─── Nesterov-Lion sign momentum ──────────────────────────────────────
+        # sign() 결정 전에 raw pseudo-gradient의 local EMA를 유지하여 방향 안정성 향상.
+        # 수식:
+        #   g'_t = g_t + μ · m_{t-1}                       (Nesterov lookahead)
+        #   c_t  = sign(β₁ · m_{t-1} + (1-β₁) · g'_t)    (Lion-style interpolation)
+        #   m_t  = β₂ · m_{t-1} + (1-β₂) · g_t            (EMA update, raw grad)
+        self.outer_sign_momentum = outer_sign_momentum
+        self.outer_sign_beta1 = outer_sign_beta1
+        self.outer_sign_beta2 = outer_sign_beta2
+        self.outer_sign_nesterov = outer_sign_nesterov
+        self.outer_sign_nesterov_mu = outer_sign_nesterov_mu
+        self.outer_sign_bias_correction = outer_sign_bias_correction
+        # EMA buffer: param_idx → tensor. Lazy init on first outer step to match shapes.
+        self._sign_ema: dict[int, torch.Tensor] = {}
+        # Bias correction용 step counter (1-indexed: 첫 번째 outer step에서 t=1)
+        self._sign_ema_step: int = 0
 
         # Local step 동기화를 위한 정보 저장
         self.num_inner_steps = None  # 나중에 설정됨
@@ -1953,9 +1977,62 @@ class DiLoCoGradAverager(DecentralizedAverager, TokenWeightedAggregationMixin):
         
 
     @torch.no_grad()
+    def _apply_sign_with_momentum(self, grad: torch.Tensor, param_idx: int) -> torch.Tensor:
+        """Sign 결정에 Nesterov-Lion momentum + bias correction을 적용.
+        
+        수식 Flow (모두 local, 통신 전):
+          ① g_t  = raw pseudo-gradient (인자로 받음)
+          ② g'_t = g_t + μ · m̂_{t-1}                      (Nesterov lookahead, optional)
+          ③ c_t  = sign(β₁ · m̂_{t-1} + (1-β₁) · g'_t)   (Lion-style interpolation)
+          ④ m_t  = β₂ · m_{t-1} + (1-β₂) · g_t            (EMA update, raw grad)
+             m̂_t = m_t / (1 - β₂^t)                       (bias correction, optional)
+        
+        Rationale:
+          - momentum update에 g_t(raw)를 사용: g'_t를 쓰면 실효 β₂가 부풀어남.
+          - bias correction: EMA가 zero에서 시작하므로 초반 step이 편향됨.
+            pseudo-gradient는 outer step 수가 적어(~500) 초반 편향이 유의미함.
+          - β 값을 낮게(0.3/0.5) 설정: pseudo-gradient는 이미 50 inner step 평균이므로
+            일반 Lion(0.95/0.98)보다 훨씬 짧은 EMA 윈도우가 적합.
+        
+        Returns:
+            ±1 tensor (same shape as grad)
+        """
+        # Lazy init: 첫 outer step에서 해당 param의 EMA buffer 생성
+        if param_idx not in self._sign_ema:
+            self._sign_ema[param_idx] = torch.zeros_like(grad)
+        
+        ema = self._sign_ema[param_idx]  # m_{t-1} (uncorrected)
+        
+        # Bias correction: m̂ = m / (1 - β₂^t)
+        if self.outer_sign_bias_correction and self._sign_ema_step > 0:
+            bc = 1.0 - self.outer_sign_beta2 ** self._sign_ema_step
+            ema_corrected = ema / max(bc, 1e-8)
+        else:
+            ema_corrected = ema
+        
+        # ② Nesterov lookahead: g'_t = g_t + μ · m̂_{t-1}
+        if self.outer_sign_nesterov:
+            grad_corrected = grad + self.outer_sign_nesterov_mu * ema_corrected
+        else:
+            grad_corrected = grad
+        
+        # ③ Lion-style sign: c_t = sign(β₁ · m̂_{t-1} + (1-β₁) · g'_t)
+        interpolated = self.outer_sign_beta1 * ema_corrected + (1.0 - self.outer_sign_beta1) * grad_corrected
+        signed = torch.sign(interpolated)
+        
+        # ④ EMA update: m_t = β₂ · m_{t-1} + (1-β₂) · g_t  (raw grad, uncorrected buffer)
+        ema.mul_(self.outer_sign_beta2).add_(grad, alpha=1.0 - self.outer_sign_beta2)
+        
+        return signed
+
+    @torch.no_grad()
     def compute_and_load_pseudo_grad_into_averager(self):
         """compute pseudo gradient by subtracting the offloaded optimizer parameters with the main parameters and load them in the averager"""
         opt_parameters = [param for group in self.offloaded_optimizer.param_groups for param in group["params"]]
+        
+        # Bias correction step counter 증가 (outer step 단위)
+        if self.outer_sign_momentum:
+            self._sign_ema_step += 1
         
         # 파라미터 업데이트 추적을 위한 정보 수집 (enable_update_logs가 True인 경우에만)
         epoch = getattr(self, '_current_epoch', None)
@@ -2014,17 +2091,26 @@ class DiLoCoGradAverager(DecentralizedAverager, TokenWeightedAggregationMixin):
                                 'was_selected': True,
                                 'was_forced_by_residual': False,
                             })
+                        _l2_norm = float(grad.norm().item())
+                        _numel = grad.numel()
                         raw_grad_stats.append({
                             'name': param_name,
                             'mean': float(grad.mean().item()),
                             'abs_mean': float(grad.abs().mean().item()),
-                            'std': float(grad.std().item()) if grad.numel() > 1 else 0.0,
-                            'norm': float(grad.norm().item()),
-                            'numel': grad.numel(),
-                            'pos_ratio': float((grad > 0).sum().item()) / max(grad.numel(), 1),
+                            'l2_rms': _l2_norm / max(_numel ** 0.5, 1.0),
+                            'std': float(grad.std().item()) if _numel > 1 else 0.0,
+                            'norm': _l2_norm,
+                            'numel': _numel,
+                            'pos_ratio': float((grad > 0).sum().item()) / max(_numel, 1),
+                            'weight_mean': float(opt_param.data.mean().item()),
+                            'weight_abs_mean': float(opt_param.data.abs().mean().item()),
+                            'weight_std': float(opt_param.data.std().item()) if opt_param.data.numel() > 1 else 0.0,
                         })
                         if self.outer_sign_update:
-                            grad = torch.sign(grad)
+                            if self.outer_sign_momentum:
+                                grad = self._apply_sign_with_momentum(grad, param_idx)
+                            else:
+                                grad = torch.sign(grad)
                         averaged_grads[grad_idx].copy_(grad, non_blocking=True)
                         
                         updated_param_names.append(param_name)
@@ -2058,17 +2144,26 @@ class DiLoCoGradAverager(DecentralizedAverager, TokenWeightedAggregationMixin):
                             'was_selected': True,
                             'was_forced_by_residual': False,
                         })
+                    _l2_norm = float(grad.norm().item())
+                    _numel = grad.numel()
                     raw_grad_stats.append({
                         'name': param_name,
                         'mean': float(grad.mean().item()),
                         'abs_mean': float(grad.abs().mean().item()),
-                        'std': float(grad.std().item()) if grad.numel() > 1 else 0.0,
-                        'norm': float(grad.norm().item()),
-                        'numel': grad.numel(),
-                        'pos_ratio': float((grad > 0).sum().item()) / max(grad.numel(), 1),
+                        'l2_rms': _l2_norm / max(_numel ** 0.5, 1.0),
+                        'std': float(grad.std().item()) if _numel > 1 else 0.0,
+                        'norm': _l2_norm,
+                        'numel': _numel,
+                        'pos_ratio': float((grad > 0).sum().item()) / max(_numel, 1),
+                        'weight_mean': float(opt_param.data.mean().item()),
+                        'weight_abs_mean': float(opt_param.data.abs().mean().item()),
+                        'weight_std': float(opt_param.data.std().item()) if opt_param.data.numel() > 1 else 0.0,
                     })
                     if self.outer_sign_update:
-                        grad = torch.sign(grad)
+                        if self.outer_sign_momentum:
+                            grad = self._apply_sign_with_momentum(grad, param_idx)
+                        else:
+                            grad = torch.sign(grad)
                     averaged_grads[grad_idx].copy_(grad, non_blocking=True)
                     
                     if not updated_param_names:
@@ -2084,13 +2179,25 @@ class DiLoCoGradAverager(DecentralizedAverager, TokenWeightedAggregationMixin):
         # Raw pseudo gradient 통계 저장 (DiLoCoOptimizer에서 함께 로깅하기 위해)
         self._raw_pseudo_grad_stats = raw_grad_stats
         
-        # Per-tensor abs_mean을 DHT에 publish (adaptive_mean 모드용)
-        # abs_mean 리스트를 저장해두고, outer_sign_mode == "adaptive_mean"일 때 DHT로 공유
+        # Nesterov-Lion EMA 통계 로깅
+        if self.outer_sign_momentum and self._sign_ema:
+            ema_norms = []
+            for pidx, ema_buf in sorted(self._sign_ema.items()):
+                ema_norms.append(float(ema_buf.norm().item()))
+            avg_ema_norm = sum(ema_norms) / max(len(ema_norms), 1)
+            logger.info(
+                f"[Nesterov-Lion EMA] {len(ema_norms)} buffers, "
+                f"avg_norm={avg_ema_norm:.6f}, "
+                f"min={min(ema_norms):.6f}, max={max(ema_norms):.6f}"
+            )
+        
+        # Per-tensor magnitude를 DHT에 publish (adaptive_mean 모드용)
         self._local_abs_means = [s['abs_mean'] for s in raw_grad_stats]
+        self._local_l2_rms = [s['l2_rms'] for s in raw_grad_stats]
         self._publish_abs_means_to_dht(epoch)
 
     def _publish_abs_means_to_dht(self, epoch: Optional[int], ttl: float = 300.0):
-        """per-tensor mean(|pseudo_grad|) 스칼라를 DHT에 publish (adaptive_mean 모드용)"""
+        """per-tensor magnitude 스칼라 + token count를 DHT에 publish (adaptive_mean 모드용)"""
         if not hasattr(self, '_local_abs_means') or self._local_abs_means is None:
             return
         if self.dht is None:
@@ -2101,18 +2208,31 @@ class DiLoCoGradAverager(DecentralizedAverager, TokenWeightedAggregationMixin):
         now = get_dht_time()
         payload = {
             "abs_means": self._local_abs_means,
+            "l2_rms": getattr(self, '_local_l2_rms', None) or self._local_abs_means,
+            "tokens": float(getattr(self, 'cumulative_tokens', 0)),
             "ts": now,
             "host": socket.gethostname(),
         }
         self.dht.store(key=key, subkey=worker_id, value=payload, expiration_time=now + ttl)
-        logger.info(f"Published {len(self._local_abs_means)} abs_mean values to DHT (epoch={epoch})")
+        logger.info(
+            f"Published {len(self._local_abs_means)} magnitude values to DHT "
+            f"(epoch={epoch}, tokens={payload['tokens']:.0f})"
+        )
 
     def _read_abs_means_from_dht(
         self, epoch: Optional[int], max_wait_time: float = 300.0, check_interval: float = 0.1
-    ) -> list:
-        """DHT에서 모든 노드의 per-tensor abs_mean을 읽고 단순 평균 계산"""
+    ) -> tuple[list, list]:
+        """DHT에서 모든 노드의 per-tensor abs_mean + l2_rms를 읽고 token-weighted 평균 계산.
+        
+        token_weighted_aggregation이 활성화되어 있으면 각 노드의 token count로 가중 평균.
+        token_weight_mode="sqrt"이면 √tokens를 가중치로 사용.
+        비활성화 또는 token=0인 노드만 있으면 단순 평균으로 fallback.
+        
+        Returns:
+            (averaged_abs_means, averaged_l2_rms)
+        """
         if self.dht is None:
-            return self._local_abs_means or []
+            return (self._local_abs_means or []), (getattr(self, '_local_l2_rms', None) or self._local_abs_means or [])
         
         key = f"{self.prefix}_abs_means_epoch_{epoch if epoch is not None else 'current'}"
         expected_count = self.expected_num_peers
@@ -2121,6 +2241,8 @@ class DiLoCoGradAverager(DecentralizedAverager, TokenWeightedAggregationMixin):
         
         start_time = time.time()
         all_abs_means = []
+        all_l2_rms = []
+        all_tokens = []
         
         while True:
             res = self.dht.get(key, latest=True)
@@ -2128,10 +2250,14 @@ class DiLoCoGradAverager(DecentralizedAverager, TokenWeightedAggregationMixin):
                 root = res.value if hasattr(res, 'value') else res
                 if isinstance(root, dict):
                     all_abs_means = []
+                    all_l2_rms = []
+                    all_tokens = []
                     for subkey, v in root.items():
                         val = v.value if hasattr(v, 'value') else v
                         if isinstance(val, dict) and "abs_means" in val:
                             all_abs_means.append(val["abs_means"])
+                            all_l2_rms.append(val.get("l2_rms", val["abs_means"]))
+                            all_tokens.append(float(val.get("tokens", 0)))
                     
                     if expected_count is not None and len(all_abs_means) >= expected_count:
                         break
@@ -2144,25 +2270,70 @@ class DiLoCoGradAverager(DecentralizedAverager, TokenWeightedAggregationMixin):
             time.sleep(check_interval)
         
         if not all_abs_means:
-            return self._local_abs_means or []
+            return (self._local_abs_means or []), (getattr(self, '_local_l2_rms', None) or self._local_abs_means or [])
         
-        # 단순 평균 (token-weighted 없이)
         num_peers = len(all_abs_means)
         num_tensors = len(all_abs_means[0])
-        averaged = []
-        for t_idx in range(num_tensors):
-            total = sum(peer[t_idx] for peer in all_abs_means if t_idx < len(peer))
-            count = sum(1 for peer in all_abs_means if t_idx < len(peer))
-            averaged.append(total / max(count, 1))
         
-        logger.info(f"Averaged abs_means from {num_peers} peers ({num_tensors} tensors)")
+        # Token-weighted 평균 결정
+        use_token_weight = (
+            getattr(self, 'token_weighted_aggregation', False)
+            and len(all_tokens) == num_peers
+            and sum(all_tokens) > 0
+        )
+        
+        if use_token_weight:
+            token_weight_mode = getattr(self, 'token_weight_mode', 'linear')
+            if token_weight_mode == "sqrt":
+                weights = [math.sqrt(max(t, 0)) for t in all_tokens]
+            else:
+                weights = [max(t, 0) for t in all_tokens]
+            total_weight = sum(weights)
+            if total_weight <= 0:
+                use_token_weight = False
+        
+        averaged = []
+        averaged_rms = []
+        for t_idx in range(num_tensors):
+            if use_token_weight:
+                w_sum_abs = sum(
+                    weights[i] * all_abs_means[i][t_idx]
+                    for i in range(num_peers) if t_idx < len(all_abs_means[i])
+                )
+                w_sum_rms = sum(
+                    weights[i] * all_l2_rms[i][t_idx]
+                    for i in range(num_peers) if t_idx < len(all_l2_rms[i])
+                )
+                w_total = sum(
+                    weights[i]
+                    for i in range(num_peers) if t_idx < len(all_abs_means[i])
+                )
+                averaged.append(w_sum_abs / max(w_total, 1e-8))
+                averaged_rms.append(w_sum_rms / max(w_total, 1e-8))
+            else:
+                total = sum(peer[t_idx] for peer in all_abs_means if t_idx < len(peer))
+                total_rms = sum(peer[t_idx] for peer in all_l2_rms if t_idx < len(peer))
+                count = sum(1 for peer in all_abs_means if t_idx < len(peer))
+                averaged.append(total / max(count, 1))
+                averaged_rms.append(total_rms / max(count, 1))
+        
+        if use_token_weight:
+            token_weight_mode = getattr(self, 'token_weight_mode', 'linear')
+            token_strs = [f"{t:.0f}" for t in all_tokens]
+            weight_strs = [f"{w:.2f}" for w in weights]
+            logger.info(
+                f"Token-weighted magnitude avg from {num_peers} peers ({num_tensors} tensors) "
+                f"[mode={token_weight_mode}]: tokens={token_strs}, weights={weight_strs}"
+            )
+        else:
+            logger.info(f"Simple-averaged magnitudes from {num_peers} peers ({num_tensors} tensors)")
         
         # DHT 정리
         worker_id = getattr(self, 'worker_id', None) or str(self.dht.peer_id)
         now = get_dht_time()
         self.dht.store(key=key, subkey=worker_id, value=None, expiration_time=now - 1)
         
-        return averaged
+        return averaged, averaged_rms
 
     def _save_parameter_updates_to_file_sync(
         self,
@@ -2257,6 +2428,25 @@ class DiLoCoGradAverager(DecentralizedAverager, TokenWeightedAggregationMixin):
             f"tensor count {old_tensor_count} -> {len(self._averaged_tensors)}, "
             f"total_size {old_total_size} -> {self.total_size}"
         )
+
+    async def _update_allreduce_compression(self, compression):
+        """subprocess에서 allreduce compression을 업데이트합니다."""
+        old_compression = self.allreduce_kwargs.get("compression", None)
+        self.allreduce_kwargs["compression"] = compression
+        logger.info(
+            f"[averager process] Updated allreduce compression: "
+            f"{type(old_compression).__name__} -> {type(compression).__name__}"
+        )
+
+    def update_compression(self, new_compression):
+        """main process에서 호출: subprocess의 allreduce compression을 변경합니다."""
+        self.allreduce_kwargs["compression"] = new_compression
+        if self.is_alive():
+            try:
+                self._outer_pipe.send(("_update_allreduce_compression", [new_compression], {}))
+                logger.info(f"Sent compression update to averager subprocess: {type(new_compression).__name__}")
+            except Exception as e:
+                logger.warning(f"Failed to send compression update to subprocess: {e}")
 
 
 class DiloCoProgressTracker(ProgressTracker):
@@ -2459,6 +2649,17 @@ class DiLoCoOptimizer(Optimizer):
         outer_lr_scheduler_type: str = "constant",  # "constant", "cosine", "linear"
         outer_warmup_steps: int = 0,
         max_outer_optimization_steps: Optional[int] = None,
+        # ─── Nesterov-Lion sign momentum ──────────────────────────────────────
+        # sign 결정 전에 local EMA momentum을 적용 (momentum-before-sign).
+        # true이면 outer SGD에서 momentum을 사용하지 않아야 함 (이중 momentum 방지).
+        outer_sign_momentum: bool = False,
+        outer_sign_beta1: float = 0.95,
+        outer_sign_beta2: float = 0.98,
+        outer_sign_nesterov: bool = True,
+        outer_sign_nesterov_mu: float = 0.9,
+        outer_sign_bias_correction: bool = False,
+        # Phase Transition: perplexity 기반 자동 전환
+        phase_transition_config: Optional[Dict] = None,
         **kwargs,
     ):
         self._check_kwargs(kwargs)
@@ -2487,6 +2688,13 @@ class DiLoCoOptimizer(Optimizer):
         # Outer sign update 저장
         self.outer_sign_update = outer_sign_update
         self.outer_sign_mode = outer_sign_mode if outer_sign_update else "fixed_lr"
+        # Nesterov-Lion sign momentum 저장
+        self.outer_sign_momentum = outer_sign_momentum
+        self.outer_sign_beta1 = outer_sign_beta1
+        self.outer_sign_beta2 = outer_sign_beta2
+        self.outer_sign_nesterov = outer_sign_nesterov
+        self.outer_sign_nesterov_mu = outer_sign_nesterov_mu
+        self.outer_sign_bias_correction = outer_sign_bias_correction
         if outer_sign_update:
             if self.outer_sign_mode == "adaptive_mean":
                 logger.info(
@@ -2495,6 +2703,11 @@ class DiLoCoOptimizer(Optimizer):
                 )
             else:
                 logger.info("Outer sign update ENABLED [fixed_lr]: update = outer_lr × sign(majority_vote)")
+            if self.outer_sign_momentum:
+                logger.info(
+                    f"Nesterov-Lion sign momentum ENABLED: β₁={outer_sign_beta1}, β₂={outer_sign_beta2}, "
+                    f"nesterov={'ON (μ=' + str(outer_sign_nesterov_mu) + ')' if outer_sign_nesterov else 'OFF'}"
+                )
         if selective_layer_patterns is not None or gradient_magnitude_threshold is not None or gradient_magnitude_top_k_ratio is not None:
             if param_names is None:
                 # param_names가 제공되지 않으면 모델에서 직접 추출 시도
@@ -2575,7 +2788,19 @@ class DiLoCoOptimizer(Optimizer):
         # state_averager에 grad_averager 참조 설정 (skip된 파라미터 보호를 위해)
         self.state_averager.grad_averager = self.diloco_grad_averager
 
+        # Phase Transition 설정
+        self._phase_transition_config = phase_transition_config or {}
+        self._phase_transitioned = False
+        self._last_validation_ppl = None
+        pt = self._phase_transition_config
+        if pt.get("enabled", False):
+            logger.info(
+                f"Phase Transition ENABLED: trigger_ppl={pt['perplexity']}, "
+                f"mode={pt['mode']}"
+            )
+
         # Outer LR scheduler 생성
+        self._max_outer_optimization_steps = max_outer_optimization_steps
         self.outer_lr_scheduler = self._create_outer_lr_scheduler(
             outer_lr_scheduler_type, outer_warmup_steps, max_outer_optimization_steps
         )
@@ -2730,6 +2955,12 @@ class DiLoCoOptimizer(Optimizer):
             warmup_epochs=self.warmup_epochs,
             galaxy_size=self.galaxy_size,  # galaxy_size 전달
             outer_sign_update=self.outer_sign_update,
+            outer_sign_momentum=self.outer_sign_momentum,
+            outer_sign_beta1=self.outer_sign_beta1,
+            outer_sign_beta2=self.outer_sign_beta2,
+            outer_sign_nesterov=self.outer_sign_nesterov,
+            outer_sign_nesterov_mu=self.outer_sign_nesterov_mu,
+            outer_sign_bias_correction=self.outer_sign_bias_correction,
             **grad_averager_kwargs,
         )
         
@@ -2872,6 +3103,163 @@ class DiLoCoOptimizer(Optimizer):
         grad_ids = None
         return hash((grad_ids, param_shapes))
 
+    # ─── Phase Transition API ──────────────────────────────────────────────────
+
+    def set_validation_perplexity(self, ppl: float) -> None:
+        """Training loop에서 validation 직후 호출 (validation sync 완료 후).
+        조건 충족 시 DHT에 readiness를 게시하고, 모든 peer가 ready할 때까지 대기한 후 전환."""
+        self._last_validation_ppl = ppl
+        self._check_phase_transition()
+
+    def _check_phase_transition(self) -> None:
+        """Phase transition 조건 확인.
+        모든 노드가 매 validation마다 자신의 달성 여부를 DHT에 publish하고,
+        전원이 threshold를 달성했을 때만 transition을 수행한다."""
+        pt = self._phase_transition_config
+        if self._phase_transitioned or not pt.get("enabled", False):
+            return
+        if self._last_validation_ppl is None:
+            return
+
+        world_rank = getattr(self, '_world_rank', None)
+        if world_rank is None:
+            world_rank = 0
+
+        threshold = pt["perplexity"]
+        my_ready = self._last_validation_ppl <= threshold
+        galaxy_size = self.galaxy_size or 4
+        dht_key = f"{self.run_id}_phase_transition_epoch_{self.local_epoch}"
+        worker_id = f"rank_{world_rank}"
+
+        now = get_dht_time()
+        try:
+            self.dht.store(
+                key=dht_key,
+                subkey=worker_id,
+                value={"ready": my_ready, "epoch": self.local_epoch, "ppl": self._last_validation_ppl},
+                expiration_time=now + 600,
+            )
+        except Exception as e:
+            logger.warning(f"Phase transition: failed to publish status to DHT: {e}")
+            return
+
+        logger.info(
+            f"Phase transition: published status (ppl={self._last_validation_ppl:.2f}, "
+            f"ready={my_ready}, threshold={threshold}), waiting for all {galaxy_size} peers..."
+        )
+
+        timeout = 300.0
+        check_interval = 0.5
+        start_time = time.time()
+
+        while True:
+            elapsed = time.time() - start_time
+            if elapsed > timeout:
+                logger.warning(
+                    f"Phase transition: timeout after {timeout:.0f}s waiting for peers "
+                    f"(epoch {self.local_epoch}). Skipping transition this epoch."
+                )
+                return
+
+            try:
+                result = self.dht.get(dht_key, latest=True)
+                root = result.value if result is not None else None
+                total_count = 0
+                ready_count = 0
+
+                if isinstance(root, dict):
+                    for v in root.values():
+                        p = v.value if hasattr(v, 'value') else v
+                        if isinstance(p, dict):
+                            total_count += 1
+                            if p.get("ready", False):
+                                ready_count += 1
+            except Exception as e:
+                logger.warning(f"Phase transition: DHT read error: {e}")
+                time.sleep(check_interval)
+                continue
+
+            if total_count >= galaxy_size and ready_count >= galaxy_size:
+                wait_time = time.time() - start_time
+                logger.info(
+                    f"Phase transition: all {ready_count}/{galaxy_size} peers ready "
+                    f"(waited {wait_time:.1f}s)"
+                )
+                self._apply_phase_transition()
+                return
+
+            if total_count >= galaxy_size and ready_count < galaxy_size:
+                logger.info(
+                    f"Phase transition: not all peers reached threshold "
+                    f"({ready_count}/{galaxy_size} ready). No transition this epoch."
+                )
+                return
+
+            time.sleep(check_interval)
+
+    def _apply_phase_transition(self) -> None:
+        """Phase transition 실행: outer optimizer 및 통신 방식 전환."""
+        pt = self._phase_transition_config
+        mode = pt["mode"]
+
+        logger.info(f"{'='*80}")
+        logger.info(f"  PHASE TRANSITION: mode={mode}, epoch={self.local_epoch}")
+        logger.info(f"{'='*80}")
+
+        old_opt = self.state_averager.optimizer
+        params = [p for group in old_opt.param_groups for p in group["params"]]
+
+        if mode == "full_gradient":
+            # (3-1) sign/1-bit 제거 → full gradient + Nesterov SGD
+            self.outer_sign_update = False
+            self.diloco_grad_averager.outer_sign_update = False
+            self.outer_sign_mode = "fixed_lr"
+
+            # compression 변경 ("none" → None → NoCompression)
+            # subprocess에도 전파하기 위해 update_compression() 사용
+            from utils import get_compression_kwargs
+            comp_str = pt.get("compression", "none")
+            new_compression_kwargs = get_compression_kwargs(None if comp_str == "none" else comp_str)
+            new_compression = new_compression_kwargs["grad_compression"]
+            self.diloco_grad_averager.update_compression(new_compression)
+
+            new_lr = pt.get("outer_lr", 0.7)
+            new_opt = torch.optim.SGD(params, lr=new_lr, momentum=0.9, nesterov=True)
+            logger.info(
+                f"  → outer_sign_update=False, compression={comp_str} (fp32 if none), "
+                f"optimizer=Nesterov SGD, lr={new_lr}"
+            )
+
+        elif mode == "sign_lion":
+            # (3-2) sign/1-bit 유지 → outer optimizer만 Lion으로 교체
+            from lion_optimizer import Lion
+            new_lr = pt.get("lion_lr", 1e-4)
+            lion_betas = tuple(pt.get("lion_betas", (0.95, 0.98)))
+            lion_wd = pt.get("lion_weight_decay", 0.0)
+            new_opt = Lion(params, lr=new_lr, betas=lion_betas, weight_decay=lion_wd)
+            logger.info(
+                f"  → sign/1-bit 유지, optimizer=Lion, lr={new_lr}, "
+                f"betas={lion_betas}, wd={lion_wd}"
+            )
+        else:
+            logger.error(f"Unknown phase_transition_mode: {mode}")
+            return
+
+        self.state_averager.optimizer = new_opt
+        self.diloco_grad_averager.offloaded_optimizer = new_opt
+
+        # LR scheduler 재생성 (전환 시점부터 남은 step에 대해)
+        remaining_steps = None
+        if hasattr(self, '_max_outer_optimization_steps') and self._max_outer_optimization_steps:
+            remaining_steps = max(1, self._max_outer_optimization_steps - self.local_epoch)
+        self.outer_lr_scheduler = self._create_outer_lr_scheduler(
+            "constant", 0, remaining_steps
+        )
+
+        self._phase_transitioned = True
+        logger.info(f"  Phase transition completed at epoch {self.local_epoch}")
+        logger.info(f"{'='*80}")
+
     def _update_global_epoch(self) -> None:
         """Depending on the configuration: aggregate gradients and/or parameters, perform global optimizer step
 
@@ -2985,13 +3373,14 @@ class DiLoCoOptimizer(Optimizer):
 
             assert self.state_averager.custom_gradients, "custom gradient must be enable for syncing pseudo gradients"
 
-            # adaptive_mean 모드: DHT에서 per-tensor abs_means 읽기 + 평균 계산
+            # adaptive_mean 모드: DHT에서 per-tensor magnitude 읽기 + 평균 계산
             if self.outer_sign_mode == "adaptive_mean" and self.tracker.global_progress.num_peers > 1:
-                self._averaged_abs_means = self.diloco_grad_averager._read_abs_means_from_dht(
+                self._averaged_abs_means, self._averaged_l2_rms = self.diloco_grad_averager._read_abs_means_from_dht(
                     epoch=self.local_epoch
                 )
             else:
                 self._averaged_abs_means = None
+                self._averaged_l2_rms = None
 
             # 통신된 averaged gradient를 outer optimizer에 로드
             # custom_gradients=True이므로 수동으로 averaged gradient를 로드해야 합니다.
@@ -3170,13 +3559,13 @@ class DiLoCoOptimizer(Optimizer):
         # Per-tensor pseudo gradient 통계 수집
         grad_stats = []
         averaged_abs_means = getattr(self, '_averaged_abs_means', None)
-        # adaptive_mean에서 사용할 abs_mean 인덱스 (선택된 텐서만 카운트)
-        abs_mean_idx = 0
+        averaged_l2_rms = getattr(self, '_averaged_l2_rms', None)
+        # magnitude 인덱스 (선택된 텐서만 카운트)
+        mag_idx = 0
         
         def _apply_grad(opt_param, grad_tensor, tensor_name):
             """averaged gradient를 opt_param.grad에 설정 (sign/adaptive_mean 변환 포함), 통계 수집"""
-            nonlocal abs_mean_idx
-            # 통계는 sign 적용 전 (averaged pseudo gradient 원본) 기준으로 수집
+            nonlocal mag_idx
             stats = {
                 'name': tensor_name,
                 'mean': float(grad_tensor.mean().item()),
@@ -3185,16 +3574,19 @@ class DiLoCoOptimizer(Optimizer):
                 'norm': float(grad_tensor.norm().item()),
                 'numel': grad_tensor.numel(),
                 'pos_ratio': float((grad_tensor > 0).sum().item()) / max(grad_tensor.numel(), 1),
+                'weight_mean': float(opt_param.data.mean().item()),
+                'weight_abs_mean': float(opt_param.data.abs().mean().item()),
+                'weight_std': float(opt_param.data.std().item()) if opt_param.data.numel() > 1 else 0.0,
             }
             
             if self.outer_sign_update:
                 if self.outer_sign_mode == "adaptive_mean" and averaged_abs_means is not None:
                     # adaptive_mean: magnitude = averaged mean(|pseudo_grad|), direction = sign(majority_vote)
-                    scale = averaged_abs_means[abs_mean_idx] if abs_mean_idx < len(averaged_abs_means) else 1e-8
+                    scale = averaged_abs_means[mag_idx] if mag_idx < len(averaged_abs_means) else 1e-8
                     scale = max(scale, 1e-8)
                     grad_tensor = scale * torch.sign(grad_tensor)
                     stats['adaptive_scale'] = scale
-                    abs_mean_idx += 1
+                    mag_idx += 1
                 else:
                     grad_tensor = torch.sign(grad_tensor)
             
@@ -3280,7 +3672,7 @@ class DiLoCoOptimizer(Optimizer):
         return lines
 
     def _log_pseudo_grad_stats(self, raw_stats: list | None, averaged_stats: list):
-        """매 outer epoch마다 tensor별 pseudo gradient 통계를 shell 출력 + CSV 저장
+        """매 outer epoch마다 tensor별 pseudo gradient 통계를 CSV로 저장 (shell 출력 없음)
         
         raw_stats: 통신 전, sign() 전 원본 pseudo gradient (이 노드만의 값)
         averaged_stats: 통신 후, sign() 전 averaged pseudo gradient (노드 간 평균)
@@ -3289,26 +3681,6 @@ class DiLoCoOptimizer(Optimizer):
             return
         
         epoch = self.local_epoch
-        
-        # Shell 출력
-        lines = [f"\n{'='*120}"]
-        lines.append(f"  Pseudo Gradient Statistics  (outer epoch {epoch})")
-        lines.append(f"{'='*120}")
-        
-        if raw_stats:
-            lines.extend(self._format_grad_stats_table(
-                f"[Local Raw]  Before sign() & communication  ({len(raw_stats)} tensors)", raw_stats
-            ))
-            lines.append("")
-        
-        lines.extend(self._format_grad_stats_table(
-            f"[Averaged]   After communication, before sign()  ({len(averaged_stats)} tensors)", averaged_stats
-        ))
-        
-        lines.append(f"{'='*120}")
-        logger.info('\n'.join(lines))
-        
-        # CSV 저장
         self._save_pseudo_grad_stats_csv(epoch, raw_stats, averaged_stats)
 
     def _save_pseudo_grad_stats_csv(
@@ -3327,6 +3699,7 @@ class DiLoCoOptimizer(Optimizer):
             fieldnames = [
                 'epoch', 'tensor_name', 'mean', 'abs_mean', 'std',
                 'l2_norm', 'pos_ratio', 'numel',
+                'weight_mean', 'weight_abs_mean', 'weight_std',
             ]
             if has_adaptive:
                 fieldnames.append('adaptive_scale')
@@ -3345,6 +3718,9 @@ class DiLoCoOptimizer(Optimizer):
                             'l2_norm': f"{s['norm']:.6f}",
                             'pos_ratio': f"{s['pos_ratio']:.6f}",
                             'numel': s['numel'],
+                            'weight_mean': f"{s.get('weight_mean', 0.0):.8f}",
+                            'weight_abs_mean': f"{s.get('weight_abs_mean', 0.0):.8f}",
+                            'weight_std': f"{s.get('weight_std', 0.0):.8f}",
                         }
                         if has_adaptive:
                             row['adaptive_scale'] = f"{s.get('adaptive_scale', 0.0):.8f}"

@@ -243,13 +243,36 @@ class HvConfig(BaseConfig):
     gradient_clip_norm: float = 1.0  # Maximum gradient norm for clipping
     # Outer sign update: pseudo-gradient에 sign()을 적용하여 Lion처럼 uniform magnitude로 업데이트
     outer_sign_update: bool = False
-    # outer_sign_mode: "fixed_lr" (고정 outer_lr) or "adaptive_mean" (텐서별 mean(|pseudo_grad|)를 step size로 사용)
+    # outer_sign_mode: magnitude 결정 방식
+    #   "fixed_lr"      — 고정 outer_lr
+    #   "adaptive_mean"  — 텐서별 mean(|pseudo_grad|)를 step size로 사용
     outer_sign_mode: Literal["fixed_lr", "adaptive_mean"] = "fixed_lr"
     # Outer LR scheduling (fixed_lr 모드에서 주로 사용)
     outer_lr_scheduler_type: Literal["constant", "cosine", "linear"] = "constant"
     outer_warmup_steps: int = 0  # outer optimization step 기준 warmup
+    # Outer optimizer type: Nesterov SGD vs plain SGD (독립 설정)
+    outer_use_nesterov_sgd: bool = True  # true → Nesterov SGD, false → plain SGD
+    outer_weight_decay: float = 0.0  # decoupled weight decay for outer optimizer
+    # ─── Outer Sign Momentum (Nesterov-Lion) ─────────────────────────────────
+    # sign 결정 전에 local EMA momentum을 적용하여 방향 안정성 향상.
+    # outer_use_nesterov_sgd와 독립적으로 동작.
+    outer_sign_momentum: bool = False
+    outer_sign_beta1: float = 0.95   # Lion interpolation weight (EMA vs current grad)
+    outer_sign_beta2: float = 0.98   # EMA decay rate
+    outer_sign_nesterov: bool = True  # pre-sign Nesterov lookahead
+    outer_sign_nesterov_mu: float = 0.9  # pre-sign Nesterov momentum coefficient
+    outer_sign_bias_correction: bool = False  # EMA bias correction (Adam-style)
     # Throughput adaptive sizing
     use_throughput_adaptive_sizing: bool = True  # If True, use throughput from previous rounds to adaptively adjust tensor partitioning
+    # Phase Transition: perplexity 기준 자동 전환
+    phase_transition_enabled: bool = False
+    phase_transition_perplexity: float = 50.0
+    phase_transition_mode: Literal["full_gradient", "sign_lion"] = "full_gradient"
+    phase_transition_compression: Literal["none", "fp16", "scaled-fp16", "uniform8bit", "quantile8bit", "blockwise8bit"] = "none"
+    phase_transition_outer_lr: float = 0.7
+    phase_transition_lion_lr: float = 1e-4
+    phase_transition_lion_betas: tuple[float, float] = (0.95, 0.98)
+    phase_transition_lion_weight_decay: float = 0.0
 
     
     @field_validator('initial_peers', mode='before')
@@ -995,8 +1018,25 @@ def train(config: Config):
         log(f"Using AdamW inner optimizer (lr={config.lr}, wd={config.inner_weight_decay}, betas={config.inner_betas})")
 
     if config.hv is not None:
-        outer_optimizer = partial(torch.optim.SGD, lr=config.hv.outer_lr, momentum=0.9, nesterov=True)
-        log(f"Using Nesterov SGD outer optimizer (lr={config.hv.outer_lr})")
+        # Outer optimizer: Nesterov SGD vs plain SGD (outer_sign_momentum과 독립)
+        if config.hv.outer_use_nesterov_sgd:
+            outer_optimizer = partial(
+                torch.optim.SGD, lr=config.hv.outer_lr,
+                momentum=0.9, nesterov=True, weight_decay=config.hv.outer_weight_decay,
+            )
+            log(f"Using Nesterov SGD outer optimizer (lr={config.hv.outer_lr}, momentum=0.9, wd={config.hv.outer_weight_decay})")
+        else:
+            outer_optimizer = partial(
+                torch.optim.SGD, lr=config.hv.outer_lr,
+                momentum=0, nesterov=False, weight_decay=config.hv.outer_weight_decay,
+            )
+            log(f"Using plain SGD outer optimizer (lr={config.hv.outer_lr}, wd={config.hv.outer_weight_decay})")
+        # Pre-sign momentum (outer_use_nesterov_sgd와 독립)
+        if config.hv.outer_sign_momentum:
+            log(f"  Pre-sign Lion EMA ENABLED: β₁={config.hv.outer_sign_beta1}, β₂={config.hv.outer_sign_beta2}"
+                f", bias_correction={'ON' if config.hv.outer_sign_bias_correction else 'OFF'}")
+            if config.hv.outer_sign_nesterov:
+                log(f"  Pre-sign Nesterov lookahead: μ={config.hv.outer_sign_nesterov_mu}")
         if config.hv.outer_sign_update:
             log(f"Outer sign update ENABLED [mode={config.hv.outer_sign_mode}]")
             if config.hv.outer_sign_mode == "adaptive_mean":
@@ -1127,6 +1167,22 @@ def train(config: Config):
             outer_lr_scheduler_type=config.hv.outer_lr_scheduler_type,
             outer_warmup_steps=config.hv.outer_warmup_steps,
             max_outer_optimization_steps=config.hv.max_outer_optimization_steps,
+            outer_sign_momentum=config.hv.outer_sign_momentum,
+            outer_sign_beta1=config.hv.outer_sign_beta1,
+            outer_sign_beta2=config.hv.outer_sign_beta2,
+            outer_sign_nesterov=config.hv.outer_sign_nesterov,
+            outer_sign_nesterov_mu=config.hv.outer_sign_nesterov_mu,
+            outer_sign_bias_correction=config.hv.outer_sign_bias_correction,
+            phase_transition_config={
+                "enabled": config.hv.phase_transition_enabled,
+                "perplexity": config.hv.phase_transition_perplexity,
+                "mode": config.hv.phase_transition_mode,
+                "compression": config.hv.phase_transition_compression,
+                "outer_lr": config.hv.phase_transition_outer_lr,
+                "lion_lr": config.hv.phase_transition_lion_lr,
+                "lion_betas": config.hv.phase_transition_lion_betas,
+                "lion_weight_decay": config.hv.phase_transition_lion_weight_decay,
+            },
         )
 
         diloco_args.update(get_compression_kwargs(config.hv.hivemind_compression))
@@ -1143,6 +1199,7 @@ def train(config: Config):
             diloco_args["matchmaking_time"] = config.hv.matchmaking_time
 
         optimizer = DiLoCoOptimizer(**diloco_args)
+        optimizer._world_rank = config.hv.world_rank
         
         print(f"[DEBUG] DiLoCoOptimizer initialized:")
         print(f"[DEBUG]   num_inner_steps={optimizer.num_inner_steps}")
@@ -1360,6 +1417,12 @@ def train(config: Config):
 
                     # 노드 내 모든 rank가 동기화될 때까지 대기
                     torch.distributed.barrier()
+
+                    # Phase transition: validation perplexity를 optimizer에 전달
+                    if local_rank == 0 and hasattr(optimizer, 'set_validation_perplexity'):
+                        val_ppl = validation_metrics.get('validation_perplexity')
+                        if val_ppl is not None:
+                            optimizer.set_validation_perplexity(val_ppl)
 
             scaler.update()
 
