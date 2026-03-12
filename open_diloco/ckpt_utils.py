@@ -18,6 +18,7 @@ class CkptConfig(BaseConfig):
     interval: int | None = None
     path: str = "outputs"
     topk: int | None = None  # how many checkpoints to keep
+    pre_transition_resume: str | None = None  # pre_transition_ckpt.pt 경로에서 resume (torch.save 형식)
 
 
 def get_resume_info(ckpt_config: CkptConfig) -> tuple[bool, str | None]:
