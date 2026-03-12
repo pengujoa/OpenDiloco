@@ -164,6 +164,17 @@ class HvConfig(BaseConfig):
     outer_lr_scheduler_type: Literal["constant", "cosine", "linear"] = "constant"
     outer_warmup_steps: int = 0  # outer optimization step 기준 warmup
     use_throughput_adaptive_sizing: bool = True
+    # Phase Transition: perplexity 기준 자동 전환
+    phase_transition_enabled: bool = False
+    phase_transition_perplexity: float = 50.0
+    phase_transition_mode: Literal["full_gradient", "sign_lion"] = "full_gradient"
+    phase_transition_compression: Literal["none", "fp16", "scaled-fp16", "uniform8bit", "quantile8bit", "blockwise8bit"] = "none"
+    phase_transition_outer_lr: float = 0.7
+    phase_transition_lion_lr: float = 1e-4
+    phase_transition_lion_betas: tuple[float, float] = (0.95, 0.98)
+    phase_transition_lion_weight_decay: float = 0.0
+    phase_transition_lion_lr_scheduler: str = "cosine"
+    phase_transition_lion_warmup_steps: int = 0
 
     @field_validator('initial_peers', mode='before')
     def _parse_str_to_str_list(cls, v: Union[str, List[str]]) -> List[str]:
@@ -631,6 +642,18 @@ def train(config: Config):
             outer_lr_scheduler_type=config.hv.outer_lr_scheduler_type,
             outer_warmup_steps=config.hv.outer_warmup_steps,
             max_outer_optimization_steps=config.hv.max_outer_optimization_steps,
+            phase_transition_config={
+                "enabled": config.hv.phase_transition_enabled,
+                "perplexity": config.hv.phase_transition_perplexity,
+                "mode": config.hv.phase_transition_mode,
+                "compression": config.hv.phase_transition_compression,
+                "outer_lr": config.hv.phase_transition_outer_lr,
+                "lion_lr": config.hv.phase_transition_lion_lr,
+                "lion_betas": config.hv.phase_transition_lion_betas,
+                "lion_weight_decay": config.hv.phase_transition_lion_weight_decay,
+                "lion_lr_scheduler": config.hv.phase_transition_lion_lr_scheduler,
+                "lion_warmup_steps": config.hv.phase_transition_lion_warmup_steps,
+            },
         )
         diloco_args.update(get_compression_kwargs(config.hv.hivemind_compression))
         if "averager_opts" not in diloco_args:
@@ -642,6 +665,7 @@ def train(config: Config):
             diloco_args["matchmaking_time"] = config.hv.matchmaking_time
 
         optimizer = DiLoCoOptimizer(**diloco_args)
+        optimizer._world_rank = config.hv.world_rank
 
         # ── Register gather/scatter hooks ─────────────────────────────────
         if config.parallelism == "tp":

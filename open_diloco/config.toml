@@ -5,6 +5,7 @@ path_model = "PrimeIntellect/llama-150m-fresh"
 dataset_name_or_path = "$C4"
 
 # Training optimization
+inner_optimizer_type = "lion"  # "adamw" or "lion" (Lion 선택 시 lr/wd 자동 스케일링)
 lr = 4e-4
 warmup_steps = 1000
 max_steps = 88000
@@ -26,6 +27,7 @@ lora = false
 [ckpt]
 interval = 200000
 path = "${EXP}_ckpt"
+# pre_transition_resume = "motivation_emnlp_4nodes_1345_ckpt/model_step_5775_pre_phase_transition/pre_transition_ckpt.pt"  # phase transition 직전 체크포인트에서 resume
 
 # Hivemind configuration
 [hv]
@@ -34,6 +36,7 @@ local_steps = 50
 max_outer_optimization_steps = 500
 matchmaking_time = 300
 averaging_timeout = 1800
+average_state_every = 1  # 사실상 state averaging 비활성화 (1 = 매 epoch, 999999 = 끔)
 skip_load_from_peers = true
 initial_peers = ["$PEER"]
 world_rank = "${WORLD_RANK}"
@@ -64,7 +67,12 @@ warmup_epochs = 5  # 초기 N epoch 동안은 모든 레이어 전송
 # 기존 동작(sign 안 씀)으로 돌아가려면 outer_sign_update = false
 outer_sign_update = true
 
-# outer_sign_mode: sign update 시 업데이트 크기(magnitude)를 결정하는 방식
+# outer_sign_aggregation: 노드 간 gradient 집계 방식
+#   "majority_vote" — sign만 통신 후 token-weighted 평균 (다수결). sign1bit 사용.
+#   "weighted_sum"  — Σ_node (sign × adaptive_mean × token_weight) 합산, majority vote 없음. sign1bit 통신.
+outer_sign_aggregation = "majority_vote"
+
+# outer_sign_mode: sign update 시 업데이트 크기(magnitude)를 결정하는 방식 (majority_vote일 때만 적용)
 #   "fixed_lr"      — 고정 outer_lr 사용 (기존 방식). outer_lr_scheduler_type으로 decay 가능
 #   "adaptive_mean"  — 텐서별 mean(|raw_pseudo_grad|)를 step size로 사용.
 #                     outer_lr은 global multiplier로 작동.
@@ -75,7 +83,7 @@ outer_sign_mode = "adaptive_mean"
 # outer_lr 역할:
 #   - outer_sign_mode = "fixed_lr"      → 그대로 step size로 사용
 #   - outer_sign_mode = "adaptive_mean" → global multiplier (magnitude가 실제 step size)
-outer_lr = 1.0
+outer_lr = 0.5
 
 # Outer optimizer: Nesterov SGD vs plain SGD
 #   true  → Nesterov SGD (momentum=0.9): 파라미터 업데이트 궤적을 smoothing
@@ -92,7 +100,7 @@ outer_use_nesterov_sgd = true
 # adaptive_mean 모드: magnitude가 자연 감소하므로 "constant" 적합.
 # fixed_lr 모드: 후반부 안정을 위해 "cosine" 또는 "linear" 권장.
 outer_lr_scheduler_type = "constant"
-outer_warmup_steps = 0  # outer optimization step 기준 warmup
+outer_warmup_steps = 0   # outer optimization step 기준 warmup
 
 # Outer weight decay (decoupled)
 # sign()이 inner weight decay 효과를 소실시킬 수 있으므로 outer level에서 옵션 제공.
@@ -126,8 +134,8 @@ outer_weight_decay = 0.0   # 0이면 비활성
 outer_sign_momentum = false
 # β 값: pseudo-gradient는 이미 50 inner step의 평균이므로 일반 Lion(0.95/0.98)보다
 # 훨씬 낮은 값이 적합. 높은 β는 over-smoothing → 변화에 둔감.
-outer_sign_beta1 = 0.7     # Lion interpolation: EMA vs 현재 grad (낮을수록 현재 비중 ↑)
-outer_sign_beta2 = 0.9     # EMA decay rate (낮을수록 빠른 적응)
+outer_sign_beta1 = 0.3     # Lion interpolation: EMA vs 현재 grad (낮을수록 현재 비중 ↑)
+outer_sign_beta2 = 0.5     # EMA decay rate (낮을수록 빠른 적응)
 outer_sign_nesterov = false  # pre-sign Nesterov lookahead (pseudo-grad에서는 비활성 권장)
 outer_sign_nesterov_mu = 0.9  # pre-sign Nesterov momentum coefficient
 
@@ -135,6 +143,46 @@ outer_sign_nesterov_mu = 0.9  # pre-sign Nesterov momentum coefficient
 # EMA가 zero에서 시작하므로 초반 step이 편향됨. 500 outer step 중 초반 20 step = 학습의 4%.
 # true이면 m̂ = m / (1 - β₂^t) 로 보정하여 초반 EMA 품질 개선.
 outer_sign_bias_correction = false
+
+# ─── MIEF + LASS (Momentum-Integrated Error Feedback + Layer-wise Adaptive Sign Scaling)
+#
+# MIEF: 모멘텀 자체에 error feedback을 통합하여 양자화 손실 관리.
+#   V_t = β_v · V_{t-1} + (1-β_v) · g_t             (local EMA: staircase 현상 완화)
+#   m_t = β₁ · m_{t-1} + (1-β₁) · (V_t + e_{t-1})   (momentum에 잔차 보정 통합)
+#   U_t = sign(m_t)                                    (1-bit 양자화)
+#   e_t = (V_t + e_{t-1}) - γ_t · U_t                 (잔차 저장)
+#
+# LASS: γ_t = mean(|m_t|) per tensor → sign에 곱하여 layer별 adaptive step size.
+#   AdamW처럼 '중요 파라미터는 크게, 아닌 것은 작게' 효과.
+#
+# MIEF=true이면 outer_sign_momentum/error_feedback 대신 MIEF가 이 둘을 통합 처리.
+# outer_sign_mode="adaptive_mean" + majority_vote 조합 권장 (LASS gamma가 DHT로 공유됨).
+outer_sign_mief = false
+outer_sign_mief_beta_v = 0.95   # local EMA decay (낮을수록 현재 grad 비중 ↑, staircase 완화)
+
+# ─── Stats 수집 최적화 ──────────────────────────────────────────────────────
+# true: pseudo-gradient 통계를 norm + abs_mean만 수집 (GPU sync 최소화)
+#   - mean, std, pos_ratio, weight_* 등 로깅 전용 항목 생략
+#   - 111 텐서 기준: .item() 888회 → 111~222회로 감소 (~4-8x 빠름)
+# false: 모든 통계 수집 (디버깅/분석 시)
+minimal_pseudo_grad_stats = true
+
+# ─── Error Feedback (1-bit 양자화 잔차 보정) ────────────────────────────────
+# sign(g) 양자화 시 버려지는 잔차(g - sign(g)·scale)를 로컬에 저장했다가
+# 다음 outer step에서 pseudo-gradient에 더해줌.
+# 여러 step을 거치면 전체 gradient 정보가 손실 없이 반영됨.
+#
+# 수식:
+#   G̃_t = G_t + e_{t-1}              (이전 잔차 보정)
+#   u_t  = sign(G̃_t)                 (양자화 & 통신)
+#   e_t  = G̃_t - u_t · mean(|G̃_t|)  (잔차 저장, scale = mean(|G̃_t|))
+#
+# outer_sign_momentum=true이면 momentum 적용 후 sign 취하는 단계에서도 잔차 보정 적용:
+#   G̃_t = G_t + e_{t-1}
+#   V_t  = β₁·m_{t-1} + (1-β₁)·G̃_t
+#   u_t  = sign(V_t)
+#   e_t  = V_t - u_t · mean(|V_t|)
+outer_sign_error_feedback = false
 
 # Hivemind compression: outer_sign_update=true일 때 자동으로 "sign1bit" 설정됨
 # 수동 설정 시 사용 가능한 값: "fp16", "scaled-fp16", "uniform8bit", "quantile8bit", "blockwise8bit", "sign1bit"
@@ -152,7 +200,7 @@ gradient_clip_norm = 2.0  # 최대 gradient norm
 # phase_transition_mode 선택:
 #   "full_gradient" — sign/1-bit 제거 → full gradient 통신 + Nesterov SGD
 #   "sign_lion"     — sign/1-bit 유지 → outer optimizer만 Lion으로 교체
-phase_transition_enabled = true
+phase_transition_enabled = false
 phase_transition_perplexity = 50          # 이 perplexity 이하 → 전환 트리거
 phase_transition_mode = "full_gradient"     # "full_gradient" or "sign_lion"
 
@@ -161,6 +209,8 @@ phase_transition_compression = "none"  # 전환 후 compression ("none"=fp32, "f
 phase_transition_outer_lr = 0.7                # 전환 후 outer_lr
 
 # (sign_lion 모드 전용)
-phase_transition_lion_lr = 1e-4             # Lion outer_lr
-phase_transition_lion_betas = [0.95, 0.98]  # Lion betas
-phase_transition_lion_weight_decay = 0.0    # Lion weight decay
+phase_transition_lion_lr = 1e-3             # Lion outer_lr
+phase_transition_lion_betas = [0.98, 0.99]  # Lion betas
+phase_transition_lion_weight_decay = 0    # Lion weight decay
+phase_transition_lion_lr_scheduler = "constant"  # "constant", "cosine", "linear" (Lion 논문: cosine 권장)
+phase_transition_lion_warmup_steps = 0         # 전환 시점 기준 warmup steps
