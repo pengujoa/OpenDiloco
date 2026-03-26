@@ -61,10 +61,13 @@ from ckpt_utils import (
     CkptConfig,
     check_checkpoint_path_access,
     delete_old_checkpoints,
+    get_ckpt_base_path,
+    get_parameter_tracking_log_dir,
     get_diloco_rank_dir_name,
     get_resume_info,
     load_checkpoint,
     save_checkpoint,
+    should_save_final_checkpoint,
 )
 from hivemind_diloco import AllReduceStrategy, DiLoCoOptimizer, wait_for_all_nodes_validation_complete
 from open_diloco.utils import WandbLogger, DummyLogger
@@ -246,8 +249,7 @@ class HvConfig(BaseConfig):
     outer_sign_update: bool = False
     # outer_sign_aggregation: 노드 간 집계 방식
     #   "majority_vote" — sign만 통신 후 token-weighted 평균 (다수결)
-    #   "weighted_sum"  — Σ (sign × adaptive_mean × token_weight), fp16 통신
-    outer_sign_aggregation: Literal["majority_vote", "weighted_sum"] = "majority_vote"
+    outer_sign_aggregation: Literal["majority_vote"] = "majority_vote"
     # outer_sign_mode: magnitude 결정 방식 (majority_vote일 때만)
     #   "fixed_lr"      — 고정 outer_lr
     #   "adaptive_mean"  — 텐서별 mean(|pseudo_grad|)를 step size로 사용
@@ -260,33 +262,10 @@ class HvConfig(BaseConfig):
     # Outer optimizer type: Nesterov SGD vs plain SGD (독립 설정)
     outer_use_nesterov_sgd: bool = True  # true → Nesterov SGD, false → plain SGD
     outer_weight_decay: float = 0.0  # decoupled weight decay for outer optimizer
-    # ─── Outer Sign Momentum (Nesterov-Lion) ─────────────────────────────────
-    # sign 결정 전에 local EMA momentum을 적용하여 방향 안정성 향상.
-    # outer_use_nesterov_sgd와 독립적으로 동작.
-    outer_sign_momentum: bool = False
-    outer_sign_beta1: float = 0.95   # Lion interpolation weight (EMA vs current grad)
-    outer_sign_beta2: float = 0.98   # EMA decay rate
-    outer_sign_nesterov: bool = True  # pre-sign Nesterov lookahead
-    outer_sign_nesterov_mu: float = 0.9  # pre-sign Nesterov momentum coefficient
-    outer_sign_bias_correction: bool = False  # EMA bias correction (Adam-style)
-    # ─── MIEF (Momentum-Integrated Error Feedback) + LASS ────────────────────
-    outer_sign_mief: bool = False  # MIEF+LASS 활성화
-    outer_sign_mief_beta_v: float = 0.3  # local EMA decay for pseudo-gradient smoothing
     # ─── Stats 수집 최적화 ────────────────────────────────────────────────────
     minimal_pseudo_grad_stats: bool = False  # true: norm+abs_mean만 수집 (GPU sync 최소화)
     # Throughput adaptive sizing
     use_throughput_adaptive_sizing: bool = True  # If True, use throughput from previous rounds to adaptively adjust tensor partitioning
-    # Phase Transition: perplexity 기준 자동 전환
-    phase_transition_enabled: bool = False
-    phase_transition_perplexity: float = 50.0
-    phase_transition_mode: Literal["full_gradient", "sign_lion"] = "full_gradient"
-    phase_transition_compression: Literal["none", "fp16", "scaled-fp16", "uniform8bit", "quantile8bit", "blockwise8bit"] = "none"
-    phase_transition_outer_lr: float = 0.7
-    phase_transition_lion_lr: float = 1e-4
-    phase_transition_lion_betas: tuple[float, float] = (0.95, 0.98)
-    phase_transition_lion_weight_decay: float = 0.0
-    phase_transition_lion_lr_scheduler: str = "cosine"
-    phase_transition_lion_warmup_steps: int = 0
 
     
     @field_validator('initial_peers', mode='before')
@@ -750,7 +729,7 @@ def train(config: Config):
         sharding_strategy = ShardingStrategy.NO_SHARD
         log("Hivemind is used, ShardingStrategy.NO_SHARD is used")
 
-    resume_from_ckpt, resume_path = get_resume_info(config.ckpt)
+    resume_from_ckpt, resume_path = get_resume_info(config)
 
     if rank == 0:
         logger_cls = WandbLogger if config.metric_logger_type == "wandb" else DummyLogger
@@ -806,7 +785,7 @@ def train(config: Config):
             log(f"Published node info: worker_id={worker_id}, gpu_count={local_world_size}, per_device_batch_size={config.per_device_train_batch_size}")
 
     if local_rank == 0:
-        check_checkpoint_path_access(config.ckpt.path, rank, config.hv.world_rank if config.hv else None)
+        check_checkpoint_path_access(get_ckpt_base_path(config), rank, config.hv.world_rank if config.hv else None)
 
     # DataLoader preparation
     tokenizer = AutoTokenizer.from_pretrained("mistralai/Mistral-7B-v0.1", use_fast=True, resume_download=True)
@@ -1032,7 +1011,7 @@ def train(config: Config):
         log(f"Using AdamW inner optimizer (lr={config.lr}, wd={config.inner_weight_decay}, betas={config.inner_betas})")
 
     if config.hv is not None:
-        # Outer optimizer: Nesterov SGD vs plain SGD (outer_sign_momentum과 독립)
+        # Outer optimizer: Nesterov SGD vs plain SGD
         if config.hv.outer_use_nesterov_sgd:
             outer_optimizer = partial(
                 torch.optim.SGD, lr=config.hv.outer_lr,
@@ -1045,23 +1024,13 @@ def train(config: Config):
                 momentum=0, nesterov=False, weight_decay=config.hv.outer_weight_decay,
             )
             log(f"Using plain SGD outer optimizer (lr={config.hv.outer_lr}, wd={config.hv.outer_weight_decay})")
-        # Pre-sign momentum (outer_use_nesterov_sgd와 독립)
-        if config.hv.outer_sign_momentum:
-            log(f"  Pre-sign Lion EMA ENABLED: β₁={config.hv.outer_sign_beta1}, β₂={config.hv.outer_sign_beta2}"
-                f", bias_correction={'ON' if config.hv.outer_sign_bias_correction else 'OFF'}")
-            if config.hv.outer_sign_nesterov:
-                log(f"  Pre-sign Nesterov lookahead: μ={config.hv.outer_sign_nesterov_mu}")
-        if config.hv.outer_sign_mief:
-            log(f"  MIEF+LASS ENABLED: β_v={config.hv.outer_sign_mief_beta_v}, β₁={config.hv.outer_sign_beta1}, LASS γ=mean(|m_t|)")
         if config.hv.average_state_every > 1:
             log(f"State averaging: every {config.hv.average_state_every} epochs ({'DISABLED' if config.hv.average_state_every > 10000 else 'reduced'})")
         else:
             log(f"State averaging: every epoch (default)")
         if config.hv.outer_sign_update:
             log(f"Outer sign update ENABLED [aggregation={config.hv.outer_sign_aggregation}, mode={config.hv.outer_sign_mode}, error_feedback={'ON' if config.hv.outer_sign_error_feedback else 'OFF'}]")
-            if config.hv.outer_sign_aggregation == "weighted_sum":
-                log(f"  weighted_sum: sign1bit + all-reduce weight=token_weight×avg_magnitude, DHT per-tensor magnitude")
-            elif config.hv.outer_sign_mode == "adaptive_mean":
+            if config.hv.outer_sign_mode == "adaptive_mean":
                 log(f"  adaptive_mean: step_size = mean(|pseudo_grad|) per tensor, outer_lr={config.hv.outer_lr} as global multiplier")
             else:
                 log(f"  fixed_lr: step_size = outer_lr={config.hv.outer_lr}")
@@ -1093,14 +1062,7 @@ def train(config: Config):
             log(f"Using cosine decay schedule for AdamW (warmup={config.warmup_steps}, total={config.total_steps})")
 
     if config.hv is not None:
-        if config.ckpt.pre_transition_resume is not None:
-            # pre_transition_ckpt.pt에서 model weights만 먼저 로드
-            # (DiLoCoOptimizer가 state_averager에 초기 파라미터를 복사하므로 optimizer 생성 전에 로드 필요)
-            pt_ckpt = torch.load(config.ckpt.pre_transition_resume, map_location="cpu")
-            model.load_state_dict(pt_ckpt["model"])
-            log(f"Pre-transition checkpoint: model weights loaded from {config.ckpt.pre_transition_resume}")
-            del pt_ckpt  # optimizer state는 optimizer 생성 후 다시 로드
-        elif resume_from_ckpt:
+        if resume_from_ckpt:
             # We need to load with a fake optimizer to set the model parameters correctly before initializing the DiLoCoOptimizer
             # This is because the DiLoCoOptimizer makes a copy of the model parameters for the state averager which is hard to update later
             # We also need to do this on follower workers so that the world_messenger has friends to talk to when it does its two loads
@@ -1198,27 +1160,7 @@ def train(config: Config):
             outer_lr_scheduler_type=config.hv.outer_lr_scheduler_type,
             outer_warmup_steps=config.hv.outer_warmup_steps,
             max_outer_optimization_steps=config.hv.max_outer_optimization_steps,
-            outer_sign_momentum=config.hv.outer_sign_momentum,
-            outer_sign_beta1=config.hv.outer_sign_beta1,
-            outer_sign_beta2=config.hv.outer_sign_beta2,
-            outer_sign_nesterov=config.hv.outer_sign_nesterov,
-            outer_sign_nesterov_mu=config.hv.outer_sign_nesterov_mu,
-            outer_sign_bias_correction=config.hv.outer_sign_bias_correction,
-            outer_sign_mief=config.hv.outer_sign_mief,
-            outer_sign_mief_beta_v=config.hv.outer_sign_mief_beta_v,
             minimal_pseudo_grad_stats=config.hv.minimal_pseudo_grad_stats,
-            phase_transition_config={
-                "enabled": config.hv.phase_transition_enabled,
-                "perplexity": config.hv.phase_transition_perplexity,
-                "mode": config.hv.phase_transition_mode,
-                "compression": config.hv.phase_transition_compression,
-                "outer_lr": config.hv.phase_transition_outer_lr,
-                "lion_lr": config.hv.phase_transition_lion_lr,
-                "lion_betas": config.hv.phase_transition_lion_betas,
-                "lion_weight_decay": config.hv.phase_transition_lion_weight_decay,
-                "lion_lr_scheduler": config.hv.phase_transition_lion_lr_scheduler,
-                "lion_warmup_steps": config.hv.phase_transition_lion_warmup_steps,
-            },
         )
 
         diloco_args.update(get_compression_kwargs(config.hv.hivemind_compression))
@@ -1236,6 +1178,7 @@ def train(config: Config):
         if config.hv.matchmaking_time is not None:
             diloco_args["matchmaking_time"] = config.hv.matchmaking_time
 
+        diloco_args["log_dir"] = get_parameter_tracking_log_dir(config)
         optimizer = DiLoCoOptimizer(**diloco_args)
         optimizer._world_rank = config.hv.world_rank
         
@@ -1249,30 +1192,7 @@ def train(config: Config):
             optimizer.inner_optimizer
         )  # scheduler(optimizer) should work but better to make it explicit here
 
-        if config.ckpt.pre_transition_resume is not None:
-            # pre_transition_ckpt.pt에서 optimizer/scheduler state 로드
-            pt_ckpt = torch.load(config.ckpt.pre_transition_resume, map_location="cpu")
-            optimizer.inner_optimizer.load_state_dict(pt_ckpt["inner_optimizer"])
-            log(f"Pre-transition checkpoint: inner optimizer loaded")
-            # outer optimizer는 새 config의 outer opt를 사용하므로 로드하지 않음
-            # (phase transition 이후 다른 outer opt를 시도하는 것이 목적)
-            scheduler.load_state_dict(pt_ckpt["scheduler"])
-            log(f"Pre-transition checkpoint: scheduler loaded")
-            if scaler is not None and "scaler" in pt_ckpt:
-                scaler.load_state_dict(pt_ckpt["scaler"])
-                log(f"Pre-transition checkpoint: scaler loaded")
-            start_step = pt_ckpt.get("step", scheduler.last_epoch)
-            log(f"Pre-transition checkpoint: resuming from step {start_step}")
-            del pt_ckpt
-            optimizer.update_num_inner_steps(config.hv.local_steps)
-            # config의 phase_transition 설정으로 outer optimizer 교체
-            if config.hv.phase_transition_enabled:
-                optimizer._apply_phase_transition()
-                log(f"Pre-transition checkpoint: applied phase transition ({config.hv.phase_transition_mode})")
-            else:
-                optimizer._phase_transitioned = True
-                log(f"Pre-transition checkpoint: phase transition disabled (using config outer optimizer)")
-        elif resume_from_ckpt:
+        if resume_from_ckpt:
             last_loss = load_checkpoint(
                 checkpoint_path=ckpt_path,
                 model=model,
@@ -1325,33 +1245,7 @@ def train(config: Config):
 
     model.train()
 
-    # Phase transition 직전 체크포인트 콜백 등록 (local_rank 0에서만 호출됨)
-    # NO_SHARD이므로 rank 0이 전체 모델을 갖고 있어 torch.save()로 충분
     _current_step_ref = [start_step]
-
-    if world_messenger_hv and config.ckpt.path and isinstance(optimizer, DiLoCoOptimizer):
-        def _pre_phase_transition_checkpoint():
-            step = _current_step_ref[0]
-            ckpt_dir = os.path.join(
-                config.ckpt.path,
-                f"{CKPT_PREFIX}_{int(step)}_pre_phase_transition",
-            )
-            os.makedirs(ckpt_dir, exist_ok=True)
-            ckpt_file = os.path.join(ckpt_dir, "pre_transition_ckpt.pt")
-            log(f"Saving pre-phase-transition checkpoint at step {step} to {ckpt_file}")
-            state = {
-                "model": model.state_dict(),
-                "inner_optimizer": optimizer.inner_optimizer.state_dict(),
-                "outer_optimizer": optimizer.state_averager.optimizer.state_dict(),
-                "scheduler": scheduler.state_dict(),
-                "step": step,
-            }
-            if scaler is not None:
-                state["scaler"] = scaler.state_dict()
-            torch.save(state, ckpt_file)
-            log(f"Pre-phase-transition checkpoint saved at step {step}")
-
-        optimizer.pre_phase_transition_hook = _pre_phase_transition_checkpoint
 
     memory_tracker = MemoryUsageTracker(model=model, optimizer=optimizer)
 
@@ -1375,6 +1269,7 @@ def train(config: Config):
     local_training_start_time = None
     local_training_time = 0.0
 
+    real_step = start_step  # used after loop for final checkpoint if loop body never runs
     for step, batch in enumerate(iterable=train_dataloader, start=start_step * gradient_accumulation_steps):
         real_step = (step + 1) // gradient_accumulation_steps
         _current_step_ref[0] = real_step
@@ -1507,13 +1402,6 @@ def train(config: Config):
 
                     # 노드 내 모든 rank가 동기화될 때까지 대기
                     torch.distributed.barrier()
-
-                    # Phase transition: validation perplexity를 optimizer에 전달 (local_rank 0만 DHT 통신)
-                    # 콜백에서 torch.save()로 rank 0만 저장 → collective op 없음
-                    if local_rank == 0 and hasattr(optimizer, 'set_validation_perplexity'):
-                        val_ppl = validation_metrics.get('validation_perplexity')
-                        if val_ppl is not None:
-                            optimizer.set_validation_perplexity(val_ppl)
 
             scaler.update()
 
@@ -1687,7 +1575,7 @@ def train(config: Config):
             # Save checkpoint every 'checkpoint_interval' steps
             if config.ckpt.interval is not None and real_step % config.ckpt.interval == 0:
                 log(f"saving at step {real_step}, step {step+1}")
-                ckpt_path = os.path.join(config.ckpt.path, f"{CKPT_PREFIX}_{int(real_step)}")
+                ckpt_path = os.path.join(get_ckpt_base_path(config), f"{CKPT_PREFIX}_{int(real_step)}")
 
                 if config.hv:
                     ckpt_path = os.path.join(ckpt_path, get_diloco_rank_dir_name(config.hv.world_rank))
@@ -1721,7 +1609,7 @@ def train(config: Config):
                 if local_rank == 0:
                     # only the rank 0 deletes the checkpoints
                     if config.ckpt.topk is not None:
-                        ckpt_deleted = delete_old_checkpoints(config.ckpt.path, config.ckpt.topk)
+                        ckpt_deleted = delete_old_checkpoints(get_ckpt_base_path(config), config.ckpt.topk)
                         if ckpt_deleted:
                             log(f"Deleted old checkpoints: {ckpt_deleted}")
 
@@ -1737,6 +1625,42 @@ def train(config: Config):
 
             if config.max_steps is not None and real_step >= config.max_steps:
                 break
+
+    # Final checkpoint if last step was not already saved at interval
+    if should_save_final_checkpoint(real_step, config.ckpt.interval):
+        log(f"saving final checkpoint at step {real_step}")
+        ckpt_path = os.path.join(get_ckpt_base_path(config), f"{CKPT_PREFIX}_{int(real_step)}")
+        if config.hv:
+            ckpt_path = os.path.join(ckpt_path, get_diloco_rank_dir_name(config.hv.world_rank))
+        if world_messenger_hv:
+            assert isinstance(optimizer, DiLoCoOptimizer)
+            with optimizer.tracker.pause_updates():
+                save_checkpoint(
+                    checkpoint_path=ckpt_path,
+                    model=model,
+                    optimizer=optimizer.inner_optimizer,
+                    scheduler=scheduler,
+                    outer_optimizer=optimizer.state_averager.optimizer,
+                    loss=0.0,
+                    scaler=scaler,
+                    data_loader=train_dataloader,
+                    save_global_state=True,
+                )
+        else:
+            save_checkpoint(
+                checkpoint_path=ckpt_path,
+                model=model,
+                optimizer=optimizer,
+                scheduler=scheduler,
+                loss=0.0,
+                scaler=scaler,
+                data_loader=train_dataloader,
+                save_global_state=rank == 0,
+            )
+        if local_rank == 0 and config.ckpt.topk is not None:
+            ckpt_deleted = delete_old_checkpoints(get_ckpt_base_path(config), config.ckpt.topk)
+            if ckpt_deleted:
+                log(f"Deleted old checkpoints: {ckpt_deleted}")
 
     log("Training completed.")
     if rank == 0:

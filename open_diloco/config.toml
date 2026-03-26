@@ -12,6 +12,7 @@ max_steps = 88000
 validation = true
 per_device_train_batch_size = 4
 total_batch_size = 16
+find_max_batch_size = false
 precision = "fp16-mixed"
 # parallelism = "tp"  # "tp" (tensor parallel) or "pp" (pipeline parallel) — only used by train_mp.py
 adjust_local_steps = true
@@ -27,7 +28,7 @@ lora = false
 [ckpt]
 interval = 200000
 path = "${EXP}_ckpt"
-# pre_transition_resume = "motivation_emnlp_4nodes_1345_ckpt/model_step_5775_pre_phase_transition/pre_transition_ckpt.pt"  # phase transition 직전 체크포인트에서 resume
+
 
 # Hivemind configuration
 [hv]
@@ -36,13 +37,13 @@ local_steps = 50
 max_outer_optimization_steps = 500
 matchmaking_time = 300
 averaging_timeout = 1800
-average_state_every = 1  # 사실상 state averaging 비활성화 (1 = 매 epoch, 999999 = 끔)
+average_state_every = 999999999  # 사실상 state averaging 비활성화 (1 = 매 epoch, 999999 = 끔)
 skip_load_from_peers = true
 initial_peers = ["$PEER"]
 world_rank = "${WORLD_RANK}"
 
 token_weighted_aggregation = true
-token_weight_mode = "sqrt"  # "linear" (w ∝ tokens) or "sqrt" (w ∝ √tokens)
+token_weight_mode = "linear"  # "linear" (w ∝ tokens) or "sqrt" (w ∝ √tokens)
 
 # Throughput Adaptive Sizing - 이전 round의 throughput 값을 기반으로 텐서 크기 조정
 use_throughput_adaptive_sizing = true  # true면 throughput 기반 조정 활성화, false면 균등 분할 사용
@@ -69,7 +70,6 @@ outer_sign_update = true
 
 # outer_sign_aggregation: 노드 간 gradient 집계 방식
 #   "majority_vote" — sign만 통신 후 token-weighted 평균 (다수결). sign1bit 사용.
-#   "weighted_sum"  — Σ_node (sign × adaptive_mean × token_weight) 합산, majority vote 없음. sign1bit 통신.
 outer_sign_aggregation = "majority_vote"
 
 # outer_sign_mode: sign update 시 업데이트 크기(magnitude)를 결정하는 방식 (majority_vote일 때만 적용)
@@ -83,16 +83,11 @@ outer_sign_mode = "adaptive_mean"
 # outer_lr 역할:
 #   - outer_sign_mode = "fixed_lr"      → 그대로 step size로 사용
 #   - outer_sign_mode = "adaptive_mean" → global multiplier (magnitude가 실제 step size)
-outer_lr = 0.5
+outer_lr = 0.3
 
 # Outer optimizer: Nesterov SGD vs plain SGD
 #   true  → Nesterov SGD (momentum=0.9): 파라미터 업데이트 궤적을 smoothing
 #   false → plain SGD (momentum=0): 업데이트에 추가 momentum 없음
-# outer_sign_momentum과 독립적으로 설정 가능:
-#   - 둘 다 true  → pre-sign EMA(투표 방향 안정화) + Nesterov(업데이트 궤적 smoothing)
-#   - momentum만  → pre-sign EMA + plain SGD (pre-sign momentum 효과만 순수 관찰)
-#   - nesterov만  → 기존 DiLoCo 방식 (sign 후 ±1에 Nesterov momentum)
-#   - 둘 다 false → sign(raw_grad) + plain SGD (baseline)
 outer_use_nesterov_sgd = true
 
 # Outer LR scheduling
@@ -105,60 +100,6 @@ outer_warmup_steps = 0   # outer optimization step 기준 warmup
 # Outer weight decay (decoupled)
 # sign()이 inner weight decay 효과를 소실시킬 수 있으므로 outer level에서 옵션 제공.
 outer_weight_decay = 0.0   # 0이면 비활성
-
-# ─── Outer Sign Momentum (Nesterov-Lion) ─────────────────────────────────────
-#
-# 핵심 원리: Lion의 "momentum-before-sign"을 DiLoCo outer에 적용.
-#   현재 Nesterov SGD는 sign() 이후의 ±1 값에 momentum을 적용하는데,
-#   ±1의 EMA는 원래 gradient의 EMA보다 정보가 적음 (크기 없이 방향만 있음).
-#   → 후반부에 consensus가 약해지면 EMA도 흔들림.
-#
-#   개선: 각 노드가 raw pseudo-gradient의 local EMA를 유지하고,
-#   sign() 전에 momentum을 적용하여 안정적인 방향 결정.
-#
-# 수식 (각 노드 local에서 수행):
-#   g_t  = θ_old - θ_new                          (raw pseudo-gradient)
-#   g'_t = g_t + μ · m_{t-1}                      (Nesterov lookahead, outer_sign_nesterov=true일 때)
-#   c_t  = sign(β₁ · m_{t-1} + (1-β₁) · g'_t)   (Lion-style sign with momentum)
-#   m_t  = β₂ · m_{t-1} + (1-β₂) · g_t           (EMA update, raw grad 사용)
-#
-#   → c_t를 1-bit 통신 → majority vote
-#   → final_grad 결정 (outer_sign_mode에 따라):
-#       adaptive_mean: abs_mean × sign(majority_vote)
-#       fixed_lr:      sign(majority_vote)    (outer_lr로 직접 scaling)
-#   → outer optimizer step (Nesterov SGD 또는 plain SGD, outer_use_nesterov_sgd로 선택)
-#
-# outer_sign_momentum: pre-sign Lion EMA 활성화 (투표 방향 안정화)
-# outer_sign_nesterov: pre-sign에서 Nesterov lookahead 적용 (g' = g + μ·m)
-# 두 설정은 outer_use_nesterov_sgd와 독립적으로 동작.
-outer_sign_momentum = false
-# β 값: pseudo-gradient는 이미 50 inner step의 평균이므로 일반 Lion(0.95/0.98)보다
-# 훨씬 낮은 값이 적합. 높은 β는 over-smoothing → 변화에 둔감.
-outer_sign_beta1 = 0.3     # Lion interpolation: EMA vs 현재 grad (낮을수록 현재 비중 ↑)
-outer_sign_beta2 = 0.5     # EMA decay rate (낮을수록 빠른 적응)
-outer_sign_nesterov = false  # pre-sign Nesterov lookahead (pseudo-grad에서는 비활성 권장)
-outer_sign_nesterov_mu = 0.9  # pre-sign Nesterov momentum coefficient
-
-# EMA bias correction (Adam 스타일)
-# EMA가 zero에서 시작하므로 초반 step이 편향됨. 500 outer step 중 초반 20 step = 학습의 4%.
-# true이면 m̂ = m / (1 - β₂^t) 로 보정하여 초반 EMA 품질 개선.
-outer_sign_bias_correction = false
-
-# ─── MIEF + LASS (Momentum-Integrated Error Feedback + Layer-wise Adaptive Sign Scaling)
-#
-# MIEF: 모멘텀 자체에 error feedback을 통합하여 양자화 손실 관리.
-#   V_t = β_v · V_{t-1} + (1-β_v) · g_t             (local EMA: staircase 현상 완화)
-#   m_t = β₁ · m_{t-1} + (1-β₁) · (V_t + e_{t-1})   (momentum에 잔차 보정 통합)
-#   U_t = sign(m_t)                                    (1-bit 양자화)
-#   e_t = (V_t + e_{t-1}) - γ_t · U_t                 (잔차 저장)
-#
-# LASS: γ_t = mean(|m_t|) per tensor → sign에 곱하여 layer별 adaptive step size.
-#   AdamW처럼 '중요 파라미터는 크게, 아닌 것은 작게' 효과.
-#
-# MIEF=true이면 outer_sign_momentum/error_feedback 대신 MIEF가 이 둘을 통합 처리.
-# outer_sign_mode="adaptive_mean" + majority_vote 조합 권장 (LASS gamma가 DHT로 공유됨).
-outer_sign_mief = false
-outer_sign_mief_beta_v = 0.95   # local EMA decay (낮을수록 현재 grad 비중 ↑, staircase 완화)
 
 # ─── Stats 수집 최적화 ──────────────────────────────────────────────────────
 # true: pseudo-gradient 통계를 norm + abs_mean만 수집 (GPU sync 최소화)
@@ -176,12 +117,6 @@ minimal_pseudo_grad_stats = true
 #   G̃_t = G_t + e_{t-1}              (이전 잔차 보정)
 #   u_t  = sign(G̃_t)                 (양자화 & 통신)
 #   e_t  = G̃_t - u_t · mean(|G̃_t|)  (잔차 저장, scale = mean(|G̃_t|))
-#
-# outer_sign_momentum=true이면 momentum 적용 후 sign 취하는 단계에서도 잔차 보정 적용:
-#   G̃_t = G_t + e_{t-1}
-#   V_t  = β₁·m_{t-1} + (1-β₁)·G̃_t
-#   u_t  = sign(V_t)
-#   e_t  = V_t - u_t · mean(|V_t|)
 outer_sign_error_feedback = false
 
 # Hivemind compression: outer_sign_update=true일 때 자동으로 "sign1bit" 설정됨
@@ -192,25 +127,3 @@ hivemind_compression = "sign1bit"
 # Gradient Clipping - Outer optimizer 업데이트 전에 gradient clipping 적용
 enable_gradient_clipping = false
 gradient_clip_norm = 2.0  # 최대 gradient norm
-
-# ─── Phase Transition ────────────────────────────────────────────────────────
-# validation perplexity 기준으로 outer optimizer를 자동 전환.
-# 모든 peer가 DHT를 통해 조건 만족을 합의한 후 동시 전환.
-#
-# phase_transition_mode 선택:
-#   "full_gradient" — sign/1-bit 제거 → full gradient 통신 + Nesterov SGD
-#   "sign_lion"     — sign/1-bit 유지 → outer optimizer만 Lion으로 교체
-phase_transition_enabled = false
-phase_transition_perplexity = 50          # 이 perplexity 이하 → 전환 트리거
-phase_transition_mode = "full_gradient"     # "full_gradient" or "sign_lion"
-
-# (full_gradient 모드 전용)
-phase_transition_compression = "none"  # 전환 후 compression ("none"=fp32, "fp16", "quantile8bit" 등)
-phase_transition_outer_lr = 0.7                # 전환 후 outer_lr
-
-# (sign_lion 모드 전용)
-phase_transition_lion_lr = 1e-3             # Lion outer_lr
-phase_transition_lion_betas = [0.98, 0.99]  # Lion betas
-phase_transition_lion_weight_decay = 0    # Lion weight decay
-phase_transition_lion_lr_scheduler = "constant"  # "constant", "cosine", "linear" (Lion 논문: cosine 권장)
-phase_transition_lion_warmup_steps = 0         # 전환 시점 기준 warmup steps
