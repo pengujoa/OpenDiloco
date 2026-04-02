@@ -46,19 +46,69 @@ def _build_llama_tp_plan() -> Dict[str, object]:
     return plan
 
 
-def _build_llama_layer_tp_plan() -> Dict[str, object]:
-    """Per-decoder-layer TP plan."""
+def _build_llama_layer_tp_plan(model: nn.Module, tp_world_size: int) -> Dict[str, object]:
+    """Per-decoder-layer TP plan with model-structure/head-divisibility safeguards."""
     from torch.distributed.tensor.parallel import ColwiseParallel, RowwiseParallel
 
-    return {
-        "self_attn.q_proj": ColwiseParallel(),
-        "self_attn.k_proj": ColwiseParallel(),
-        "self_attn.v_proj": ColwiseParallel(),
-        "self_attn.o_proj": RowwiseParallel(),
-        "mlp.gate_proj": ColwiseParallel(),
-        "mlp.up_proj": ColwiseParallel(),
-        "mlp.down_proj": RowwiseParallel(),
-    }
+    plan: Dict[str, object] = {}
+    sample_layer = model.model.layers[0]
+
+    # MLP projection names differ by architecture.
+    # Llama-family: gate_proj + up_proj + down_proj
+    # Phi3-family: gate_up_proj + down_proj
+    if hasattr(sample_layer, "mlp"):
+        mlp = sample_layer.mlp
+        if hasattr(mlp, "gate_proj"):
+            plan["mlp.gate_proj"] = ColwiseParallel()
+        if hasattr(mlp, "up_proj"):
+            plan["mlp.up_proj"] = ColwiseParallel()
+        if hasattr(mlp, "gate_up_proj"):
+            plan["mlp.gate_up_proj"] = ColwiseParallel()
+        if hasattr(mlp, "down_proj"):
+            plan["mlp.down_proj"] = RowwiseParallel()
+
+    cfg = getattr(model, "config", None)
+    num_attention_heads = getattr(cfg, "num_attention_heads", None)
+    num_key_value_heads = getattr(cfg, "num_key_value_heads", num_attention_heads)
+
+    q_heads_ok = (
+        isinstance(num_attention_heads, int)
+        and num_attention_heads > 0
+        and num_attention_heads % tp_world_size == 0
+    )
+    kv_heads_ok = (
+        isinstance(num_key_value_heads, int)
+        and num_key_value_heads > 0
+        and num_key_value_heads % tp_world_size == 0
+    )
+
+    # Keep the whole attention TP plan consistent.
+    # Partial sharding can produce projection matmul dim mismatch.
+    if q_heads_ok and kv_heads_ok:
+        if hasattr(sample_layer, "self_attn"):
+            attn = sample_layer.self_attn
+            # Llama/Gemma style split q,k,v projections
+            if all(hasattr(attn, name) for name in ("q_proj", "k_proj", "v_proj", "o_proj")):
+                plan["self_attn.q_proj"] = ColwiseParallel()
+                plan["self_attn.k_proj"] = ColwiseParallel()
+                plan["self_attn.v_proj"] = ColwiseParallel()
+                plan["self_attn.o_proj"] = RowwiseParallel()
+            # Phi3 style fused qkv projection
+            elif all(hasattr(attn, name) for name in ("qkv_proj", "o_proj")):
+                plan["self_attn.qkv_proj"] = ColwiseParallel()
+                plan["self_attn.o_proj"] = RowwiseParallel()
+            else:
+                logger.warning("Unknown attention projection layout; skipping attention TP sharding.")
+    else:
+        logger.warning(
+            "Skipping TP sharding for all attention projections: "
+            "num_attention_heads=%s, num_key_value_heads=%s, tp_world_size=%s",
+            num_attention_heads,
+            num_key_value_heads,
+            tp_world_size,
+        )
+
+    return plan
 
 
 def wrap_model_tp(
@@ -75,7 +125,8 @@ def wrap_model_tp(
     from torch.distributed.tensor.parallel import parallelize_module
 
     top_plan = _build_llama_tp_plan()
-    layer_plan = _build_llama_layer_tp_plan()
+    tp_world_size = int(device_mesh[tp_mesh_dim].size())
+    layer_plan = _build_llama_layer_tp_plan(model, tp_world_size)
 
     parallelize_module(model, device_mesh[tp_mesh_dim], top_plan)
 
@@ -95,56 +146,99 @@ def wrap_model_pp(
     num_stages: int,
     stage_index: int,
     device: torch.device,
+    microbatch_size: int,
+    seq_len: int,
+    activation_dtype: torch.dtype = torch.float32,
 ) -> Tuple[nn.Module, object]:
     """
-    Split a LlamaForCausalLM into pipeline stages.
+    Split a causal LM into pipeline stages and build a manual
+    ``torch.distributed.pipelining.PipelineStage`` for ``ScheduleGPipe``.
 
-    Returns (stage_module, PipelineStage) where stage_module contains only
-    the layers assigned to ``stage_index``.
+    Returns ``(stage_module, pipeline_stage)`` where ``stage_module`` is the
+    per-rank ``nn.Module`` and ``pipeline_stage`` is the pipelining wrapper.
 
-    Requires PyTorch >= 2.4 for ``torch.distributed.pipelining``.
+    Supports:
+    - Llama-style causal LM (e.g. Llama, Mistral)
+    - Gemma3 text causal LM (e.g. google/gemma-3-270m)
     """
+    cfg = getattr(model, "config", None)
+    model_type = getattr(cfg, "model_type", None) if cfg is not None else None
+
+    if model_type in ("gemma3", "gemma3_text"):
+        try:
+            from gemma3_pp_stages import (
+                build_pipeline_stage,
+                is_gemma3_pp_supported,
+                slice_gemma3_for_pp,
+            )
+        except ImportError:
+            from open_diloco.gemma3_pp_stages import (
+                build_pipeline_stage,
+                is_gemma3_pp_supported,
+                slice_gemma3_for_pp,
+            )
+        if not is_gemma3_pp_supported(model):
+            raise RuntimeError("Model config indicates gemma3 but Gemma3 PP checks failed.")
+        model = model.to(device)
+        stage_module, (layer_start, layer_end) = slice_gemma3_for_pp(
+            model, num_stages, stage_index, activation_dtype=activation_dtype
+        )
+        stage_module = stage_module.to(device)
+        pipeline_stage = build_pipeline_stage(
+            stage_module,
+            stage_index,
+            num_stages,
+            device,
+            microbatch_size=microbatch_size,
+            seq_len=seq_len,
+            activation_dtype=activation_dtype,
+        )
+        logger.info(
+            f"Pipeline stage {stage_index}/{num_stages}: "
+            f"layers [{layer_start}, {layer_end}) (Gemma3 / ScheduleGPipe)"
+        )
+        return stage_module, pipeline_stage
+
     try:
-        from torch.distributed.pipelining import PipelineStage
-    except ModuleNotFoundError:
-        raise RuntimeError(
-            "Pipeline Parallelism requires PyTorch >= 2.4. "
-            f"Current version: {torch.__version__}. "
-            "Please upgrade PyTorch or use --parallelism tp instead."
+        from llama_pp_stages import (
+            build_pipeline_stage,
+            is_llama_like_pp_supported,
+            slice_llama_like_model_for_pp,
+        )
+    except ImportError:
+        from open_diloco.llama_pp_stages import (
+            build_pipeline_stage,
+            is_llama_like_pp_supported,
+            slice_llama_like_model_for_pp,
         )
 
-    num_layers = len(model.model.layers)
-    layers_per_stage = num_layers // num_stages
-    remainder = num_layers % num_stages
-
-    boundaries: List[int] = []
-    start = 0
-    for i in range(num_stages):
-        end = start + layers_per_stage + (1 if i < remainder else 0)
-        boundaries.append((start, end))
-        start = end
-
-    layer_start, layer_end = boundaries[stage_index]
-
-    keep_indices = set(range(layer_start, layer_end))
-    drop_indices = sorted(set(range(num_layers)) - keep_indices, reverse=True)
-    for idx in drop_indices:
-        del model.model.layers[idx]
-
-    if stage_index != 0:
-        model.model.embed_tokens = None
-    if stage_index != num_stages - 1:
-        model.lm_head = None
-        model.model.norm = None
+    if not is_llama_like_pp_supported(model):
+        raise RuntimeError(
+            "parallelism='pp' only supports Llama-style or Gemma3-style causal LMs in this repo. "
+            f"Got model_type={model_type!r}. Use parallelism='tp' or add a model-specific PP implementation."
+        )
 
     model = model.to(device)
+    stage_module, (layer_start, layer_end) = slice_llama_like_model_for_pp(
+        model, num_stages, stage_index, activation_dtype=activation_dtype
+    )
+    stage_module = stage_module.to(device)
 
-    stage = PipelineStage(model, stage_index, num_stages, device)
+    pipeline_stage = build_pipeline_stage(
+        stage_module,
+        stage_index,
+        num_stages,
+        device,
+        microbatch_size=microbatch_size,
+        seq_len=seq_len,
+        activation_dtype=activation_dtype,
+    )
+
     logger.info(
         f"Pipeline stage {stage_index}/{num_stages}: "
-        f"layers [{layer_start}, {layer_end})"
+        f"layers [{layer_start}, {layer_end}) (ScheduleGPipe / PipelineStage)"
     )
-    return model, stage
+    return stage_module, pipeline_stage
 
 
 # ---------------------------------------------------------------------------
@@ -337,24 +431,25 @@ def scatter_pp_params(
     """
     Scatter full-model parameters back to each PP stage.
 
-    Rank 0 sends each stage its relevant parameters; other ranks receive.
+    All ranks must call this (collective). Rank 0 gathers each stage's
+    param names, then scatters the corresponding tensors from full_model.
     """
     rank = dist.get_rank(process_group)
 
-    pp_param_names = [name for name, _ in pp_model.named_parameters()]
+    my_param_names = [name for name, _ in pp_model.named_parameters()]
+    all_names: Optional[List] = [None] * num_stages if rank == 0 else None
+    dist.gather_object(my_param_names, object_gather_list=all_names, dst=0, group=process_group)
 
     if rank == 0:
-        scatter_list = [None] * num_stages
+        scatter_list: List = [None] * num_stages
         full_params = dict(full_model.named_parameters())
-        scatter_list[stage_index] = {
-            name: full_params[name].detach().cpu()
-            for name in pp_param_names
-            if name in full_params
-        }
-        for other_stage in range(num_stages):
-            if other_stage == stage_index:
-                continue
-            scatter_list[other_stage] = {}
+        for stage_i in range(num_stages):
+            names = all_names[stage_i] if all_names[stage_i] else []
+            scatter_list[stage_i] = {
+                name: full_params[name].detach().cpu()
+                for name in names
+                if name in full_params
+            }
     else:
         scatter_list = None
 

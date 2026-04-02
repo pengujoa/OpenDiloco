@@ -1,7 +1,5 @@
 # Model configuration
 path_model = "PrimeIntellect/llama-150m-fresh"
-# path_model = "microsoft/Phi-4-mini-instruct"
-# path_model = "google/gemma-3-270m"
 
 # Data configuration
 dataset_name_or_path = "$C4"
@@ -34,7 +32,7 @@ path = "${EXP}_ckpt"
 
 # Hivemind configuration
 [hv]
-galaxy_size = 4
+galaxy_size = 2
 local_steps = 50
 max_outer_optimization_steps = 500
 matchmaking_time = 300
@@ -44,8 +42,8 @@ skip_load_from_peers = true
 initial_peers = ["$PEER"]
 world_rank = "${WORLD_RANK}"
 
-token_weighted_aggregation = true
-token_weight_mode = "linear"  # "linear" (w ∝ tokens) or "sqrt" (w ∝ √tokens)
+token_weighted_aggregation = false
+token_weight_mode = "sqrt"  # "linear" (w ∝ tokens) or "sqrt" (w ∝ √tokens)
 
 # Throughput Adaptive Sizing - 이전 round의 throughput 값을 기반으로 텐서 크기 조정
 use_throughput_adaptive_sizing = true  # true면 throughput 기반 조정 활성화, false면 균등 분할 사용
@@ -85,7 +83,7 @@ outer_sign_mode = "adaptive_mean"
 # outer_lr 역할:
 #   - outer_sign_mode = "fixed_lr"      → 그대로 step size로 사용
 #   - outer_sign_mode = "adaptive_mean" → global multiplier (magnitude가 실제 step size)
-outer_lr = 0.3
+outer_lr = 0.5
 
 # Outer optimizer: Nesterov SGD vs plain SGD
 #   true  → Nesterov SGD (momentum=0.9): 파라미터 업데이트 궤적을 smoothing

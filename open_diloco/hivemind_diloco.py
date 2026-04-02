@@ -903,6 +903,8 @@ class DiLoCoGradAverager(DecentralizedAverager, TokenWeightedAggregationMixin):
             elapsed_time = time.time() - start_time
             if elapsed_time > timeout:
                 logger.warning(f"Timeout waiting for all nodes to publish gradient magnitudes (timeout={timeout}s). Using local magnitudes only.")
+                now = get_dht_time()
+                self.dht.store(key=magnitude_key, subkey=worker_id, value=None, expiration_time=now - 1)
                 return local_magnitudes
             
             magnitude_res = self.dht.get(magnitude_key, latest=True)
@@ -2268,6 +2270,9 @@ class DiLoCoGradAverager(DecentralizedAverager, TokenWeightedAggregationMixin):
             time.sleep(check_interval)
         
         if not all_abs_means:
+            worker_id = getattr(self, 'worker_id', None) or str(self.dht.peer_id)
+            now = get_dht_time()
+            self.dht.store(key=key, subkey=worker_id, value=None, expiration_time=now - 1)
             return (self._local_abs_means or []), (getattr(self, '_local_l2_rms', None) or self._local_abs_means or [])
         
         num_peers = len(all_abs_means)

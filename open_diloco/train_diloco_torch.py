@@ -21,6 +21,7 @@ from transformers import (
     get_cosine_schedule_with_warmup,
 )
 
+from ckpt_utils import should_save_final_checkpoint
 from open_diloco.utils import get_grad_norm, register_hooks_log_activations
 
 
@@ -268,6 +269,7 @@ def main(
     handles = None
 
     loss_batch = 0
+    last_real_step = start_step  # for final checkpoint after loop
 
     for step, batch in enumerate(iterable=train_dataloader):
         real_step = (step + 1) // gradient_accumulation_steps
@@ -318,6 +320,7 @@ def main(
         scaler.scale(loss).backward()
 
         if step_within_grad_acc == 0:
+            last_real_step = real_step
             scaler.unscale_(optimizer=inner_optimizer)
 
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)  # gradient clipping
@@ -405,6 +408,24 @@ def main(
                     training_date,
                     project,
                 )
+
+    # Final checkpoint if last step was not already saved at interval
+    if (
+        local_rank == 0
+        and should_save_final_checkpoint(last_real_step, checkpoint_interval)
+    ):
+        print(f"saving final checkpoint at step {last_real_step}")
+        save_checkpoint(
+            last_real_step,
+            model,
+            inner_optimizer,
+            outer_optimizer,
+            scheduler,
+            torch.tensor(0.0, device="cuda"),
+            checkpoint_path,
+            training_date,
+            project,
+        )
 
     print("Training completed.")
     wandb.finish()

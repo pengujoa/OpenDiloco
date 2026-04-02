@@ -47,10 +47,13 @@ from ckpt_utils import (
     CkptConfig,
     check_checkpoint_path_access,
     delete_old_checkpoints,
+    get_ckpt_base_path,
+    get_parameter_tracking_log_dir,
     get_diloco_rank_dir_name,
     get_resume_info,
     load_checkpoint,
     save_checkpoint,
+    should_save_final_checkpoint,
 )
 from hivemind_diloco import AllReduceStrategy, DiLoCoOptimizer
 from open_diloco.utils import WandbLogger, DummyLogger
@@ -268,7 +271,7 @@ def train(config: Config):
     assert batch_size % config.per_device_train_batch_size == 0
     gradient_accumulation_steps = batch_size // config.per_device_train_batch_size
 
-    resume_from_ckpt, resume_path = get_resume_info(config.ckpt)
+    resume_from_ckpt, resume_path = get_resume_info(config)
 
     if rank == 0:
         logger_cls = WandbLogger if config.metric_logger_type == "wandb" else DummyLogger
@@ -287,7 +290,7 @@ def train(config: Config):
         log_visible_maddrs(dht.get_visible_maddrs(), only_p2p=False)
 
     if local_rank == 0:
-        check_checkpoint_path_access(config.ckpt.path, rank, config.hv.world_rank if config.hv else None)
+        check_checkpoint_path_access(get_ckpt_base_path(config), rank, config.hv.world_rank if config.hv else None)
 
     # DataLoader preparation
     tokenizer = AutoTokenizer.from_pretrained("mistralai/Mistral-7B-v0.1", use_fast=True)
@@ -434,6 +437,7 @@ def train(config: Config):
         if config.hv.matchmaking_time is not None:
             diloco_args["matchmaking_time"] = config.hv.matchmaking_time
 
+        diloco_args["log_dir"] = get_parameter_tracking_log_dir(config)
         optimizer = DiLoCoOptimizer(**diloco_args)
 
         scheduler = scheduler_fn(
@@ -503,6 +507,7 @@ def train(config: Config):
 
     log_activations = {}
 
+    real_step = start_step  # used after loop for final checkpoint if loop body never runs
     for step, batch in enumerate(iterable=train_dataloader, start=start_step * gradient_accumulation_steps):
         real_step = (step + 1) // gradient_accumulation_steps
         is_accumulating = bool((step + 1) % gradient_accumulation_steps)
@@ -623,7 +628,7 @@ def train(config: Config):
             # Save checkpoint every 'checkpoint_interval' steps
             if config.ckpt.interval is not None and real_step % config.ckpt.interval == 0:
                 log(f"saving at step {real_step}, step {step+1}")
-                ckpt_path = os.path.join(config.ckpt.path, f"{CKPT_PREFIX}_{int(real_step)}")
+                ckpt_path = os.path.join(get_ckpt_base_path(config), f"{CKPT_PREFIX}_{int(real_step)}")
 
                 if config.hv:
                     ckpt_path = os.path.join(ckpt_path, get_diloco_rank_dir_name(config.hv.world_rank))
@@ -657,7 +662,7 @@ def train(config: Config):
                 if local_rank == 0:
                     # only the rank 0 deletes the checkpoints
                     if config.ckpt.topk is not None:
-                        ckpt_deleted = delete_old_checkpoints(config.ckpt.path, config.ckpt.topk)
+                        ckpt_deleted = delete_old_checkpoints(get_ckpt_base_path(config), config.ckpt.topk)
                         if ckpt_deleted:
                             log(f"Deleted old checkpoints: {ckpt_deleted}")
 
@@ -665,6 +670,42 @@ def train(config: Config):
 
             if config.max_steps is not None and real_step >= config.max_steps:
                 break
+
+    # Final checkpoint if last step was not already saved at interval
+    if should_save_final_checkpoint(real_step, config.ckpt.interval):
+        log(f"saving final checkpoint at step {real_step}")
+        ckpt_path = os.path.join(get_ckpt_base_path(config), f"{CKPT_PREFIX}_{int(real_step)}")
+        if config.hv:
+            ckpt_path = os.path.join(ckpt_path, get_diloco_rank_dir_name(config.hv.world_rank))
+        if world_messenger_hv:
+            assert isinstance(optimizer, DiLoCoOptimizer)
+            with optimizer.tracker.pause_updates():
+                save_checkpoint(
+                    checkpoint_path=ckpt_path,
+                    model=model,
+                    optimizer=optimizer.inner_optimizer,
+                    scheduler=scheduler,
+                    outer_optimizer=optimizer.state_averager.optimizer,
+                    loss=0.0,
+                    scaler=scaler,
+                    data_loader=train_dataloader,
+                    save_global_state=True,
+                )
+        else:
+            save_checkpoint(
+                checkpoint_path=ckpt_path,
+                model=model,
+                optimizer=optimizer,
+                scheduler=scheduler,
+                loss=0.0,
+                scaler=scaler,
+                data_loader=train_dataloader,
+                save_global_state=rank == 0,
+            )
+        if local_rank == 0 and config.ckpt.topk is not None:
+            ckpt_deleted = delete_old_checkpoints(get_ckpt_base_path(config), config.ckpt.topk)
+            if ckpt_deleted:
+                log(f"Deleted old checkpoints: {ckpt_deleted}")
 
     log("Training completed.")
     if rank == 0:

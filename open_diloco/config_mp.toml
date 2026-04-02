@@ -3,6 +3,7 @@ path_model = "PrimeIntellect/llama-150m-fresh"
 # path_model = "microsoft/Phi-4-mini-instruct"
 # path_model = "google/gemma-3-270m"
 
+
 # Data configuration
 dataset_name_or_path = "$C4"
 
@@ -12,11 +13,11 @@ lr = 4e-4
 warmup_steps = 1000
 max_steps = 88000
 validation = true
-per_device_train_batch_size = 4
+per_device_train_batch_size = 1
 total_batch_size = 16
 find_max_batch_size = false
 precision = "fp16-mixed"
-# parallelism = "tp"  # "tp" (tensor parallel) or "pp" (pipeline parallel) — only used by train_mp.py
+parallelism = "pp"  # "tp" (tensor parallel) or "pp" (pipeline parallel) — only used by train_mp.py
 adjust_local_steps = true
 initial_lr_adjust = true
 
@@ -34,12 +35,12 @@ path = "${EXP}_ckpt"
 
 # Hivemind configuration
 [hv]
-galaxy_size = 4
+galaxy_size = 2
 local_steps = 50
 max_outer_optimization_steps = 500
 matchmaking_time = 300
 averaging_timeout = 1800
-average_state_every = 999999999  # 사실상 state averaging 비활성화 (1 = 매 epoch, 999999 = 끔)
+average_state_every = 1  # 사실상 state averaging 비활성화 (1 = 매 epoch, 999999 = 끔)
 skip_load_from_peers = true
 initial_peers = ["$PEER"]
 world_rank = "${WORLD_RANK}"

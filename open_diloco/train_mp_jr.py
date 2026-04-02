@@ -21,10 +21,10 @@ import math
 import re
 from contextlib import nullcontext
 import datetime
-from typing import Any, Literal, Dict
+from typing import Any, Literal
 import sys
 
-from pydantic import field_validator, Field
+from pydantic import field_validator
 import torch
 import torch.nn as nn
 from typing import List, Union
@@ -51,10 +51,10 @@ from torch.distributed.pipelining.microbatch import TensorChunkSpec
 
 from torchdata.stateful_dataloader import StatefulDataLoader
 from transformers import (
+    AutoConfig,
+    AutoModelForCausalLM,
     AutoTokenizer,
     DataCollatorForLanguageModeling,
-    LlamaConfig,
-    LlamaForCausalLM,
     get_cosine_schedule_with_warmup,
 )
 
@@ -71,7 +71,7 @@ from ckpt_utils import (
     save_checkpoint,
     should_save_final_checkpoint,
 )
-from hivemind_diloco import AllReduceStrategy, DiLoCoOptimizer, wait_for_all_nodes_validation_complete
+from hivemind_diloco import AllReduceStrategy, DiLoCoOptimizer
 from open_diloco.utils import WandbLogger, DummyLogger
 
 from hivemind.dht.dht import DHT
@@ -217,6 +217,7 @@ class Config(BaseConfig):
     lion_betas: tuple[float, float] = (0.95, 0.98)  # 언어 모델링 권장값
     # Parallelism
     parallelism: Literal["tp", "pp"] = "tp"
+    pp_n_microbatches: int | None = None  # None = per_device_train_batch_size (1 sample per microbatch)
     # Checkpointing / logging
     project: str = "hivemind_debug"
     metric_logger_type: Literal["wandb", "dummy"] = "wandb"
@@ -255,13 +256,22 @@ def get_dataloader(tokenizer, world_size, rank, local_rank, config: Config, dht=
             node_batch_sizes, node_gpu_counts, node_per_device_batch_sizes = get_node_batch_sizes_from_dht(
                 dht=dht, run_id=RUN_ID, galaxy_size=config.hv.galaxy_size, timeout=120.0,
             )
-            global_rank = sum(node_gpu_counts[:config.hv.world_rank]) + local_rank
+            is_pp = getattr(config, "parallelism", "tp") == "pp"
+            if is_pp:
+                # PP: all stages form one pipeline per node — treat each node as a single worker
+                pp_gpu_counts = [1] * len(node_gpu_counts)
+                effective_local_rank = 0
+            else:
+                pp_gpu_counts = node_gpu_counts
+                effective_local_rank = local_rank
+            global_rank = sum(pp_gpu_counts[:config.hv.world_rank]) + effective_local_rank
             print(f"MY LOCAL RANK: {local_rank}, MY WORLD RANK: {config.hv.world_rank}, MY GLOBAL RANK: {global_rank}")
             train_dataset = split_dataset_by_worker_batch_size(
                 tokenized_datasets,
-                node_batch_sizes=node_batch_sizes, node_gpu_counts=node_gpu_counts,
+                node_batch_sizes=node_per_device_batch_sizes if is_pp else node_batch_sizes,
+                node_gpu_counts=pp_gpu_counts,
                 node_per_device_batch_sizes=node_per_device_batch_sizes,
-                world_rank=config.hv.world_rank, local_rank=local_rank,
+                world_rank=config.hv.world_rank, local_rank=effective_local_rank,
             )
             if local_rank == 0:
                 node_info_key = f"{RUN_ID}:node_info"
@@ -270,6 +280,7 @@ def get_dataloader(tokenizer, world_size, rank, local_rank, config: Config, dht=
                 for worker_id in node_info.keys():
                     dht.store(key=node_info_key, subkey=worker_id, value=None, expiration_time=now - 1)
         else:
+            # Pipeline parallel: all stages on this node must read the same shard.
             rank_for_split = (rank - local_rank) if getattr(config, "parallelism", "tp") == "pp" else rank
             train_dataset = split_dataset_by_node(
                 tokenized_datasets, world_size=world_size, rank=rank_for_split
@@ -279,13 +290,143 @@ def get_dataloader(tokenizer, world_size, rank, local_rank, config: Config, dht=
     return StatefulDataLoader(train_dataset, collate_fn=data_collator, batch_size=config.per_device_train_batch_size, num_workers=config.num_workers)
 
 
-def get_model(config: Config) -> LlamaForCausalLM:
-    config_model = LlamaConfig.from_pretrained(
+def get_validation_dataloader(tokenizer, config: Config):
+    """Fixed 1,000-sample validation set (seed=42) for consistent PPL tracking."""
+    VALIDATION_SEED = 42
+    VALIDATION_SAMPLE_SIZE = 1000
+
+    if config.fake_data:
+        validation_dataset = FakeTokenizedDataset(config.seq_length, TEST_VOCAB_SIZE)
+        validation_dataset = validation_dataset.take(100)
+    else:
+        ds = load_dataset(config.dataset_name_or_path, "default", streaming=True, trust_remote_code=True)
+
+        def tokenize_function(data):
+            return tokenizer(data["text"], truncation=True, max_length=config.seq_length, padding="max_length")
+
+        tokenized_datasets = ds.map(tokenize_function, batched=True, remove_columns=["text", "timestamp", "url"])["train"]
+        validation_dataset = tokenized_datasets.shuffle(seed=VALIDATION_SEED, buffer_size=10000).take(VALIDATION_SAMPLE_SIZE)
+        log(f"Validation dataset: Fixed {VALIDATION_SAMPLE_SIZE:,} samples (seed={VALIDATION_SEED})")
+
+    data_collator = DataCollatorForLanguageModeling(tokenizer=tokenizer, mlm=False)
+    # num_workers=0: validation runs after CUDA init; forked workers
+    # inherit the CUDA context and crash with "initialization error".
+    return StatefulDataLoader(
+        validation_dataset,
+        collate_fn=data_collator,
+        batch_size=config.per_device_train_batch_size,
+        num_workers=0,
+    )
+
+
+def validate_model_mp(
+    validation_dataloader,
+    model,
+    pp_schedule,
+    config: Config,
+    half_precision: bool,
+    half_precision_dtype,
+    local_rank: int,
+    local_world_size: int,
+    max_batches: int | None = None,
+):
+    """Validate model for TP/PP. All ranks must call this (collective ops inside).
+
+    PP uses a manual forward-only pipeline (no backward) to avoid the CUDA
+    errors that ScheduleGPipe.step() can trigger outside training context.
+    """
+    loss_val = 0.0
+    step_val = 0
+    t0 = time.time()
+
+    model.eval()
+
+    if config.parallelism == "tp":
+        with torch.no_grad():
+            autocast_ctx = (
+                torch.autocast(device_type="cuda", dtype=half_precision_dtype) if half_precision else nullcontext()
+            )
+            for batch_idx, batch in enumerate(validation_dataloader):
+                if max_batches is not None and batch_idx >= max_batches:
+                    break
+                for k in batch:
+                    batch[k] = batch[k].to("cuda")
+                with autocast_ctx:
+                    outputs = model(**batch)
+                loss_val += outputs.loss.item()
+                step_val += 1
+
+    elif config.parallelism == "pp":
+        device = f"cuda:{local_rank}"
+        hidden_size = model.config.hidden_size
+        act_dtype = half_precision_dtype if half_precision else torch.float32
+
+        with torch.no_grad():
+            autocast_ctx = (
+                torch.autocast(device_type="cuda", dtype=half_precision_dtype) if half_precision else nullcontext()
+            )
+            for batch_idx, batch in enumerate(validation_dataloader):
+                if max_batches is not None and batch_idx >= max_batches:
+                    break
+                for k in batch:
+                    batch[k] = batch[k].to(device)
+
+                bs, seq = batch["input_ids"].shape
+
+                with autocast_ctx:
+                    if local_rank == 0:
+                        hidden, mask_out = model(batch["input_ids"], batch["attention_mask"])
+                        torch.distributed.send(hidden.contiguous(), dst=1)
+                        torch.distributed.send(mask_out.contiguous(), dst=1)
+                    elif local_rank == local_world_size - 1:
+                        hidden = torch.empty(bs, seq, hidden_size, dtype=act_dtype, device=device)
+                        mask_in = torch.empty(bs, seq, dtype=torch.float32, device=device)
+                        torch.distributed.recv(hidden, src=local_rank - 1)
+                        torch.distributed.recv(mask_in, src=local_rank - 1)
+                        logits = model(hidden, mask_in)
+                    else:
+                        hidden = torch.empty(bs, seq, hidden_size, dtype=act_dtype, device=device)
+                        mask_in = torch.empty(bs, seq, dtype=torch.float32, device=device)
+                        torch.distributed.recv(hidden, src=local_rank - 1)
+                        torch.distributed.recv(mask_in, src=local_rank - 1)
+                        hidden_out, mask_out = model(hidden, mask_in)
+                        torch.distributed.send(hidden_out.contiguous(), dst=local_rank + 1)
+                        torch.distributed.send(mask_out.contiguous(), dst=local_rank + 1)
+
+                loss = torch.zeros((), device=device, dtype=torch.float32)
+                if local_rank == local_world_size - 1:
+                    loss = causal_lm_shifted_loss(logits, batch["labels"]).detach()
+                torch.distributed.broadcast(loss, src=local_world_size - 1)
+                loss_val += loss.item()
+                step_val += 1
+
+    model.train()
+
+    elapsed = time.time() - t0
+
+    if step_val > 0:
+        loss_val /= step_val
+    else:
+        loss_val = float("inf")
+
+    perplexity_val = math.exp(min(loss_val, 20.0))
+
+    if local_rank == 0:
+        log(
+            f"Validation: {step_val} batches, {elapsed:.1f}s, "
+            f"loss={loss_val:.4f}, ppl={perplexity_val:.2f}"
+        )
+
+    return {"validation_loss": loss_val, "validation_perplexity": perplexity_val}
+
+
+def get_model(config: Config) -> nn.Module:
+    config_model = AutoConfig.from_pretrained(
         config.path_model,
         attn_implementation=config.attn_implementation,
         resume_download=True,
     )
-    return LlamaForCausalLM.from_pretrained(
+    return AutoModelForCausalLM.from_pretrained(
         pretrained_model_name_or_path=config.path_model,
         config=config_model,
         resume_download=True,
@@ -349,10 +490,16 @@ def train(config: Config):
 
     world_messenger_hv = config.hv is not None and local_rank == 0
 
-    assert config.total_batch_size % world_size == 0
-    batch_size = config.total_batch_size // world_size
-    assert batch_size % config.per_device_train_batch_size == 0
-    gradient_accumulation_steps = batch_size // config.per_device_train_batch_size
+    if config.parallelism == "pp":
+        # PP: all stages process the same batch → no data-parallel split by world_size
+        assert config.total_batch_size % config.per_device_train_batch_size == 0
+        batch_size = config.per_device_train_batch_size
+        gradient_accumulation_steps = config.total_batch_size // config.per_device_train_batch_size
+    else:
+        assert config.total_batch_size % world_size == 0
+        batch_size = config.total_batch_size // world_size
+        assert batch_size % config.per_device_train_batch_size == 0
+        gradient_accumulation_steps = batch_size // config.per_device_train_batch_size
 
     resume_from_ckpt, resume_path = get_resume_info(config)
 
@@ -391,9 +538,17 @@ def train(config: Config):
         check_checkpoint_path_access(get_ckpt_base_path(config), rank, config.hv.world_rank if config.hv else None)
 
     # ── DataLoader ────────────────────────────────────────────────────────
-    tokenizer = AutoTokenizer.from_pretrained("mistralai/Mistral-7B-v0.1", use_fast=True, resume_download=True)
+    tokenizer = AutoTokenizer.from_pretrained(config.path_model, use_fast=True, resume_download=True, trust_remote_code=True)
     tokenizer.pad_token = "</s>"
     train_dataloader = get_dataloader(tokenizer, world_size, rank, local_rank, config, dht=dht)
+
+    validation_dataloader = None
+    if config.validation:
+        if local_rank == 0:
+            log("Creating validation dataloader...")
+        validation_dataloader = get_validation_dataloader(tokenizer, config)
+        if local_rank == 0:
+            log("Validation dataloader created.")
 
     # ── Model ─────────────────────────────────────────────────────────────
     model = get_model(config)
@@ -401,6 +556,7 @@ def train(config: Config):
 
     half_precision = config.precision in ("fp16-mixed", "bf16-mixed")
     half_precision_dtype = torch.bfloat16 if config.precision == "bf16-mixed" else torch.float16
+    # Pipeline backward is driven inside ScheduleGPipe; GradScaler is not applied to that backward.
     scaler = torch.amp.GradScaler(
         "cuda",
         enabled=(config.precision == "fp16-mixed" and config.parallelism != "pp")
@@ -433,22 +589,30 @@ def train(config: Config):
         num_stages = local_world_size
         if world_messenger_hv:
             full_model = create_full_model_copy(model, device="cpu")
+        n_microbatches = config.pp_n_microbatches or config.per_device_train_batch_size
+        assert config.per_device_train_batch_size % n_microbatches == 0, (
+            f"per_device_train_batch_size ({config.per_device_train_batch_size}) "
+            f"must be divisible by pp_n_microbatches ({n_microbatches})"
+        )
+        microbatch_size = config.per_device_train_batch_size // n_microbatches
+
         model, pp_stage = wrap_model_pp(
             model,
             num_stages,
             pp_stage_index,
             torch.device(f"cuda:{local_rank}"),
-            microbatch_size=config.per_device_train_batch_size,
+            microbatch_size=microbatch_size,
             seq_len=config.seq_length,
             activation_dtype=half_precision_dtype if half_precision else torch.float32,
         )
         pp_schedule = ScheduleGPipe(
             pp_stage,
-            n_microbatches=1,
+            n_microbatches=n_microbatches,
             loss_fn=lambda logits, labels: causal_lm_shifted_loss(logits, labels),
             kwargs_chunk_spec=TensorChunkSpec.from_dict({"input_ids": 0, "attention_mask": 0}),
         )
-        log(f"Model wrapped with PP (stage {pp_stage_index}/{num_stages}, ScheduleGPipe)")
+        log(f"Model wrapped with PP (stage {pp_stage_index}/{num_stages}, "
+            f"n_microbatches={n_microbatches}, microbatch_size={microbatch_size})")
         device_mesh = None
     else:
         device_mesh = None
@@ -467,19 +631,40 @@ def train(config: Config):
         _vocab_size = getattr(getattr(_inner_model, "config", None), "vocab_size", 32000)
 
         profiling_start_time = time.time()
-        steps_per_sec = measure_steps_per_second_with_model(
-            model=model,
-            batch_size=config.per_device_train_batch_size,
-            seq_length=config.seq_length,
-            precision=config.precision,
-            gradient_accumulation_steps=gradient_accumulation_steps,
-            vocab_size=_vocab_size,
-            pp_schedule=pp_schedule,
-            local_world_size=local_world_size,
-        )
+        profiling_batch_size = config.per_device_train_batch_size
+        steps_per_sec = None
+        while profiling_batch_size >= 1:
+            try:
+                steps_per_sec = measure_steps_per_second_with_model(
+                    model=model,
+                    batch_size=profiling_batch_size,
+                    seq_length=config.seq_length,
+                    precision=config.precision,
+                    gradient_accumulation_steps=gradient_accumulation_steps,
+                    vocab_size=_vocab_size,
+                    pp_schedule=pp_schedule,
+                    local_world_size=local_world_size,
+                )
+                break
+            except torch.cuda.OutOfMemoryError:
+                log(
+                    f"[Speed Profiling] OOM at batch_size={profiling_batch_size}. "
+                    "Trying smaller batch for profiling."
+                )
+                profiling_batch_size //= 2
+                torch.cuda.empty_cache()
+
+        if steps_per_sec is None:
+            # Fail-safe: keep training alive even if speed profiling cannot run on this GPU.
+            # Use conservative placeholder so throughput-based local_steps logic can proceed.
+            steps_per_sec = 1.0
+            log("[Speed Profiling] Failed due to OOM at all batch sizes. Falling back to steps_per_sec=1.0")
         profiling_elapsed_time = time.time() - profiling_start_time
         if rank == 0:
-            log(f"[Speed Profiling] Completed in {profiling_elapsed_time:.2f}s: {steps_per_sec:.4f} steps/sec")
+            log(
+                f"[Speed Profiling] Completed in {profiling_elapsed_time:.2f}s: {steps_per_sec:.4f} steps/sec "
+                f"(profiling_batch_size={profiling_batch_size if profiling_batch_size >= 1 else 'fallback'})"
+            )
 
         with torch.no_grad():
             for param, saved in zip(model.parameters(), saved_param_data):
@@ -665,14 +850,16 @@ def train(config: Config):
     elif resume_from_ckpt:
         ckpt_path = resume_path
 
+    # PP: initial gather must be a collective (all ranks participate)
+    if config.hv is not None and config.parallelism == "pp":
+        gather_pp_params(model, full_model, pp_stage_index, local_world_size)
+
     if world_messenger_hv:
         assert full_model is not None, "full_model must exist on world_messenger for DiLoCo"
 
         # Sync full_model with current model state before creating DiLoCoOptimizer
         if config.parallelism == "tp":
             gather_tp_params(model, full_model)
-        elif config.parallelism == "pp":
-            gather_pp_params(model, full_model, pp_stage_index, local_world_size)
 
         # Pre-create inner optimizer with TP/PP model parameters
         inner_opt = inner_optimizer_factory(model.parameters())
@@ -778,6 +965,9 @@ def train(config: Config):
         else:
             start_step = 0
 
+    # Hivemind: only local_rank==0 constructs DiLoCoOptimizer (Hivemind super().__init__, grad averager, …).
+    # Other ranks finish inner_optimizer_factory in milliseconds. Without this barrier, PP ranks 1..N-1 enter
+    # the training loop and block on the first pp_schedule.step while rank 0 is still in DiLoCoOptimizer.__init__.
     if config.hv is not None:
         torch.distributed.barrier()
         if local_rank == 0:
@@ -863,7 +1053,8 @@ def train(config: Config):
 
                 scaler.scale(loss).backward()
 
-        # All ranks must sync after DHT readiness (see train_mp_jr PP deadlock note).
+        # PP/TP: wait_for_all_nodes_ready must not run only on rank 0 without a barrier — other ranks would
+        # advance to the next microbatch while rank 0 blocks on DHT, deadlocking the pipeline.
         if config.hv is not None and not all_nodes_ready:
             if local_rank == 0:
                 wait_for_all_nodes_ready(dht, config.hv.galaxy_size, config.hv, log)
@@ -881,6 +1072,12 @@ def train(config: Config):
                     optimizer.step(scaler=None, current_loss=float(loss.detach().item()))
                 else:
                     optimizer.step()
+                    # Non-rank-0 PP ranks: participate in outer step collectives.
+                    # Rank 0 calls gather/scatter from DiLoCoOptimizer hooks;
+                    # these are collective ops that need all ranks.
+                    if config.hv is not None and int(real_step) % config.hv.local_steps == 0:
+                        gather_pp_params(model, None, pp_stage_index, local_world_size)
+                        scatter_pp_params(None, model, pp_stage_index, local_world_size)
             else:
                 if world_messenger_hv:
                     mp_scaler_unscale_(scaler, optimizer.inner_optimizer, model)
@@ -898,16 +1095,43 @@ def train(config: Config):
             scheduler.step()
             optimizer.zero_grad()
 
+            # PP/TP + Hivemind: only local_rank==0 runs DiLoCoOptimizer (slow hivemind path); other ranks use a
+            # plain inner optimizer.step(). Without a barrier, fast ranks enter the next microbatch / pp_schedule.step
+            # while rank 0 is still in optimizer.step → pipeline deadlock.
             if config.hv is not None and config.parallelism in ("pp", "tp"):
                 torch.distributed.barrier()
 
-            # Sync parameters to all TP/PP ranks after outer step
+            # Sync parameters to all TP ranks after outer step
             if config.hv is not None and int(real_step) % config.hv.local_steps == 0:
                 if config.parallelism == "tp":
                     broadcast_tp_params(model, full_model, src_rank=0)
-                elif config.parallelism == "pp":
-                    for param in model.parameters():
-                        torch.distributed.broadcast(param.data, src=0)
+
+            # ── Validation (after outer-step sync) ────────────────────────
+            validation_metrics = {}
+            if (config.hv is not None and config.validation
+                    and validation_dataloader is not None and real_step > 0
+                    and int(real_step) % config.hv.local_steps == 0):
+                if local_rank == 0:
+                    log(f"Running validation at step {real_step}...")
+                validation_metrics = validate_model_mp(
+                    validation_dataloader, model, pp_schedule, config,
+                    half_precision, half_precision_dtype,
+                    local_rank, local_world_size,
+                )
+                if local_rank == 0 and dht is not None:
+                    current_epoch = int(real_step) // config.hv.local_steps
+                    try:
+                        from hivemind_diloco import wait_for_all_nodes_validation_complete
+                        val_sync_time = wait_for_all_nodes_validation_complete(
+                            dht=dht, epoch=current_epoch,
+                            expected_num_peers=config.hv.galaxy_size,
+                            prefix="OpenDiLoCo_validation",
+                            log_fn=log, timeout=300.0,
+                        )
+                        log(f"[TIMING] Validation sync: {val_sync_time:.6f}s (epoch {current_epoch})")
+                    except Exception as e:
+                        log(f"Warning: Validation sync failed: {e}")
+                torch.distributed.barrier()
 
             if rank == 0:
                 total_samples = real_step * config.total_batch_size
@@ -926,6 +1150,7 @@ def train(config: Config):
                     "time_taken": time.time() - current_time,
                     "tokens_per_second": config.seq_length * config.total_batch_size / (time.time() - current_time),
                 }
+                metrics.update(validation_metrics)
 
                 if world_messenger_hv:
                     outer_lr = [group["lr"] for group in optimizer.state_averager.optimizer.param_groups][0]
@@ -1106,3 +1331,4 @@ if __name__ == "__main__":
     config = Config(**config_dict)
     train(config)
     destroy_process_group()
+

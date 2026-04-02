@@ -19,10 +19,10 @@ import wandb
 # 설정
 ENTITY = "cyshin-korea-university"
 PROJECTS = [
-    "motivation_emnlp_4nodes_1345-0",
-    "motivation_emnlp_4nodes_1345-1",
-    "motivation_emnlp_4nodes_1345-2",
-    "motivation_emnlp_4nodes_1345-3",
+    "motivation_emnlp_4nodes_1345_clean-0",
+    "motivation_emnlp_4nodes_1345_clean-1",
+    "motivation_emnlp_4nodes_1345_clean-2",
+    "motivation_emnlp_4nodes_1345_clean-3",
     # "emnlp_finding_ema_alpha-0",
     # "emnlp_finding_ema_alpha-1",
     # "emnlp_finding_ema_alpha-2",
@@ -217,7 +217,6 @@ _TOKEN_WEIGHT_SYNC_PATTERN = re.compile(r"Token weight sync:\s*([\d.]+)\s*sec")
 _SYNC_WAIT_GPU_IDLE_PATTERN = re.compile(r"Sync wait \(GPU idle\):\s*([\d.]+)\s*sec")
 _VALIDATION_SYNC_WAIT_PATTERN = re.compile(r"\[TIMING\] Validation sync wait:\s*([\d.]+)\s*sec")
 _ALLREDUCE_PATTERN = re.compile(r"All-reduce networking time:\s*([\d.]+)\s*sec")
-_PHASE_TRANSITION_EPOCH_PATTERN = re.compile(r"Phase transition completed at epoch\s*(\d+)")
 _STATE_AVERAGER_PATTERN = re.compile(r"Time taken for state_averager_step:\s*([\d.]+)\s*sec")
 _VALIDATION_TIME_PATTERN = re.compile(r"Validation completed:.*time:\s*([\d.]+)\s*seconds")
 
@@ -295,16 +294,6 @@ def extract_training_start_timestamp_from_log(log_path: str) -> Optional[float]:
     return None
 
 
-def extract_phase_transition_timestamp_from_log(log_path: str) -> Optional[float]:
-    """output.log에서 'Phase transition completed at epoch' 줄의 타임스탬프(epoch 초) 추출."""
-    lines = parse_log_file(log_path, pattern=r"Phase transition completed at epoch")
-    for ln in lines:
-        ts_m = _TIMESTAMP_PATTERN.search(ln)
-        if ts_m:
-            return _parse_timestamp_to_seconds(ts_m.group(1))
-    return None
-
-
 def extract_gpu_local_training_times_from_log(log_path: str) -> pd.DataFrame:
     """
     output.log에서 [TIMING] GPU local training time 전부 추출.
@@ -356,16 +345,6 @@ def extract_allreduce_networking_times_from_log(log_path: str) -> pd.DataFrame:
         ts = _TIMESTAMP_PATTERN.search(ln).group(1) if _TIMESTAMP_PATTERN.search(ln) else ""
         rows.append({"timestamp": ts, "allreduce_networking_time_sec": float(m.group(1))})
     return pd.DataFrame(rows)
-
-
-def extract_phase_transition_epoch_from_log(log_path: str) -> Optional[int]:
-    """output.log에서 Phase transition completed at epoch N 추출. 없으면 None."""
-    lines = parse_log_file(log_path, pattern=r"Phase transition completed at epoch")
-    for ln in lines:
-        m = _PHASE_TRANSITION_EPOCH_PATTERN.search(ln)
-        if m:
-            return int(m.group(1))
-    return None
 
 
 def extract_state_averager_step_times_from_log(log_path: str) -> pd.DataFrame:
@@ -562,8 +541,6 @@ def _load_validation_results_from_csv(path: str) -> Tuple[Optional[pd.DataFrame]
     sync_wait_times = _read_sec_col("sync_wait_gpu_idle.csv", "sync_wait_gpu_idle_sec")
     validation_sync_wait_times = _read_sec_col("validation_sync_wait_time.csv", "validation_sync_wait_sec")
     allreduce_times = _read_sec_col("allreduce_networking_time.csv", "allreduce_networking_time_sec")
-    allreduce_before_pt = _read_sec_col("allreduce_networking_time_before_phase_transition.csv", "allreduce_networking_time_sec")
-    allreduce_after_pt = _read_sec_col("allreduce_networking_time_after_phase_transition.csv", "allreduce_networking_time_sec")
     state_times = _read_sec_col("state_averager_step_time.csv", "state_averager_step_sec")
     val_times = _read_sec_col("validation_time.csv", "validation_time_sec")
 
@@ -599,10 +576,6 @@ def _load_validation_results_from_csv(path: str) -> Tuple[Optional[pd.DataFrame]
         "ppl30_excl_val_sec": ppl30_excl,
         "ppl30_epochs": ppl30_epochs,
         "allreduce_times": allreduce_times,
-        "allreduce_times_before_pt": allreduce_before_pt,
-        "allreduce_times_after_pt": allreduce_after_pt,
-        "phase_transition_timestamp_sec": None,
-        "training_start_timestamp_sec": None,
         "state_averager_times": state_times,
         "validation_times": val_times,
     }
@@ -682,27 +655,6 @@ def extract_validation_results_from_logs(
         if not allreduce_df.empty:
             allreduce_df.to_csv(os.path.join(path, "allreduce_networking_time.csv"), index=False)
 
-        # outer opt change 실험: phase transition 전/후 all-reduce 시간 구분 + GPU 구간 분할용 타임스탬프
-        allreduce_times_before_pt: List[float] = []
-        allreduce_times_after_pt: List[float] = []
-        phase_transition_timestamp_sec: Optional[float] = None
-        training_start_timestamp_sec: Optional[float] = None
-        if "outer opt change" in exp_key and allreduce_times:
-            pt_epoch = extract_phase_transition_epoch_from_log(log_path)
-            if pt_epoch is not None:
-                # phase transition completed at epoch K → 0..K 구간 전, K+1.. 후
-                split_idx = pt_epoch + 1
-                allreduce_times_before_pt = allreduce_times[:split_idx]
-                allreduce_times_after_pt = allreduce_times[split_idx:]
-                if allreduce_times_before_pt and not allreduce_df.empty:
-                    before_df = allreduce_df.iloc[:split_idx]
-                    before_df.to_csv(os.path.join(path, "allreduce_networking_time_before_phase_transition.csv"), index=False)
-                if allreduce_times_after_pt and not allreduce_df.empty and split_idx < len(allreduce_df):
-                    after_df = allreduce_df.iloc[split_idx:]
-                    after_df.to_csv(os.path.join(path, "allreduce_networking_time_after_phase_transition.csv"), index=False)
-                phase_transition_timestamp_sec = extract_phase_transition_timestamp_from_log(log_path)
-                training_start_timestamp_sec = extract_training_start_timestamp_from_log(log_path)
-
         # state_averager_step time
         state_df = extract_state_averager_step_times_from_log(log_path)
         state_times = state_df["state_averager_step_sec"].tolist() if not state_df.empty else []
@@ -747,10 +699,6 @@ def extract_validation_results_from_logs(
             "ppl30_excl_val_sec": ppl30_excl,
             "ppl30_epochs": ppl30_epochs,
             "allreduce_times": allreduce_times,
-            "allreduce_times_before_pt": allreduce_times_before_pt,
-            "allreduce_times_after_pt": allreduce_times_after_pt,
-            "phase_transition_timestamp_sec": phase_transition_timestamp_sec,
-            "training_start_timestamp_sec": training_start_timestamp_sec,
             "validation_intervals_epoch_sec": validation_intervals_epoch_sec,
             "state_averager_times": state_times,
             "validation_times": val_times,
@@ -792,48 +740,6 @@ def _extract_gpu_ids(df: pd.DataFrame) -> list:
         if m:
             ids.add(int(m.group(1)))
     return sorted(ids)
-
-
-def _gpu_util_before_after_phase_transition(
-    gpu_df: pd.DataFrame,
-    phase_transition_timestamp_sec: float,
-    training_start_timestamp_sec: Optional[float] = None,
-) -> Tuple[Optional[float], Optional[float]]:
-    """
-    GPU 메트릭을 phase transition 시점 기준으로 나누어 전/후 평균 utilization(% ) 반환.
-    Returns:
-        (avg_util_before_pct, avg_util_after_pct) — 구간에 데이터 없으면 None
-    """
-    util_cols = [c for c in gpu_df.columns if c.endswith(f".{UTIL_COL}") and "system.gpu." in c]
-    if not util_cols:
-        return None, None
-
-    time_col = None
-    phase_bound_sec = phase_transition_timestamp_sec
-    if "_timestamp" in gpu_df.columns:
-        time_col = "_timestamp"
-        ser = pd.to_numeric(gpu_df[time_col], errors="coerce").dropna()
-        if ser.max() > 1e12:
-            phase_bound_sec = phase_transition_timestamp_sec * 1000.0
-    elif "_runtime" in gpu_df.columns and training_start_timestamp_sec is not None:
-        time_col = "_runtime"
-        phase_bound_sec = phase_transition_timestamp_sec - training_start_timestamp_sec
-    else:
-        return None, None
-
-    gpu_df = gpu_df.copy()
-    gpu_df["_time_sec"] = pd.to_numeric(gpu_df[time_col], errors="coerce")
-    before_df = gpu_df[gpu_df["_time_sec"] < phase_bound_sec].dropna(subset=["_time_sec"])
-    after_df = gpu_df[gpu_df["_time_sec"] >= phase_bound_sec].dropna(subset=["_time_sec"])
-
-    def _mean_util(sub_df: pd.DataFrame) -> Optional[float]:
-        if sub_df.empty:
-            return None
-        vals = sub_df[util_cols].apply(pd.to_numeric, errors="coerce").values.flatten()
-        vals = vals[~pd.isna(vals)]
-        return round(float(sum(vals) / len(vals)), 2) if len(vals) > 0 else None
-
-    return _mean_util(before_df), _mean_util(after_df)
 
 
 def _gpu_util_incl_excl_validation(
@@ -967,7 +873,6 @@ def summarize_training(
     """
     실험별 최종 validation_loss, validation_perplexity, e2e_training_time, 각종 avg time 요약
     avg_*: 첫 번째 제외한 나머지 평균
-    gpu_data가 있고 outer opt change + phase transition 타임스탬프가 있으면 GPU utilization을 전/후 구간으로 구분해 기록.
     """
     rows = []
     for exp_name in set(validation_data.keys()) | set(log_extra.keys()):
@@ -987,20 +892,8 @@ def summarize_training(
         token_weight_times = extra.get("token_weight_sync_times", [])
         validation_sync_wait_times = extra.get("validation_sync_wait_times", [])
         allreduce_times = extra.get("allreduce_times", [])
-        allreduce_before_pt = extra.get("allreduce_times_before_pt", [])
-        allreduce_after_pt = extra.get("allreduce_times_after_pt", [])
         state_times = extra.get("state_averager_times", [])
         val_times = extra.get("validation_times", [])
-
-        avg_gpu_util_before_pt: Optional[float] = None
-        avg_gpu_util_after_pt: Optional[float] = None
-        if gpu_data and exp_name in gpu_data and "outer opt change" in exp_name:
-            phase_ts = extra.get("phase_transition_timestamp_sec")
-            start_ts = extra.get("training_start_timestamp_sec")
-            if phase_ts is not None:
-                avg_gpu_util_before_pt, avg_gpu_util_after_pt = _gpu_util_before_after_phase_transition(
-                    gpu_data[exp_name], phase_ts, start_ts
-                )
 
         def _round_opt(v):
             return round(v, 2) if v is not None else None
@@ -1024,10 +917,6 @@ def summarize_training(
             "ppl30_excl_val_sec": _round_opt(extra.get("ppl30_excl_val_sec")),
             "ppl30_epochs": extra.get("ppl30_epochs"),
             "avg_allreduce_networking_time_sec": _avg_exclude_first(allreduce_times),
-            "avg_allreduce_before_phase_transition_sec": _avg_exclude_first(allreduce_before_pt) if allreduce_before_pt else None,
-            "avg_allreduce_after_phase_transition_sec": _avg_exclude_first(allreduce_after_pt) if allreduce_after_pt else None,
-            "avg_gpu_util_before_phase_transition_pct": avg_gpu_util_before_pt,
-            "avg_gpu_util_after_phase_transition_pct": avg_gpu_util_after_pt,
             "avg_state_averager_step_sec": _avg_exclude_first(state_times),
             "avg_validation_time_sec": _avg_exclude_first(val_times),
         })

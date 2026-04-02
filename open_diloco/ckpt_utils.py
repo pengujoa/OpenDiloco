@@ -4,6 +4,7 @@ import torch
 from torch.distributed.checkpoint.state_dict import get_state_dict, set_state_dict
 import torch.distributed.checkpoint as dcp
 import os
+import re
 from torchdata.stateful_dataloader import StatefulDataLoader
 from fsspec.generic import GenericFileSystem
 from hivemind.optim.optimizer import logger
@@ -13,37 +14,174 @@ GLOBAL_STATE_FILE = "global_state_dict.pt"
 CKPT_PREFIX = "model_step"
 
 
+def _float_to_tag(x: float) -> str:
+    """Filesystem-safe: 0.5 -> 0p5, 1e-4 -> 1em4"""
+    if x == 0:
+        return "0"
+    s = f"{x:.10g}"
+    if "e" in s.lower():
+        return s.lower().replace("e", "em").replace(".", "p").replace("-", "m")
+    return s.replace(".", "p").replace("-", "m")
+
+
+def _outer_compression_tag(hv) -> str:
+    """
+    Sign update + sign1bit -> outer_1bitsign (후보1 예시).
+    끄면 hivemind_compression 기반 outer_fp16, outer_fp32 등.
+    """
+    if hv is None:
+        return "outer_fp32"
+    sign_on = getattr(hv, "outer_sign_update", False)
+    comp = getattr(hv, "hivemind_compression", None)
+    if sign_on and comp == "sign1bit":
+        return "outer_1bitsign"
+    if comp is None:
+        return "outer_fp32"
+    # fp16, scaled-fp16, uniform8bit, ...
+    m = {
+        "fp16": "outer_fp16",
+        "scaled-fp16": "outer_scaled_fp16",
+        "uniform8bit": "outer_uniform8bit",
+        "quantile8bit": "outer_quantile8bit",
+        "blockwise8bit": "outer_blockwise8bit",
+        "sign1bit": "outer_1bitsign",
+    }
+    return m.get(comp, "outer_" + comp.replace("-", "_"))
+
+
+def _tw_tag(hv) -> str:
+    if hv is None or not getattr(hv, "token_weighted_aggregation", False):
+        return "tw_off"
+    mode = getattr(hv, "token_weight_mode", "linear")
+    return f"tw_{mode}"
+
+
+def get_ckpt_experiment_dir_name(config) -> str:
+    """
+    하나의 설정을 나타내는 디렉터리명 한 덩어리 (후보1 형식).
+
+    예: inner_lion_outer_1bitsign_adaptive_mean_outerlr0p5_majority_vote_constant_warm0_tw_sqrt_maxouter500
+    """
+    inner = getattr(config, "inner_optimizer_type", "adamw")
+    hv = getattr(config, "hv", None)
+
+    parts = [f"inner_{inner}", _outer_compression_tag(hv)]
+
+    if hv is not None:
+        # adaptive_mean은 하나의 토큰으로 (outer_sign_mode)
+        outer_sign_mode = getattr(hv, "outer_sign_mode", "fixed_lr")
+        parts.append(outer_sign_mode)
+
+        outer_lr = getattr(hv, "outer_lr", 0.7)
+        parts.append(f"outerlr{_float_to_tag(outer_lr)}")
+
+        agg = getattr(hv, "outer_sign_aggregation", "majority_vote")
+        parts.append(agg)
+
+        sched = getattr(hv, "outer_lr_scheduler_type", "constant")
+        parts.append(sched)
+
+        warm = getattr(hv, "outer_warmup_steps", 0)
+        parts.append(f"warm{warm}")
+
+        parts.append(_tw_tag(hv))
+
+        max_outer = getattr(hv, "max_outer_optimization_steps", None)
+        if max_outer is not None:
+            parts.append(f"maxouter{int(max_outer)}")
+        else:
+            parts.append("maxouter_none")
+    else:
+        parts.append("fixed_lr")
+        parts.append(f"outerlr{_float_to_tag(getattr(config, 'lr', 4e-4))}")
+        parts.append("majority_vote")
+        parts.append("constant")
+        parts.append("warm0")
+        parts.append("tw_off")
+        parts.append("maxouter_none")
+
+    name = "_".join(parts)
+    # 파일시스템 안전: 나머지 특수문자 제거
+    name = re.sub(r"[^a-zA-Z0-9_.-]", "_", name)
+    return name
+
+
+def get_ckpt_base_path(config) -> str:
+    """config.ckpt.path 아래 설정 ID 한 덩어리 디렉터리 = 실험 베이스. 그 안에 model_step_* / diloco_rank_* 유지."""
+    return os.path.join(config.ckpt.path, get_ckpt_experiment_dir_name(config))
+
+
+def get_parameter_tracking_log_dir(config) -> str:
+    """
+    parameter_tracking_logs를 체크포인트와 동일한 실험 ID 아래에 두어 CSV/JSON이 실험별로 구분되게 함.
+    hivemind_diloco DiLoCoGradAverager.log_dir 으로 전달.
+    """
+    return os.path.join(get_ckpt_base_path(config), "parameter_tracking_logs")
+
+
+def should_save_final_checkpoint(real_step: int, interval: int | None) -> bool:
+    """
+    학습 루프 종료 직후, 마지막 스텝이 interval 저장으로 이미 저장되지 않았을 때
+    한 번 더 저장할지 여부. interval이 None이면 루프 중 저장이 없었으므로
+    real_step > 0이면 최종 저장 권장.
+    """
+    if real_step <= 0:
+        return False
+    if interval is None:
+        return True
+    return real_step % interval != 0
+
+
 class CkptConfig(BaseConfig):
     resume: str | bool | None = None  # if resume is a boolean, it means we should resume from the last checkpoint
     interval: int | None = None
     path: str = "outputs"
     topk: int | None = None  # how many checkpoints to keep
-    pre_transition_resume: str | None = None  # pre_transition_ckpt.pt 경로에서 resume (torch.save 형식)
 
 
-def get_resume_info(ckpt_config: CkptConfig) -> tuple[bool, str | None]:
+def get_resume_info(config) -> tuple[bool, str | None]:
     """
-    check if we should resume from a checkpoint, if yes return the path to the checkpoint, otherwise return None
+    config 전체를 받아 실험 베이스(config.ckpt.path/설정ID/) 아래에서
+    최신 model_step_* 디렉터리를 찾는다.
+    resume이 문자열이면 기존처럼 그 경로를 그대로 반환.
     """
+    ckpt_config = config.ckpt
     if ckpt_config.resume is None:
         return False, None
-    elif isinstance(ckpt_config.resume, bool):
-        # Using fsspec to list directory contents
-        fs = GenericFileSystem()
-        try:
-            ckpt_files = [f for f in fs.ls(ckpt_config.path, detail=False) if filter_ckpt_files(f)]
-        except FileNotFoundError:
-            logger.info(f"Checkpoint path {ckpt_config.path} not found, starting from scratch")
-            return False, None
-
-        if len(ckpt_files) == 0:
-            logger.info(f"No checkpoints found in {ckpt_config.path}, starting from scratch")
-            return False, None
-
-        latest_ckpt = max(ckpt_files, key=lambda f: int(f.split("_")[-1]))
-        return True, latest_ckpt
-    else:
+    if isinstance(ckpt_config.resume, str):
         return True, ckpt_config.resume
+
+    # resume is True: 실험 베이스 아래에서 최신 model_step_* 검색
+    base = get_ckpt_base_path(config)
+    fs = GenericFileSystem()
+    try:
+        # base가 없으면 path만 나열 시도 (구버전 평탄 구조)
+        if not fs.exists(base):
+            ckpt_files = [f for f in fs.ls(ckpt_config.path, detail=False) if filter_ckpt_files(f)]
+        else:
+            ckpt_files = []
+            for f in fs.ls(base, detail=False):
+                if filter_ckpt_files(f):
+                    ckpt_files.append(f)
+            if not ckpt_files:
+                # 평탄 구조 fallback
+                ckpt_files = [f for f in fs.ls(ckpt_config.path, detail=False) if filter_ckpt_files(f)]
+    except FileNotFoundError:
+        logger.info(f"Checkpoint path {ckpt_config.path} not found, starting from scratch")
+        return False, None
+
+    if len(ckpt_files) == 0:
+        logger.info(f"No checkpoints found under {base} (or {ckpt_config.path}), starting from scratch")
+        return False, None
+
+    def _step_key(path: str) -> int:
+        try:
+            return int(path.rstrip("/").split("_")[-1])
+        except ValueError:
+            return 0
+
+    latest_ckpt = max(ckpt_files, key=_step_key)
+    return True, latest_ckpt
 
 
 def save_checkpoint(
@@ -72,8 +210,12 @@ def save_checkpoint(
     rank = int(os.environ["RANK"])
 
     # 1. Save distributed states
-    fs_storage_writer = dcp.FsspecWriter(checkpoint_path, sync_files=False)
-    # for some reason sync_files = True try to call stream.fileno which is not supported with gcp ffspec storage.
+    if hasattr(dcp, "FsspecWriter"):
+        fs_storage_writer = dcp.FsspecWriter(checkpoint_path, sync_files=False)
+        # for some reason sync_files = True try to call stream.fileno which is not supported with gcp ffspec storage.
+    else:
+        # PyTorch 2.4 uses FileSystemWriter/FileSystemReader
+        fs_storage_writer = dcp.FileSystemWriter(checkpoint_path, sync_files=False)
 
     try:
         model_state_dict, optimizer_state_dict = get_state_dict(model, optimizer)
@@ -135,7 +277,10 @@ def load_checkpoint(
     """
     rank = int(os.environ["RANK"])
     # 1. Load distributed states
-    fs_storage_reader = dcp.FsspecReader(checkpoint_path)
+    if hasattr(dcp, "FsspecReader"):
+        fs_storage_reader = dcp.FsspecReader(checkpoint_path)
+    else:
+        fs_storage_reader = dcp.FileSystemReader(checkpoint_path)
 
     try:
         model_state_dict, optimizer_state_dict = get_state_dict(model, optimizer)
@@ -223,7 +368,7 @@ def delete_old_checkpoints(checkpoint_path: str, topk: int) -> list[str]:
 
 
 def check_checkpoint_path_access(checkpoint_path: str, rank: int, world_rank_hv: int | None = None):
-    if world_rank_hv:
+    if world_rank_hv is not None:
         dummy_file_path = os.path.join(
             checkpoint_path, get_diloco_rank_dir_name(world_rank_hv), f"dummy_file_{rank}.txt"
         )
