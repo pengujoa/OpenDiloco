@@ -71,6 +71,7 @@ from ckpt_utils import (
 )
 from hivemind_diloco import AllReduceStrategy, DiLoCoOptimizer, wait_for_all_nodes_validation_complete
 from halos_diloco import HaLoSOptimizer
+from halos_delayed_nesterov import DelayedNesterovOptimizer
 from open_diloco.utils import WandbLogger, DummyLogger
 
 from hivemind.dht.dht import DHT
@@ -310,6 +311,23 @@ class HvConfig(BaseConfig):
     # false → 기존 DiLoCoOptimizer 사용 (sync, WAIT_FOR_ALL)
     halos_mode: bool = False
     halos_async_timeout: float = 60.0  # HALoS allreduce 시 peer 대기 최대 시간 (초)
+    # ─── HALoS 논문/공식 코드(utnslab/halos) outer(GPS) 옵티마이저 ───────────
+    # True → outer를 DelayedNesterovOptimizer로 (examples/run_halos.sh 의 gps_opt_config)
+    # False → outer_use_nesterov_sgd에 따라 SGD / Nesterov SGD (기존 DiLoCo)
+    halos_gps_delayed_nesterov: bool = False
+    halos_gps_lr: float = 0.3  # 스크립트: GLR(0.15) * GMUD(2); 논문 Pythia-70M 실험
+    halos_gps_beta: float = 0.5
+    halos_gps_buffer_size: int = 2  # GMUD
+    halos_gps_c: float = 0.0
+    # LPS / 계층 병합 — 공식 시뮬레이터와 동일한 2단 스케줄을 쓰려면
+    # grad averager를 LPS 누적(K)·GPS 푸시 단위로 쪼개야 함. 현재 OpenDiloco는
+    # 단일 탈중앙화 pseudo-grad 평균이므로 아래 값은 체크포인트/추후 확장·문서용.
+    halos_lps_lr: float = 3.2  # LLR(0.2) * LMUD(16)
+    halos_lps_beta: float = 0.9
+    halos_lps_buffer_size: int = 16
+    halos_lps_c: float = 0.0
+    halos_model_merge_weight: float = 0.25  # ALPHA (GPS→LPS merge_model)
+    halos_local_updates_accumulation: int = 32  # K (LPS가 GPS로 보내기 전 워커 업데이트 수)
 
     
     @field_validator('initial_peers', mode='before')
@@ -1109,8 +1127,22 @@ def train(config: Config):
         log(f"Using AdamW inner optimizer (lr={config.lr}, wd={config.inner_weight_decay}, betas={config.inner_betas})")
 
     if config.hv is not None:
-        # Outer optimizer: Nesterov SGD vs plain SGD
-        if config.hv.outer_use_nesterov_sgd:
+        # Outer optimizer: HALoS GPS delayed Nesterov vs DiLoCo SGD/Nesterov
+        if config.hv.halos_mode and config.hv.halos_gps_delayed_nesterov:
+            outer_optimizer = partial(
+                DelayedNesterovOptimizer,
+                lr=config.hv.halos_gps_lr,
+                beta=config.hv.halos_gps_beta,
+                c=config.hv.halos_gps_c,
+                buffer_size=config.hv.halos_gps_buffer_size,
+            )
+            log(
+                f"Using HALoS GPS DelayedNesterovOptimizer "
+                f"(lr={config.hv.halos_gps_lr}, beta={config.hv.halos_gps_beta}, "
+                f"buffer_size={config.hv.halos_gps_buffer_size}, c={config.hv.halos_gps_c}) "
+                f"[utnslab/halos gps_opt_config]"
+            )
+        elif config.hv.outer_use_nesterov_sgd:
             outer_optimizer = partial(
                 torch.optim.SGD, lr=config.hv.outer_lr,
                 momentum=0.9, nesterov=True, weight_decay=config.hv.outer_weight_decay,
@@ -1279,8 +1311,22 @@ def train(config: Config):
         diloco_args["log_dir"] = get_parameter_tracking_log_dir(config)
 
         if config.hv.halos_mode:
-            # HALoS baseline: async outer step, no sync barrier, NO_WAIT allreduce
-            log(f"[HALoS] halos_mode=True — using HaLoSOptimizer (Async Local SGD baseline)")
+            log(
+                f"[HALoS] halos_mode=True — HaLoSOptimizer "
+                f"(async barrier off, NO_WAIT allreduce"
+                + (
+                    f", GPS=DelayedNesterov β={config.hv.halos_gps_beta} buf={config.hv.halos_gps_buffer_size})"
+                    if config.hv.halos_gps_delayed_nesterov
+                    else ")"
+                )
+            )
+            if config.hv.halos_gps_delayed_nesterov:
+                log(
+                    f"[HALoS] LPS/GPS 계층·K={config.hv.halos_local_updates_accumulation}·α={config.hv.halos_model_merge_weight} "
+                    f"는 공식 Ray 시뮬과 다르게 단일 탈중앙화 평균으로 동작합니다. "
+                    f"LPS 하이퍼파라미터(lr={config.hv.halos_lps_lr}, β={config.hv.halos_lps_beta}, "
+                    f"buf={config.hv.halos_lps_buffer_size})는 설정만 보관됩니다."
+                )
             optimizer = HaLoSOptimizer(
                 halos_async_timeout=config.hv.halos_async_timeout,
                 **diloco_args,
