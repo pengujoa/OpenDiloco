@@ -1,0 +1,112 @@
+# HALoS baseline config
+# HALoS (ICML 2025) 논문과의 비교를 위한 baseline 실험 설정
+# 기존 config.toml과 동일한 모델/데이터/하이퍼파라미터, halos_mode만 다름
+
+# Model configuration
+path_model = "PrimeIntellect/llama-150m-fresh"
+
+# Data configuration
+dataset_name_or_path = "$C4"
+
+# Training optimization
+inner_optimizer_type = "lion"
+lr = 4e-4
+warmup_steps = 1000
+max_steps = 88000
+validation = true
+per_device_train_batch_size = 4
+total_batch_size = 16
+find_max_batch_size = false
+precision = "fp16-mixed"
+adjust_local_steps = false
+initial_lr_adjust = true
+
+# Project and logging
+project = "${EXP}-halos-${WORLD_RANK}"
+
+# LoRA
+lora = false
+
+# Checkpoint configuration
+[ckpt]
+interval = 200000
+path = "${EXP}_halos_ckpt"
+
+
+# Hivemind configuration
+[hv]
+galaxy_size = 4
+local_steps = 50
+max_outer_optimization_steps = 500
+matchmaking_time = 300   # halos_async_timeout으로 override됨
+averaging_timeout = 1800
+average_state_every = 999999999
+skip_load_from_peers = true
+initial_peers = ["$PEER"]
+world_rank = "${WORLD_RANK}"
+
+token_weighted_aggregation = true
+token_weight_mode = "linear"
+
+use_throughput_adaptive_sizing = true
+
+gradient_magnitude_top_k_ratio = 1.0
+gradient_magnitude_top_k_ratio_by_size = true
+gradient_magnitude_selection_mode = "layer"
+gradient_importance_metric = "magnitude"
+
+enable_max_staleness = false
+max_staleness = 10
+
+enable_warmup = false
+warmup_epochs = 5
+
+# Outer sign update — 기존 방법과 동일하게 유지 (공정 비교)
+outer_sign_update = true
+outer_sign_aggregation = "majority_vote"
+outer_sign_mode = "adaptive_mean"
+outer_sign_error_feedback = false
+hivemind_compression = "sign1bit"
+
+outer_lr = 0.3
+outer_use_nesterov_sgd = true
+outer_lr_scheduler_type = "constant"
+outer_warmup_steps = 0
+outer_weight_decay = 0.0
+
+enable_gradient_clipping = false
+gradient_clip_norm = 2.0
+
+minimal_pseudo_grad_stats = true
+
+# ─── HALoS baseline 설정 ─────────────────────────────────────────────────────
+# halos_mode = true: HaLoSOptimizer 사용
+#   - sync barrier 없음 (no wait_for_all_nodes_local_step_complete)
+#   - NO_WAIT allreduce: straggler를 기다리지 않고 outer step 진행
+# halos_gps_delayed_nesterov = true: 공식 run_halos.sh 의 GPS (delayed_nesterov)
+#   - halos_gps_lr = GLR*GMUD = 0.15*2, beta=GBETA, buffer=GMUD
+# 2-tier 통신 (지역 LPS=torch, 글로벌 GPS=hivemind): halos_regions 로 world_rank 분할
+halos_hierarchical_ps = true
+halos_regions = [ [0, 1], [2, 3] ]
+# 노드×GPU 레이아웃이 다르면 halos_messenger_global_ranks = [ RANK0, RANK1, ... ] 명시 (길이=galaxy_size)
+
+halos_mode = true
+halos_async_timeout = 60.0  # allreduce 시 peer 대기 최대 시간 (초)
+halos_gps_delayed_nesterov = true
+halos_gps_lr = 0.3
+halos_gps_beta = 0.5
+halos_gps_buffer_size = 2
+halos_gps_c = 0.0
+halos_lps_lr = 3.2
+halos_lps_beta = 0.9
+halos_lps_buffer_size = 16
+halos_lps_c = 0.0
+halos_model_merge_weight = 0.25
+halos_local_updates_accumulation = 32
+# 논문형 LPS(지역 pseudo-grad momentum) + GPS(hivemind delta 평균 후 momentum) + alpha 병합
+halos_lps_gps = true
+# 별도 GPS 프로세스: python -m open_diloco.halos_gps_server --port 9100 (halos_gps_* 와 동일 하이퍼 권장)
+# halos_remote_gps_host = "127.0.0.1"
+# halos_remote_gps_port = 9100
+# halos_remote_gps_init_rank = 0
+# halos_remote_gps_async = false

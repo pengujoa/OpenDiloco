@@ -8,6 +8,7 @@ from concurrent.futures import ThreadPoolExecutor
 import os
 from datetime import datetime
 import torch
+import torch.distributed as dist
 
 from hivemind.averaging.averager import DecentralizedAverager
 from hivemind.averaging.control import StepControl
@@ -517,6 +518,13 @@ class DiLoCoGradAverager(DecentralizedAverager, TokenWeightedAggregationMixin):
         # HALoS async mode: sync barrier 비활성화 (HaLoSOptimizer에서 외부 설정)
         self.async_mode: bool = False
 
+        # HALoS hierarchical: 지역(LPS) torch allreduce 후 글로벌(GPS) hivemind 평균
+        self.halos_regional_process_group: Optional[dist.ProcessGroup] = kwargs.pop(
+            "halos_regional_process_group", None
+        )
+        self.halos_regional_size: int = int(kwargs.pop("halos_regional_size", 1))
+        halos_lps_gps_cfg = kwargs.pop("halos_lps_gps_cfg", None)
+
         # Local step 동기화를 위한 정보 저장
         self.num_inner_steps = None  # 나중에 설정됨
         self._current_epoch = None
@@ -633,6 +641,7 @@ class DiLoCoGradAverager(DecentralizedAverager, TokenWeightedAggregationMixin):
                 logger.info(f"[DEBUG] All {len(param_names)} parameters will be updated (no selective layer patterns)")
 
         averaged_grads = tuple(grad for grad in self._grads_from_optimizer())
+        _n_averaged_grad_tensors = len(averaged_grads)
 
         super().__init__(
             averaged_tensors=averaged_grads,
@@ -646,6 +655,23 @@ class DiLoCoGradAverager(DecentralizedAverager, TokenWeightedAggregationMixin):
         # Token-weighted aggregation 초기화 (DHT와 worker_id가 설정된 후)
         if self.token_weighted_aggregation:
             self._init_token_weighted_aggregation(key_suffix="_grad")
+
+        self.halos_lps_gps_runtime = None
+        if halos_lps_gps_cfg is not None:
+            if self.param_update_mask is not None and not all(self.param_update_mask):
+                raise ValueError(
+                    "halos_lps_gps_cfg requires all parameters in the grad averager (no sparse param_update_mask)."
+                )
+            try:
+                from halos_lps_gps import HalosLpsGpsRuntime
+            except ImportError:
+                from open_diloco.halos_lps_gps import HalosLpsGpsRuntime  # type: ignore
+            outer_params = [p for g in self.offloaded_optimizer.param_groups for p in g["params"]]
+            if _n_averaged_grad_tensors != len(outer_params):
+                raise ValueError(
+                    f"halos_lps_gps: averaged tensor count {_n_averaged_grad_tensors} != outer params {len(outer_params)}"
+                )
+            self.halos_lps_gps_runtime = HalosLpsGpsRuntime(reference_params=outer_params, **halos_lps_gps_cfg)
 
     def _create_param_mask(self, param_names: List[str], patterns: List[str]) -> List[bool]:
         """파라미터 이름이 패턴 중 하나라도 매칭되면 True인 마스크 생성
@@ -2002,6 +2028,23 @@ class DiLoCoGradAverager(DecentralizedAverager, TokenWeightedAggregationMixin):
         else:
             return torch.sign(grad)
 
+    @torch.no_grad()
+    def _halos_regional_average_pseudo_grads(self) -> None:
+        """LPS tier: same pseudo-grad tensor within a region (torch.distributed mean)."""
+        pg = self.halos_regional_process_group
+        if pg is None or self.halos_regional_size <= 1:
+            return
+        if not dist.is_initialized():
+            return
+        with self.get_tensors() as tensors:
+            for tensor in tensors:
+                dist.all_reduce(tensor, op=dist.ReduceOp.SUM, group=pg)
+                tensor.div_(self.halos_regional_size)
+        logger.info(
+            f"[HALoS hierarchical] LPS: regional mean pseudo-grad (size={self.halos_regional_size}); "
+            f"GPS: hivemind allreduce next"
+        )
+
     def compute_and_load_pseudo_grad_into_averager(self):
         """compute pseudo gradient by subtracting the offloaded optimizer parameters with the main parameters and load them in the averager.
 
@@ -2166,6 +2209,13 @@ class DiLoCoGradAverager(DecentralizedAverager, TokenWeightedAggregationMixin):
             if self.enable_update_logs and update_records:
                 self._save_parameter_updates_to_file(update_records, epoch, step, timestamp)
         
+        self._halos_regional_average_pseudo_grads()
+
+        rt = getattr(self, "halos_lps_gps_runtime", None)
+        if rt is not None:
+            with self.get_tensors() as _halos_ts:
+                rt.apply_lps_round(list(_halos_ts))
+
         # Deferred batch conversion: 0-dim tensor → float (1~2회 GPU sync로 통합)
         if _deferred_norms:
             all_norms = torch.stack(_deferred_norms).tolist()
@@ -3165,10 +3215,30 @@ class DiLoCoOptimizer(Optimizer):
                             2  # 최소 2개 노드는 있어야 함
                         )
                 
-                self.diloco_grad_averager.step(
-                    wait=True, timeout=self.averaging_timeout, control=self.scheduled_diloco_grads, 
-                    epoch=self.local_epoch, current_loss=getattr(self, '_current_loss', None)
-                )
+                _rt_lps_gps = getattr(self.diloco_grad_averager, "halos_lps_gps_runtime", None)
+                if _rt_lps_gps is not None:
+                    if _rt_lps_gps.will_run_gps_after_this_lps():
+                        if getattr(_rt_lps_gps, "use_remote_gps", False):
+                            # Dedicated GPS process: no hivemind grad allreduce for this round.
+                            self.diloco_grad_averager.compute_and_load_pseudo_grad_into_averager()
+                        else:
+                            self.diloco_grad_averager.step(
+                                wait=True,
+                                timeout=self.averaging_timeout,
+                                control=self.scheduled_diloco_grads,
+                                epoch=self.local_epoch,
+                                current_loss=getattr(self, "_current_loss", None),
+                            )
+                    else:
+                        self.diloco_grad_averager.compute_and_load_pseudo_grad_into_averager()
+                else:
+                    self.diloco_grad_averager.step(
+                        wait=True,
+                        timeout=self.averaging_timeout,
+                        control=self.scheduled_diloco_grads,
+                        epoch=self.local_epoch,
+                        current_loss=getattr(self, "_current_loss", None),
+                    )
 
                 self.diloco_grad_averager.notify_used_averaged_gradients()
                 
@@ -3215,7 +3285,24 @@ class DiLoCoOptimizer(Optimizer):
 
             # 통신된 averaged gradient를 outer optimizer에 로드
             # custom_gradients=True이므로 수동으로 averaged gradient를 로드해야 합니다.
-            if self.tracker.global_progress.num_peers > 1:
+            _rt_lps_gps = getattr(self.diloco_grad_averager, "halos_lps_gps_runtime", None)
+            if _rt_lps_gps is not None:
+                _gps_round = (
+                    _rt_lps_gps.lps_step_count > 0 and _rt_lps_gps.lps_step_count % _rt_lps_gps.K == 0
+                )
+                if _gps_round:
+                    if getattr(_rt_lps_gps, "use_remote_gps", False):
+                        _wr = int(getattr(self, "_world_rank", 0))
+                        with self.diloco_grad_averager.get_tensors() as _gps_ts:
+                            _rt_lps_gps.run_remote_gps_round(list(_gps_ts), _wr)
+                    elif self.tracker.global_progress.num_peers > 1:
+                        with self.diloco_grad_averager.get_tensors() as _gps_ts:
+                            _rt_lps_gps.after_gps_allreduce(list(_gps_ts))
+                _outer_ps = [p for g in self.state_averager.optimizer.param_groups for p in g["params"]]
+                _rt_lps_gps.sync_lps_to_outer(_outer_ps)
+                self.state_averager._apply_optimizer_parameters_()
+                should_perform_optimizer_step = False
+            elif self.tracker.global_progress.num_peers > 1:
                 self._load_averaged_gradients_into_outer_optimizer()
 
             # Token-weighted aggregation을 위한 expected_num_peers 설정 (state_averager)

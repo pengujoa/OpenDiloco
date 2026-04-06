@@ -15,13 +15,12 @@ import re
 import hashlib
 from contextlib import nullcontext
 import datetime
-from typing import Any, Literal, Dict
+from typing import Any, Literal, Dict, List, Optional, Union
 import sys
 
 from pydantic import field_validator, Field
 import torch
 import torch.nn as nn
-from typing import List, Union
 from pydantic_config import parse_argv, BaseConfig
 
 # TOML 파일 파싱 지원
@@ -71,6 +70,7 @@ from ckpt_utils import (
 )
 from hivemind_diloco import AllReduceStrategy, DiLoCoOptimizer, wait_for_all_nodes_validation_complete
 from halos_diloco import HaLoSOptimizer
+from halos_delayed_nesterov import DelayedNesterovOptimizer
 from open_diloco.utils import WandbLogger, DummyLogger
 
 from hivemind.dht.dht import DHT
@@ -310,6 +310,39 @@ class HvConfig(BaseConfig):
     # false → 기존 DiLoCoOptimizer 사용 (sync, WAIT_FOR_ALL)
     halos_mode: bool = False
     halos_async_timeout: float = 60.0  # HALoS allreduce 시 peer 대기 최대 시간 (초)
+    # ─── HALoS 논문/공식 코드(utnslab/halos) outer(GPS) 옵티마이저 ───────────
+    # True → outer를 DelayedNesterovOptimizer로 (examples/run_halos.sh 의 gps_opt_config)
+    # False → outer_use_nesterov_sgd에 따라 SGD / Nesterov SGD (기존 DiLoCo)
+    halos_gps_delayed_nesterov: bool = False
+    halos_gps_lr: float = 0.3  # 스크립트: GLR(0.15) * GMUD(2); 논문 Pythia-70M 실험
+    halos_gps_beta: float = 0.5
+    halos_gps_buffer_size: int = 2  # GMUD
+    halos_gps_c: float = 0.0
+    # LPS / 계층 병합 — 공식 시뮬레이터와 동일한 2단 스케줄을 쓰려면
+    # grad averager를 LPS 누적(K)·GPS 푸시 단위로 쪼개야 함. 현재 OpenDiloco는
+    # 단일 탈중앙화 pseudo-grad 평균이므로 아래 값은 체크포인트/추후 확장·문서용.
+    halos_lps_lr: float = 3.2  # LLR(0.2) * LMUD(16)
+    halos_lps_beta: float = 0.9
+    halos_lps_buffer_size: int = 16
+    halos_lps_c: float = 0.0
+    halos_model_merge_weight: float = 0.25  # ALPHA (GPS→LPS merge_model)
+    halos_local_updates_accumulation: int = 32  # K (LPS가 GPS로 보내기 전 워커 업데이트 수)
+    # ─── 2-tier 통신: 지역 LPS(torch) + 글로벌 GPS(hivemind) ─────────────────
+    # halos_regions: galaxy world_rank(0..galaxy_size-1)의 분할, 예) [[0,1],[2,3]]
+    halos_hierarchical_ps: bool = False
+    halos_regions: Optional[List[List[int]]] = None
+    # 길이 galaxy_size, 각 hv world_rank에 대응하는 torch RANK(메신저 프로세스)
+    halos_messenger_global_ranks: Optional[List[int]] = None
+    # HALoS LPS+GPS (Delayed Nesterov on dedicated tensors; K 주기로 hivemind GPS)
+    halos_lps_gps: bool = False
+    # 별도 GPS 프로세스(TCP): halos_lps_gps=True일 때 hivemind GPS allreduce 대신 원격 GPS만 사용
+    halos_remote_gps_host: Optional[str] = None
+    halos_remote_gps_port: Optional[int] = None
+    halos_remote_gps_timeout: float = 600.0
+    # INIT(글로벌 가중치 부트스트랩)을 보낼 hivemind world_rank (보통 0)
+    halos_remote_gps_init_rank: int = 0
+    # True면 TCP 직렬화/송수신만 워커 스레드에서 수행(완료는 같은 outer에서 대기)
+    halos_remote_gps_async: bool = False
 
     
     @field_validator('initial_peers', mode='before')
@@ -812,6 +845,26 @@ def train(config: Config):
 
     world_messenger_hv = config.hv is not None and local_rank == 0
 
+    local_world_size = int(os.environ.get("LOCAL_WORLD_SIZE", str(world_size)))
+    halos_regional_pg = None
+    halos_regional_size = 1
+    if config.hv is not None and getattr(config.hv, "halos_hierarchical_ps", False):
+        if torch.distributed.is_initialized():
+            from halos_hierarchical import build_halos_regional_process_groups
+
+            halos_regional_pg, halos_regional_size = build_halos_regional_process_groups(
+                torch_rank=rank,
+                world_size=world_size,
+                local_rank=local_rank,
+                galaxy_size=config.hv.galaxy_size,
+                hv_world_rank=config.hv.world_rank,
+                regions=config.hv.halos_regions or [],
+                messenger_global_ranks=config.hv.halos_messenger_global_ranks,
+                local_world_size=local_world_size,
+            )
+        elif local_rank == 0:
+            log("[HALoS hierarchical] skipped: torch.distributed not initialized")
+
     # batch_size is the total batch size for all GPUs
     assert config.total_batch_size % world_size == 0
     batch_size = config.total_batch_size // world_size
@@ -1109,8 +1162,22 @@ def train(config: Config):
         log(f"Using AdamW inner optimizer (lr={config.lr}, wd={config.inner_weight_decay}, betas={config.inner_betas})")
 
     if config.hv is not None:
-        # Outer optimizer: Nesterov SGD vs plain SGD
-        if config.hv.outer_use_nesterov_sgd:
+        # Outer optimizer: HALoS GPS delayed Nesterov vs DiLoCo SGD/Nesterov
+        if config.hv.halos_mode and config.hv.halos_gps_delayed_nesterov:
+            outer_optimizer = partial(
+                DelayedNesterovOptimizer,
+                lr=config.hv.halos_gps_lr,
+                beta=config.hv.halos_gps_beta,
+                c=config.hv.halos_gps_c,
+                buffer_size=config.hv.halos_gps_buffer_size,
+            )
+            log(
+                f"Using HALoS GPS DelayedNesterovOptimizer "
+                f"(lr={config.hv.halos_gps_lr}, beta={config.hv.halos_gps_beta}, "
+                f"buffer_size={config.hv.halos_gps_buffer_size}, c={config.hv.halos_gps_c}) "
+                f"[utnslab/halos gps_opt_config]"
+            )
+        elif config.hv.outer_use_nesterov_sgd:
             outer_optimizer = partial(
                 torch.optim.SGD, lr=config.hv.outer_lr,
                 momentum=0.9, nesterov=True, weight_decay=config.hv.outer_weight_decay,
@@ -1268,6 +1335,68 @@ def train(config: Config):
             diloco_args["averager_opts"] = {}
         diloco_args["averager_opts"]["use_throughput_adaptive_sizing"] = config.hv.use_throughput_adaptive_sizing
 
+        if getattr(config.hv, "halos_hierarchical_ps", False):
+            diloco_args["averager_opts"]["halos_regional_process_group"] = halos_regional_pg
+            diloco_args["averager_opts"]["halos_regional_size"] = halos_regional_size
+            if world_messenger_hv:
+                log(
+                    f"[HALoS hierarchical] LPS=torch regional_size={halos_regional_size}, "
+                    f"GPS=hivemind allreduce (halos_regions={config.hv.halos_regions})"
+                )
+
+        if getattr(config.hv, "halos_lps_gps", False):
+            if config.hv.selective_layer_patterns is not None:
+                raise ValueError("halos_lps_gps: disable selective_layer_patterns.")
+            if config.hv.gradient_magnitude_threshold is not None:
+                raise ValueError("halos_lps_gps: disable gradient_magnitude_threshold.")
+            if (
+                config.hv.gradient_magnitude_top_k_ratio is not None
+                and config.hv.gradient_magnitude_top_k_ratio != 1.0
+            ):
+                raise ValueError("halos_lps_gps: use gradient_magnitude_top_k_ratio=1.0 or omit.")
+            _lps_gps_cfg = {
+                "K": config.hv.halos_local_updates_accumulation,
+                "alpha": config.hv.halos_model_merge_weight,
+                "lps_lr": config.hv.halos_lps_lr,
+                "lps_beta": config.hv.halos_lps_beta,
+                "lps_buffer_size": config.hv.halos_lps_buffer_size,
+                "lps_c": config.hv.halos_lps_c,
+                "gps_lr": config.hv.halos_gps_lr,
+                "gps_beta": config.hv.halos_gps_beta,
+                "gps_buffer_size": config.hv.halos_gps_buffer_size,
+                "gps_c": config.hv.halos_gps_c,
+            }
+            if getattr(config.hv, "halos_remote_gps_host", None) and getattr(
+                config.hv, "halos_remote_gps_port", None
+            ) is not None:
+                _lps_gps_cfg.update(
+                    {
+                        "remote_gps_host": config.hv.halos_remote_gps_host,
+                        "remote_gps_port": config.hv.halos_remote_gps_port,
+                        "remote_gps_timeout": getattr(config.hv, "halos_remote_gps_timeout", 600.0),
+                        "remote_gps_init_rank": getattr(config.hv, "halos_remote_gps_init_rank", 0),
+                        "remote_gps_async": getattr(config.hv, "halos_remote_gps_async", False),
+                    }
+                )
+            diloco_args["averager_opts"]["halos_lps_gps_cfg"] = _lps_gps_cfg
+            if world_messenger_hv:
+                log(
+                    f"[HALoS LPS/GPS] enabled: K={config.hv.halos_local_updates_accumulation}, "
+                    f"alpha={config.hv.halos_model_merge_weight} (outer SGD skipped; use halos_* lr/beta/buffer)"
+                )
+                if getattr(config.hv, "halos_remote_gps_host", None) and getattr(
+                    config.hv, "halos_remote_gps_port", None
+                ) is not None:
+                    log(
+                        f"[HALoS LPS/GPS] remote GPS TCP {config.hv.halos_remote_gps_host}:"
+                        f"{config.hv.halos_remote_gps_port} (init_rank={getattr(config.hv, 'halos_remote_gps_init_rank', 0)})"
+                    )
+            if config.hv.halos_gps_delayed_nesterov and world_messenger_hv:
+                log(
+                    "[HALoS LPS/GPS] halos_gps_delayed_nesterov applies to unused outer opt; "
+                    "GPS uses halos_gps_* inside halos_lps_gps runtime."
+                )
+
         if config.hv.averaging_timeout is not None:
             diloco_args["averaging_timeout"] = config.hv.averaging_timeout
 
@@ -1279,8 +1408,21 @@ def train(config: Config):
         diloco_args["log_dir"] = get_parameter_tracking_log_dir(config)
 
         if config.hv.halos_mode:
-            # HALoS baseline: async outer step, no sync barrier, NO_WAIT allreduce
-            log(f"[HALoS] halos_mode=True — using HaLoSOptimizer (Async Local SGD baseline)")
+            log(
+                f"[HALoS] halos_mode=True — HaLoSOptimizer "
+                f"(async barrier off, NO_WAIT allreduce"
+                + (
+                    f", GPS=DelayedNesterov β={config.hv.halos_gps_beta} buf={config.hv.halos_gps_buffer_size})"
+                    if config.hv.halos_gps_delayed_nesterov
+                    else ")"
+                )
+            )
+            if config.hv.halos_gps_delayed_nesterov and not getattr(config.hv, "halos_hierarchical_ps", False):
+                log(
+                    f"[HALoS] 논문 LPS/GPS 스케줄(K={config.hv.halos_local_updates_accumulation}, α={config.hv.halos_model_merge_weight}) "
+                    f"는 아직 단일 평근 라운드와 다를 수 있음. "
+                    f"LPS opt 하이퍼(lr={config.hv.halos_lps_lr}, β={config.hv.halos_lps_beta}, buf={config.hv.halos_lps_buffer_size})는 설정 보관."
+                )
             optimizer = HaLoSOptimizer(
                 halos_async_timeout=config.hv.halos_async_timeout,
                 **diloco_args,
