@@ -514,6 +514,9 @@ class DiLoCoGradAverager(DecentralizedAverager, TokenWeightedAggregationMixin):
         self._error_feedback_buffers: dict[int, torch.Tensor] = {}
         self._minimal_pseudo_grad_stats = minimal_pseudo_grad_stats
 
+        # HALoS async mode: sync barrier 비활성화 (HaLoSOptimizer에서 외부 설정)
+        self.async_mode: bool = False
+
         # Local step 동기화를 위한 정보 저장
         self.num_inner_steps = None  # 나중에 설정됨
         self._current_epoch = None
@@ -1746,8 +1749,9 @@ class DiLoCoGradAverager(DecentralizedAverager, TokenWeightedAggregationMixin):
             return None
         
         # Local step 동기화 (모든 노드가 local steps를 완료할 때까지 대기)
+        # async_mode=True (HALoS)이면 barrier 스킵 — straggler를 기다리지 않음
         sync_wait_time = 0.0
-        if (wait and self.num_inner_steps is not None and epoch is not None and self.expected_num_peers is not None):
+        if (not self.async_mode and wait and self.num_inner_steps is not None and epoch is not None and self.expected_num_peers is not None):
             try:
                 sync_wait_time = wait_for_all_nodes_local_step_complete(
                     dht=self.dht,

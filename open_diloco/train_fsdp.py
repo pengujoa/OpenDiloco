@@ -70,6 +70,7 @@ from ckpt_utils import (
     should_save_final_checkpoint,
 )
 from hivemind_diloco import AllReduceStrategy, DiLoCoOptimizer, wait_for_all_nodes_validation_complete
+from halos_diloco import HaLoSOptimizer
 from open_diloco.utils import WandbLogger, DummyLogger
 
 from hivemind.dht.dht import DHT
@@ -199,6 +200,33 @@ def ddp_setup():
     torch.cuda.set_device(int(os.environ["LOCAL_RANK"]))
 
 
+def _make_intra_node_process_group():
+    """
+    torchrun이 설정한 LOCAL_WORLD_SIZE(노드당 GPU 수)를 사용해, 같은 노드의 global rank만 묶은
+    프로세스 그룹을 만든다. 모든 rank가 동일한 순서로 new_group을 호출해야 한다.
+    """
+    if not torch.distributed.is_initialized():
+        return None
+    world_size = torch.distributed.get_world_size()
+    rank = torch.distributed.get_rank()
+    local_world_size = int(os.environ.get("LOCAL_WORLD_SIZE", str(world_size)))
+    if local_world_size < 1:
+        local_world_size = 1
+    if world_size % local_world_size != 0:
+        log(
+            f"WORLD_SIZE ({world_size}) not divisible by LOCAL_WORLD_SIZE ({local_world_size}); "
+            "intra-node token sum falls back to one global group — fix launch env for multi-node."
+        )
+        local_world_size = world_size
+    subgroup = None
+    for start in range(0, world_size, local_world_size):
+        ranks = list(range(start, min(start + local_world_size, world_size)))
+        g = torch.distributed.new_group(ranks=ranks)
+        if rank in ranks:
+            subgroup = g
+    return subgroup
+
+
 def log(message):
     logger.info(f"[rank {os.environ['LOCAL_RANK']}] {message}")
 
@@ -266,6 +294,11 @@ class HvConfig(BaseConfig):
     minimal_pseudo_grad_stats: bool = False  # true: norm+abs_mean만 수집 (GPU sync 최소화)
     # Throughput adaptive sizing
     use_throughput_adaptive_sizing: bool = True  # If True, use throughput from previous rounds to adaptively adjust tensor partitioning
+    # ─── HALoS baseline mode ─────────────────────────────────────────────────
+    # true → HaLoSOptimizer 사용 (async outer step, no sync barrier, NO_WAIT allreduce)
+    # false → 기존 DiLoCoOptimizer 사용 (sync, WAIT_FOR_ALL)
+    halos_mode: bool = False
+    halos_async_timeout: float = 60.0  # HALoS allreduce 시 peer 대기 최대 시간 (초)
 
     
     @field_validator('initial_peers', mode='before')
@@ -307,6 +340,10 @@ class Config(BaseConfig):
     metric_logger_type: Literal["wandb", "dummy"] = "wandb"
     log_activations_steps: int | None = None
     log_memory_breakdown_steps: int | None = None
+    # True면 패딩/비패딩 토큰 비율을 로그만 출력 (rank 0, micro-batch 누적 후 구간 리셋).
+    # Hivemind(hv) 사용 시: 노드 간 outer 동기화마다( real_step % hv.local_steps == 0 ).
+    # hv 없음: 매 옵티마이저 스텝(DDP grad 동기화)마다.
+    log_padding_stats: bool = False
     ckpt: CkptConfig = CkptConfig()
     # Hivemind
     hv: HvConfig | None = None  # if no hv config then hivemind is disabled
@@ -447,7 +484,7 @@ def get_validation_dataloader(tokenizer, config: Config) -> StatefulDataLoader:
                 padding="max_length",
             )
             return outputs
-        
+
         # Try to load validation split, fallback to train if not available
         try:
             tokenized_datasets = ds.map(tokenize_function, batched=True, remove_columns=["text", "timestamp", "url"])
@@ -465,7 +502,7 @@ def get_validation_dataloader(tokenizer, config: Config) -> StatefulDataLoader:
             tokenized_datasets = ds.map(tokenize_function, batched=True, remove_columns=["text", "timestamp", "url"])
             train_data = tokenized_datasets["train"]
             validation_dataset = train_data
-        
+
         # Fixed random sampling: shuffle with fixed seed and take 1,000 samples
         # This ensures the same samples are used throughout training for consistent PPL measurement
         validation_dataset = validation_dataset.shuffle(seed=VALIDATION_SEED, buffer_size=10000).take(VALIDATION_SAMPLE_SIZE)
@@ -1179,10 +1216,19 @@ def train(config: Config):
             diloco_args["matchmaking_time"] = config.hv.matchmaking_time
 
         diloco_args["log_dir"] = get_parameter_tracking_log_dir(config)
-        optimizer = DiLoCoOptimizer(**diloco_args)
+
+        if config.hv.halos_mode:
+            # HALoS baseline: async outer step, no sync barrier, NO_WAIT allreduce
+            log(f"[HALoS] halos_mode=True — using HaLoSOptimizer (Async Local SGD baseline)")
+            optimizer = HaLoSOptimizer(
+                halos_async_timeout=config.hv.halos_async_timeout,
+                **diloco_args,
+            )
+        else:
+            optimizer = DiLoCoOptimizer(**diloco_args)
         optimizer._world_rank = config.hv.world_rank
-        
-        print(f"[DEBUG] DiLoCoOptimizer initialized:")
+
+        print(f"[DEBUG] {'HaLoSOptimizer' if config.hv.halos_mode else 'DiLoCoOptimizer'} initialized:")
         print(f"[DEBUG]   num_inner_steps={optimizer.num_inner_steps}")
         print(f"[DEBUG]   batch_size_per_step={optimizer.batch_size_per_step}")
         print(f"[DEBUG]   target_batch_size={optimizer.tracker.target_batch_size}")
@@ -1249,6 +1295,10 @@ def train(config: Config):
 
     memory_tracker = MemoryUsageTracker(model=model, optimizer=optimizer)
 
+    intra_node_pg = None
+    if config.hv is not None and config.hv.token_weighted_aggregation:
+        intra_node_pg = _make_intra_node_process_group()
+
     if world_messenger_hv and not config.hv.skip_load_from_peers:
         optimizer.load_state_from_peers()
 
@@ -1264,7 +1314,11 @@ def train(config: Config):
     
     # 모든 노드 준비 체크 플래그
     all_nodes_ready = False
-    
+
+    padding_stats_nonpad_sum = 0
+    padding_stats_total_sum = 0
+    padding_stats_num_batches = 0
+
     # Local 학습 시간 측정을 위한 변수
     local_training_start_time = None
     local_training_time = 0.0
@@ -1302,6 +1356,12 @@ def train(config: Config):
         for key in batch.keys():
             batch[key] = batch[key].to("cuda")
 
+        if config.log_padding_stats and rank == 0 and "attention_mask" in batch:
+            am = batch["attention_mask"]
+            padding_stats_nonpad_sum += int(am.sum().item())
+            padding_stats_total_sum += int(am.numel())
+            padding_stats_num_batches += 1
+
         with model.no_sync() if is_accumulating else nullcontext():
             activation_cm = memory_tracker.capture_activations() if should_profile_memory else nullcontext()
             with activation_cm:
@@ -1312,22 +1372,23 @@ def train(config: Config):
             loss_batch += loss.detach()
 
             # Token 수 계산 및 누적 (token-weighted aggregation용)
-            if (world_messenger_hv 
-                and not is_accumulating 
-                and config.hv is not None 
-                and config.hv.token_weighted_aggregation):
-                # Batch의 실제 token 수 계산 (padding 제외)
-                if 'attention_mask' in batch:
-                    batch_token_count = batch['attention_mask'].sum().item()
-                elif 'input_ids' in batch:
-                    batch_token_count = batch['input_ids'].numel()
+            # 노드 내 모든 GPU 배치의 토큰을 all_reduce로 합친 뒤, local_rank==0만 누적 (DHT는 메신저 1프로세스)
+            if (
+                not is_accumulating
+                and config.hv is not None
+                and config.hv.token_weighted_aggregation
+                and intra_node_pg is not None
+            ):
+                if "attention_mask" in batch:
+                    batch_token_count = int(batch["attention_mask"].sum().item())
+                elif "input_ids" in batch:
+                    batch_token_count = int(batch["input_ids"].numel())
                 else:
-                    # attention_mask나 input_ids가 없으면 seq_length * batch_size로 추정
-                    batch_token_count = config.seq_length * config.per_device_train_batch_size
-                
-                # Token 수를 optimizer에 누적
-                if hasattr(optimizer, 'diloco_grad_averager'):
-                    optimizer.diloco_grad_averager.accumulate_tokens(batch_token_count)
+                    batch_token_count = int(config.seq_length * config.per_device_train_batch_size)
+                count_t = torch.tensor([batch_token_count], device="cuda", dtype=torch.int64)
+                torch.distributed.all_reduce(count_t, op=torch.distributed.ReduceOp.SUM, group=intra_node_pg)
+                if local_rank == 0 and hasattr(optimizer, "diloco_grad_averager"):
+                    optimizer.diloco_grad_averager.accumulate_tokens(int(count_t.item()))
 
             scaler.scale(loss).backward()
 
@@ -1437,7 +1498,37 @@ def train(config: Config):
                     "time_taken": time.time() - current_time,
                     "tokens_per_second": config.seq_length * config.total_batch_size / (time.time() - current_time),
                 }
-                
+
+                _padding_report_sync = real_step > 0 and (
+                    (config.hv is not None and int(real_step) % config.hv.local_steps == 0)
+                    or (config.hv is None)
+                )
+                if (
+                    config.log_padding_stats
+                    and _padding_report_sync
+                    and padding_stats_total_sum > 0
+                ):
+                    nonpad_tok = padding_stats_nonpad_sum
+                    total_tok = padding_stats_total_sum
+                    pad_tok = total_tok - nonpad_tok
+                    pad_frac = pad_tok / total_tok
+                    nonpad_frac = nonpad_tok / total_tok
+                    pad_vs_nonpad = pad_tok / nonpad_tok if nonpad_tok > 0 else float("inf")
+                    sync_tag = (
+                        f"outer_sync local_steps={config.hv.local_steps}"
+                        if config.hv is not None
+                        else "ddp_step"
+                    )
+                    log(
+                        f"[padding] step={real_step} ({sync_tag}, micro_batches={padding_stats_num_batches}): "
+                        f"nonpad={nonpad_tok:,} pad={pad_tok:,} total={total_tok:,} | "
+                        f"pad:total={pad_frac:.4f} nonpad:total={nonpad_frac:.4f} | "
+                        f"pad:nonpad={pad_vs_nonpad:.4f}"
+                    )
+                    padding_stats_nonpad_sum = 0
+                    padding_stats_total_sum = 0
+                    padding_stats_num_batches = 0
+
                 # Add validation metrics to the metrics dictionary
                 metrics.update(validation_metrics)
 
@@ -1615,10 +1706,15 @@ def train(config: Config):
 
             loss_batch = 0
 
-            # Check outer optimization steps limit
-            if world_messenger_hv and config.hv is not None and config.hv.max_outer_optimization_steps is not None:
-                outer_optimization_steps = optimizer.tracker.local_progress.epoch
-                if outer_optimization_steps >= config.hv.max_outer_optimization_steps:
+            # Check outer optimization steps limit (sync all ranks — see train_mp.py note)
+            if config.hv is not None and config.hv.max_outer_optimization_steps is not None:
+                stop_outer = torch.zeros(1, dtype=torch.int32, device=f"cuda:{local_rank}")
+                if world_messenger_hv:
+                    outer_optimization_steps = optimizer.tracker.local_progress.epoch
+                    if outer_optimization_steps >= config.hv.max_outer_optimization_steps:
+                        stop_outer.fill_(1)
+                torch.distributed.all_reduce(stop_outer, op=torch.distributed.ReduceOp.MAX)
+                if stop_outer.item() != 0:
                     if rank == 0:
                         log(f"Reached max outer optimization steps ({config.hv.max_outer_optimization_steps}). Stopping training.")
                     break

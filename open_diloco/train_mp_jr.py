@@ -1207,8 +1207,12 @@ def train(config: Config):
 
             loss_batch = 0
 
-            if world_messenger_hv and config.hv is not None and config.hv.max_outer_optimization_steps is not None:
-                if optimizer.tracker.local_progress.epoch >= config.hv.max_outer_optimization_steps:
+            if config.hv is not None and config.hv.max_outer_optimization_steps is not None:
+                stop_outer = torch.zeros(1, dtype=torch.int32, device=f"cuda:{local_rank}")
+                if world_messenger_hv and optimizer.tracker.local_progress.epoch >= config.hv.max_outer_optimization_steps:
+                    stop_outer.fill_(1)
+                torch.distributed.all_reduce(stop_outer, op=torch.distributed.ReduceOp.MAX)
+                if stop_outer.item() != 0:
                     if rank == 0:
                         log(f"Reached max outer optimization steps ({config.hv.max_outer_optimization_steps}). Stopping.")
                     break

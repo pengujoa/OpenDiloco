@@ -208,6 +208,17 @@ def save_checkpoint(
         save_global_state: whether to save the global state
     """
     rank = int(os.environ["RANK"])
+    os.makedirs(checkpoint_path, exist_ok=True)
+    abs_ckpt = os.path.abspath(checkpoint_path)
+
+    def _log_save_done(note: str = "") -> None:
+        try:
+            nfiles = sum(len(files) for _, _, files in os.walk(abs_ckpt))
+            logger.info(
+                f"Checkpoint save finished{note}: {abs_ckpt} ({nfiles} files under this directory)"
+            )
+        except OSError:
+            logger.info(f"Checkpoint save finished{note}: {abs_ckpt}")
 
     # 1. Save distributed states
     if hasattr(dcp, "FsspecWriter"):
@@ -238,6 +249,7 @@ def save_checkpoint(
             torch.save(rank_state_dict, f)
 
     if not save_global_state:
+        _log_save_done(" (DCP/dataloader only; global_state_dict.pt on rank 0 / messenger ranks)")
         return
 
     # 2. Save global states
@@ -249,6 +261,8 @@ def save_checkpoint(
 
     with fsspec.open(os.path.join(checkpoint_path, GLOBAL_STATE_FILE), "wb") as f:
         torch.save(global_state_dict, f)
+
+    _log_save_done()
 
 
 def load_checkpoint(
