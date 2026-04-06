@@ -5,6 +5,9 @@ path_model = "PrimeIntellect/llama-150m-fresh"
 
 # Data configuration
 dataset_name_or_path = "$C4"
+sequence_packing = true   # train_fsdp: 문서 스트림 패킹 + 경계 attention 차단 (fake_data와 flash_attention_2 비권장)
+# max_document_tokens = 8192  # 문서당 최대 토큰(초과 시 자름); 생략 시 min(8*seq_length, 32768)
+log_padding_stats = true  # outer 동기화마다( hv.local_steps ) 패딩 비율 로그; hv 없으면 매 스텝
 
 # Training optimization
 inner_optimizer_type = "lion"  # "adamw" or "lion" (Lion 선택 시 lr/wd 자동 스케일링)

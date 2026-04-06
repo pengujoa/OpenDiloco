@@ -100,6 +100,17 @@ from dataset_splitter import (
     read_node_info,
 )
 
+try:
+    from open_diloco.packed_lm import (
+        PackedSequenceIterable,
+        collate_packed_causal_lm,
+    )
+except ImportError:
+    from packed_lm import (
+        PackedSequenceIterable,
+        collate_packed_causal_lm,
+    )
+
 
 TIMEOUT_NCCL_MINUTES = os.environ.get("TIMEOUT_NCCL_MINUTES", 120)
 TARGET_LAYER_ACTIVATIONS = ["self_attn", "lm_head"]
@@ -317,6 +328,10 @@ class Config(BaseConfig):
     # Data
     dataset_name_or_path: str = "allenai/c4"
     seq_length: int = 1024
+    # True: 문서 단위 토큰 스트림을 seq_length로 패킹, 문서 경계 attention 차단 (train만; 검증은 기존 고정 길이)
+    sequence_packing: bool = False
+    # 패킹 파이프라인에서 문서당 최대 토큰(초과 시 자름). None이면 min(8 * seq_length, 32768)
+    max_document_tokens: int | None = None
     c4_tiny: bool = False
     num_workers: int = 4
     # Optimization
@@ -367,25 +382,57 @@ def get_dataloader(tokenizer, world_size, rank, local_rank, config: Config, dht:
     actual_per_device_batch_size: per device batch size (used for learning rate scaling)"""
     actual_total_batch_size = config.total_batch_size  # Default to config value
     actual_per_device_batch_size = config.per_device_train_batch_size  # Default to config value
+    use_packing = bool(config.sequence_packing) and not config.fake_data
+    if config.sequence_packing and config.fake_data and rank == 0:
+        log("sequence_packing is ignored when fake_data=True")
+    if config.sequence_packing and config.attn_implementation == "flash_attention_2" and rank == 0:
+        log(
+            "WARNING: sequence_packing may not work with flash_attention_2; use attn_implementation=sdpa or eager."
+        )
+
     if config.fake_data:
         train_dataset = FakeTokenizedDataset(config.seq_length, TEST_VOCAB_SIZE)
     else:
         # dataset NFS로 copy 해오면서 전체 디렉토리 복사 한게 아니어서 이렇게 설정
         # ds = load_dataset(config.dataset_name_or_path, "en", streaming=True, trust_remote_code=True)
         ds = load_dataset(config.dataset_name_or_path, "default", streaming=True, trust_remote_code=True)
+        train_split = ds["train"]
+        # 스트리밍에서 column_names가 None일 수 있으므로 features로 폴백하고,
+        # 그래도 알 수 없으면 기존 하드코딩 목록을 그대로 사용
+        _split_cols = getattr(train_split, "column_names", None)
+        if not _split_cols:
+            _feat = getattr(train_split, "features", None)
+            _split_cols = list(_feat.keys()) if _feat is not None else None
+        if _split_cols is not None:
+            _remove_cols = [c for c in ("text", "timestamp", "url") if c in _split_cols]
+        else:
+            _remove_cols = ["text", "timestamp", "url"]
 
-        def tokenize_function(data):
-            outputs = tokenizer(
-                data["text"],
-                truncation=True,
-                max_length=config.seq_length,
-                padding="max_length",
-            )
-            return outputs
+        if use_packing:
+            mdt = config.max_document_tokens if config.max_document_tokens is not None else min(8 * config.seq_length, 32768)
 
-        tokenized_datasets = ds.map(tokenize_function, batched=True, remove_columns=["text", "timestamp", "url"])[
-            "train"
-        ]
+            def tokenize_function(data):
+                return tokenizer(
+                    data["text"],
+                    truncation=True,
+                    max_length=mdt,
+                    padding=False,
+                    add_special_tokens=False,
+                )
+
+            tokenized_datasets = ds.map(tokenize_function, batched=True, remove_columns=_remove_cols)["train"]
+        else:
+
+            def tokenize_function(data):
+                outputs = tokenizer(
+                    data["text"],
+                    truncation=True,
+                    max_length=config.seq_length,
+                    padding="max_length",
+                )
+                return outputs
+
+            tokenized_datasets = ds.map(tokenize_function, batched=True, remove_columns=_remove_cols)["train"]
 
         if config.hv is not None:
             if dht is None:
@@ -441,6 +488,12 @@ def get_dataloader(tokenizer, world_size, rank, local_rank, config: Config, dht:
         else:
             train_dataset = split_dataset_by_node(tokenized_datasets, world_size=world_size, rank=rank)
 
+        if use_packing:
+            eos_id = tokenizer.eos_token_id
+            if eos_id is None:
+                eos_id = tokenizer.pad_token_id
+            train_dataset = PackedSequenceIterable(train_dataset, int(eos_id), config.seq_length)
+
     # Print train dataset size
     try:
         train_dataset_size = len(train_dataset)
@@ -450,13 +503,17 @@ def get_dataloader(tokenizer, world_size, rank, local_rank, config: Config, dht:
         if rank == 0:
             log("Train dataset size: streaming dataset (size unknown)")
 
-    data_collator = DataCollatorForLanguageModeling(tokenizer=tokenizer, mlm=False)
+    if use_packing:
+        data_collator = collate_packed_causal_lm
+    else:
+        data_collator = DataCollatorForLanguageModeling(tokenizer=tokenizer, mlm=False)
+    num_loader_workers = config.num_workers
 
     dataloader = StatefulDataLoader(
         train_dataset,
         collate_fn=data_collator,
         batch_size=config.per_device_train_batch_size,
-        num_workers=config.num_workers,
+        num_workers=num_loader_workers,
     )
     
     # Return actual total batch size and per device batch size for learning rate scaling
@@ -1036,7 +1093,11 @@ def train(config: Config):
         print(f"[DEBUG] rank={rank}, local_rank={local_rank}: adjusted local_steps={config.hv.local_steps}")
 
     if config.torch_compile:
-        model = torch.compile(model)
+        if config.sequence_packing and not config.fake_data:
+            if rank == 0:
+                log("sequence_packing: torch.compile disabled (sdpa packed causal mask in-place ops incompatible with Dynamo)")
+        else:
+            model = torch.compile(model)
 
     # Setup optimizers
     if config.inner_optimizer_type == "lion":
@@ -1353,7 +1414,7 @@ def train(config: Config):
                 model, TARGET_LAYER_ACTIVATIONS, log_activations, gradient_accumulation_steps
             )
 
-        for key in batch.keys():
+        for key in list(batch.keys()):
             batch[key] = batch[key].to("cuda")
 
         if config.log_padding_stats and rank == 0 and "attention_mask" in batch:
