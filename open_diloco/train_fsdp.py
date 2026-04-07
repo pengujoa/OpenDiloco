@@ -72,6 +72,7 @@ from ckpt_utils import (
 from hivemind_diloco import AllReduceStrategy, DiLoCoOptimizer, wait_for_all_nodes_validation_complete
 from halos_diloco import HaLoSOptimizer
 from halos_delayed_nesterov import DelayedNesterovOptimizer
+from halos_lps import LocalParameterServer
 from open_diloco.utils import WandbLogger, DummyLogger
 
 from hivemind.dht.dht import DHT
@@ -306,28 +307,27 @@ class HvConfig(BaseConfig):
     minimal_pseudo_grad_stats: bool = False  # true: norm+abs_mean만 수집 (GPU sync 최소화)
     # Throughput adaptive sizing
     use_throughput_adaptive_sizing: bool = True  # If True, use throughput from previous rounds to adaptively adjust tensor partitioning
-    # ─── HALoS baseline mode ─────────────────────────────────────────────────
-    # true → HaLoSOptimizer 사용 (async outer step, no sync barrier, NO_WAIT allreduce)
-    # false → 기존 DiLoCoOptimizer 사용 (sync, WAIT_FOR_ALL)
+    # ─── HALoS mode ─────────────────────────────────────────────────────────
     halos_mode: bool = False
-    halos_async_timeout: float = 60.0  # HALoS allreduce 시 peer 대기 최대 시간 (초)
-    # ─── HALoS 논문/공식 코드(utnslab/halos) outer(GPS) 옵티마이저 ───────────
-    # True → outer를 DelayedNesterovOptimizer로 (examples/run_halos.sh 의 gps_opt_config)
-    # False → outer_use_nesterov_sgd에 따라 SGD / Nesterov SGD (기존 DiLoCo)
+    halos_async_timeout: float = 60.0
+    # GPS 서버 접속 정보 (python halos_gps.py로 별도 실행)
+    halos_gps_host: str = "127.0.0.1"
+    halos_gps_port: int = 29600
+    # GPS optimizer (DelayedNesterov)
     halos_gps_delayed_nesterov: bool = False
-    halos_gps_lr: float = 0.3  # 스크립트: GLR(0.15) * GMUD(2); 논문 Pythia-70M 실험
+    halos_gps_lr: float = 0.3
     halos_gps_beta: float = 0.5
-    halos_gps_buffer_size: int = 2  # GMUD
+    halos_gps_buffer_size: int = 2
     halos_gps_c: float = 0.0
-    # LPS / 계층 병합 — 공식 시뮬레이터와 동일한 2단 스케줄을 쓰려면
-    # grad averager를 LPS 누적(K)·GPS 푸시 단위로 쪼개야 함. 현재 OpenDiloco는
-    # 단일 탈중앙화 pseudo-grad 평균이므로 아래 값은 체크포인트/추후 확장·문서용.
-    halos_lps_lr: float = 3.2  # LLR(0.2) * LMUD(16)
+    halos_gps_ckpt_dir: str | None = None
+    halos_gps_ckpt_every: int = 32
+    # LPS optimizer (DelayedNesterov, d_l=buffer_size)
+    halos_lps_lr: float = 0.2
     halos_lps_beta: float = 0.9
-    halos_lps_buffer_size: int = 16
+    halos_lps_buffer_size: int = 1
     halos_lps_c: float = 0.0
-    halos_model_merge_weight: float = 0.25  # ALPHA (GPS→LPS merge_model)
-    halos_local_updates_accumulation: int = 32  # K (LPS가 GPS로 보내기 전 워커 업데이트 수)
+    halos_model_merge_weight: float = 0.25   # α: GPS→LPS merge weight
+    halos_local_updates_accumulation: int = 2  # K: LPS updates before GPS sync
 
     
     @field_validator('initial_peers', mode='before')
@@ -452,11 +452,7 @@ def get_dataloader(tokenizer, world_size, rank, local_rank, config: Config, dht:
 
             tokenized_datasets = ds.map(tokenize_function, batched=True, remove_columns=_remove_cols)["train"]
 
-        if config.hv is not None:
-            if dht is None:
-                raise ValueError("DHT must be provided when using hivemind for dataset splitting")
-            
-            # DHT에서 모든 노드의 batch size, GPU worker 수, per_device_batch_size 정보를 받아옴
+        if config.hv is not None and dht is not None:
             RUN_ID = "OpenDiLoCo"
             node_batch_sizes, node_gpu_counts, node_per_device_batch_sizes = get_node_batch_sizes_from_dht(
                 dht=dht,
@@ -465,12 +461,9 @@ def get_dataloader(tokenizer, world_size, rank, local_rank, config: Config, dht:
                 timeout=120.0,
             )
             
-            # 현재 worker의 global rank 계산
             global_rank = sum(node_gpu_counts[:config.hv.world_rank]) + local_rank
-            
-            # 현재 worker의 per device batch size
             current_worker_batch_size = node_per_device_batch_sizes[config.hv.world_rank]
-            actual_per_device_batch_size = current_worker_batch_size  # Update actual per device batch size
+            actual_per_device_batch_size = current_worker_batch_size
             
             print(f"MY LOCAL RANK: {local_rank}, MY WORLD RANK: {config.hv.world_rank}, MY GLOBAL RANK: {global_rank}")
             print(f"Node batch sizes: {node_batch_sizes}")
@@ -481,7 +474,6 @@ def get_dataloader(tokenizer, world_size, rank, local_rank, config: Config, dht:
             print(f"Total batch size: {actual_total_batch_size}")
             print(f"Current worker per_device_batch_size: {current_worker_batch_size}")
             
-            # 각 GPU worker별 batch size에 비례하여 데이터셋 분할
             train_dataset = split_dataset_by_worker_batch_size(
                 tokenized_datasets,
                 node_batch_sizes=node_batch_sizes,
@@ -491,7 +483,6 @@ def get_dataloader(tokenizer, world_size, rank, local_rank, config: Config, dht:
                 local_rank=local_rank,
             )
             
-            # Clean up node_info data from DHT after dataloader initialization is complete
             if local_rank == 0:
                 node_info_key = f"{RUN_ID}:node_info"
                 node_info = read_node_info(dht, node_info_key)
@@ -502,6 +493,15 @@ def get_dataloader(tokenizer, world_size, rank, local_rank, config: Config, dht:
                     dht.store(key=node_info_key, subkey=worker_id, value=None, expiration_time=now - 1)
                     deleted_count += 1
                 print(f"[INFO] Deleted {deleted_count} node_info entries from DHT")
+
+        elif config.hv is not None:
+            # HALoS hierarchy: world_rank + galaxy_size로 직접 데이터 분할 (DHT 불필요)
+            local_world_size = int(os.environ.get("LOCAL_WORLD_SIZE", world_size))
+            global_rank = config.hv.world_rank * local_world_size + local_rank
+            total_workers = config.hv.galaxy_size * local_world_size
+            print(f"[HALoS] Dataset split: global_rank={global_rank}/{total_workers} "
+                  f"(world_rank={config.hv.world_rank}, local_rank={local_rank})")
+            train_dataset = split_dataset_by_node(tokenized_datasets, world_size=total_workers, rank=global_rank)
 
         else:
             train_dataset = split_dataset_by_node(tokenized_datasets, world_size=world_size, rank=rank)
@@ -828,7 +828,8 @@ def train(config: Config):
     world_size = int(os.environ["WORLD_SIZE"])
     rank = int(os.environ["RANK"])
 
-    world_messenger_hv = config.hv is not None and local_rank == 0
+    halos_hierarchy = config.hv is not None and config.hv.halos_mode
+    world_messenger_hv = config.hv is not None and local_rank == 0 and not halos_hierarchy
 
     # batch_size is the total batch size for all GPUs
     assert config.total_batch_size % world_size == 0
@@ -847,9 +848,8 @@ def train(config: Config):
         logger_cls = WandbLogger if config.metric_logger_type == "wandb" else DummyLogger
         metric_logger = logger_cls(project=config.project, config=config.model_dump(), resume=resume_from_ckpt)
 
-    if config.hv is not None:
+    if config.hv is not None and not halos_hierarchy:
         log("hivemind diloco enabled")
-        # 모든 rank에서 DHT 초기화 (데이터셋 분할을 위해 필요)
         dht = DHT(
             start=True,
             initial_peers=config.hv.initial_peers,
@@ -862,7 +862,9 @@ def train(config: Config):
                 print(f"[INFO] adjust_local_steps=True: profiling will run after FSDP wrapping with actual model")
             else:
                 print(f"[INFO] Using initial local_steps value: {config.hv.local_steps} (adjust_local_steps=False)")
-
+    elif halos_hierarchy:
+        log("[HALoS] Hierarchy mode: LPS/GPS (no Hivemind DHT)")
+        dht = None
     else:
         dht = None 
     
@@ -874,12 +876,11 @@ def train(config: Config):
         print(f"[DEBUG] rank={rank}, local_rank={local_rank}: synchronized local_steps={config.hv.local_steps}")
 
     if config.hv is not None:
-        # Validation uses fixed 1,000 samples (seed=42) for consistent PPL measurement
         if config.validation and rank == 0:
             log(f"Validation: Using fixed 1,000 samples (seed=42) for consistent PPL measurement")
         
-        # DHT에 노드 정보 publish (local_rank 0만, 모든 노드에서)
-        if local_rank == 0:
+        # DHT에 노드 정보 publish (hierarchy mode에서는 불필요)
+        if local_rank == 0 and dht is not None:
             RUN_ID = "OpenDiLoCo"
             node_info_key = f"{RUN_ID}:node_info"
             local_world_size = int(os.environ.get("LOCAL_WORLD_SIZE", world_size))
@@ -1191,13 +1192,11 @@ def train(config: Config):
         if rank == 0:
             log(f"Using cosine decay schedule for AdamW (warmup={config.warmup_steps}, total={config.total_steps})")
 
-    if config.hv is not None:
+    if halos_hierarchy:
+        pass  # HALoS hierarchy: plain optimizer, no DiLoCoOptimizer setup needed
+
+    elif config.hv is not None:
         if resume_from_ckpt:
-            # We need to load with a fake optimizer to set the model parameters correctly before initializing the DiLoCoOptimizer
-            # This is because the DiLoCoOptimizer makes a copy of the model parameters for the state averager which is hard to update later
-            # We also need to do this on follower workers so that the world_messenger has friends to talk to when it does its two loads
-            # Otherwise the world messenger will get lonely and hang
-            # params = list(model.parameters())
             fake_optimizer = inner_optimizer(model.parameters())
             last_loss = load_checkpoint(
                 checkpoint_path=os.path.join(resume_path, get_diloco_rank_dir_name(config.hv.world_rank)),
@@ -1398,6 +1397,31 @@ def train(config: Config):
 
     model.train()
 
+    # ── HALoS hierarchy: LPS 생성 + 초기 파라미터 저장 ──
+    halos_lps = None
+    halos_saved_params = None
+    halos_outer_steps = 0
+    if halos_hierarchy:
+        if local_rank == 0:
+            halos_lps = LocalParameterServer(
+                model_params=[p.data for p in model.parameters()],
+                gps_host=config.hv.halos_gps_host,
+                gps_port=config.hv.halos_gps_port,
+                K=config.hv.halos_local_updates_accumulation,
+                alpha=config.hv.halos_model_merge_weight,
+                lr=config.hv.halos_lps_lr,
+                beta=config.hv.halos_lps_beta,
+                buffer_size=config.hv.halos_lps_buffer_size,
+                c=config.hv.halos_lps_c,
+            )
+            log(
+                f"[HALoS] LPS created: K={config.hv.halos_local_updates_accumulation}, "
+                f"α={config.hv.halos_model_merge_weight}, β={config.hv.halos_lps_beta}, "
+                f"d_l={config.hv.halos_lps_buffer_size}, lr={config.hv.halos_lps_lr}, "
+                f"GPS={config.hv.halos_gps_host}:{config.hv.halos_gps_port}"
+            )
+        halos_saved_params = [p.data.clone().cpu() for p in model.parameters()]
+
     _current_step_ref = [start_step]
 
     memory_tracker = MemoryUsageTracker(model=model, optimizer=optimizer)
@@ -1518,28 +1542,36 @@ def train(config: Config):
             model.clip_grad_norm_(1.0)  # gradient clipping
 
             if world_messenger_hv:
-                # Local 학습 시간 측정 (local_steps 완료 시점)
                 if config.hv is not None and real_step > 0 and real_step % config.hv.local_steps == 0:
                     if local_training_start_time is not None:
                         local_training_time = time.perf_counter() - local_training_start_time
                         log(f"[TIMING] GPU local training time: {local_training_time:.6f} sec")
-                
-                # This will trigger inter-node synchronization if real_step % local_steps == 0
                 optimizer.step(scaler=scaler, current_loss=float(loss.detach().item()))
-                # todo(sami): refactor to use built in pytorch mechanism to handle scaler manually
-                # should allow to just do scaler.step(optimizer)
             else:
                 scaler.step(optimizer)
-            
-            # Perform validation after inter-node synchronization (when real_step is multiple of local_steps)
-            # All ranks must participate in validation for FSDP (not just local_rank == 0)
-            # Note: optimizer.step()이 완료되면 이미 update_main_param_after_outer_step()도 완료되어 있으므로
-            # 파라미터는 안정적인 상태입니다. 추가 동기화 대기는 불필요합니다 (성능 최적화).
+
+            # ── HALoS hierarchy: LPS outer step ──
+            if halos_hierarchy and real_step > 0 and real_step % config.hv.local_steps == 0:
+                if local_rank == 0:
+                    pseudo_grad = [
+                        s - p.data.cpu()
+                        for s, p in zip(halos_saved_params, model.parameters())
+                    ]
+                    halos_lps.step(pseudo_grad)
+                    new_params = halos_lps.get_model_params()
+                    for p, new_p in zip(model.parameters(), new_params):
+                        p.data.copy_(new_p.to(p.device))
+                    halos_saved_params = [p.data.clone().cpu() for p in model.parameters()]
+                    halos_outer_steps += 1
+                    log(f"[HALoS] outer_step={halos_outer_steps}, local_step={real_step}")
+                for param in model.parameters():
+                    torch.distributed.broadcast(param.data, src=0)
+
             validation_metrics = {}
             if config.hv is not None and config.validation and validation_dataloader is not None and real_step > 0:
                 if int(real_step) % config.hv.local_steps == 0:
                     if rank == 0:
-                        log(f"Running validation at step {real_step} (after inter-node synchronization)...")
+                        log(f"Running validation at step {real_step}...")
                     validation_metrics = validate_model(
                         validation_dataloader,
                         model,
@@ -1552,7 +1584,6 @@ def train(config: Config):
                     if rank == 0:
                         log(f"Validation results: validation_loss={validation_metrics.get('validation_loss', 'N/A'):.4f}, validation_perplexity={validation_metrics.get('validation_perplexity', 'N/A'):.4f}")
 
-                    # Inter-node validation 완료 동기화 (local_rank 0만 DHT 참여, 노드당 1개)
                     if local_rank == 0 and dht is not None:
                         current_epoch = int(real_step) // config.hv.local_steps
                         try:
@@ -1568,7 +1599,6 @@ def train(config: Config):
                         except Exception as e:
                             log(f"Warning: Validation sync failed: {e}. Proceeding anyway.")
 
-                    # 노드 내 모든 rank가 동기화될 때까지 대기
                     torch.distributed.barrier()
 
             scaler.update()
@@ -1579,8 +1609,8 @@ def train(config: Config):
             scheduler.step()
             optimizer.zero_grad()
 
-            # Synchronization after validation (for non-hivemind case, this is node-internal broadcast)
-            if config.hv is not None:
+            # Broadcast after Hivemind outer step (hierarchy mode already handled above)
+            if config.hv is not None and not halos_hierarchy:
                 if int(real_step) % config.hv.local_steps == 0:
                     for param in model.parameters():
                         torch.distributed.broadcast(param.data, src=0)
@@ -1746,9 +1776,12 @@ def train(config: Config):
                     metrics["outer_lr"] = outer_lr
                     metrics["num_peers"] = num_peers
                     
-                    # Track outer optimization steps (epoch represents outer optimization count)
                     outer_optimization_steps = optimizer.tracker.local_progress.epoch
                     metrics["outer_optimization_steps"] = outer_optimization_steps
+
+                if halos_hierarchy:
+                    metrics["outer_optimization_steps"] = halos_outer_steps
+                    metrics["num_peers"] = config.hv.galaxy_size
 
                 if logging_activations_steps:
                     metrics.update(log_activations)
@@ -1765,7 +1798,7 @@ def train(config: Config):
 
                 metric_logger.log(metrics)
 
-                if config.hv is None:
+                if config.hv is None or halos_hierarchy:
                     log(
                         f"step: {real_step}, loss: {loss_batch.item()}, lr {[group['lr'] for group in optimizer.param_groups][0]}"
                     )
@@ -1813,12 +1846,14 @@ def train(config: Config):
 
             loss_batch = 0
 
-            # Check outer optimization steps limit (sync all ranks — see train_mp.py note)
             if config.hv is not None and config.hv.max_outer_optimization_steps is not None:
                 stop_outer = torch.zeros(1, dtype=torch.int32, device=f"cuda:{local_rank}")
                 if world_messenger_hv:
                     outer_optimization_steps = optimizer.tracker.local_progress.epoch
                     if outer_optimization_steps >= config.hv.max_outer_optimization_steps:
+                        stop_outer.fill_(1)
+                elif halos_hierarchy and local_rank == 0:
+                    if halos_outer_steps >= config.hv.max_outer_optimization_steps:
                         stop_outer.fill_(1)
                 torch.distributed.all_reduce(stop_outer, op=torch.distributed.ReduceOp.MAX)
                 if stop_outer.item() != 0:

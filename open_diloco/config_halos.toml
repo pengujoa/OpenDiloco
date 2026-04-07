@@ -9,16 +9,16 @@ path_model = "PrimeIntellect/llama-150m-fresh"
 dataset_name_or_path = "$C4"
 
 # Training optimization
-inner_optimizer_type = "lion"
+inner_optimizer_type = "adamw"
 lr = 4e-4
 warmup_steps = 1000
-max_steps = 88000
-validation = true
+max_steps = 128000
+validation = false
 per_device_train_batch_size = 4
 total_batch_size = 16
 find_max_batch_size = false
 precision = "fp16-mixed"
-adjust_local_steps = true
+adjust_local_steps = false
 initial_lr_adjust = true
 
 # Project and logging
@@ -36,8 +36,8 @@ path = "${EXP}_halos_ckpt"
 # Hivemind configuration
 [hv]
 galaxy_size = 4
-local_steps = 50
-max_outer_optimization_steps = 500
+local_steps = 32
+max_outer_optimization_steps = 2500
 matchmaking_time = 300   # halos_async_timeout으로 override됨
 averaging_timeout = 1800
 average_state_every = 999999999
@@ -45,7 +45,7 @@ skip_load_from_peers = true
 initial_peers = ["$PEER"]
 world_rank = "${WORLD_RANK}"
 
-token_weighted_aggregation = true
+token_weighted_aggregation = false
 token_weight_mode = "linear"
 
 use_throughput_adaptive_sizing = true
@@ -62,13 +62,13 @@ enable_warmup = false
 warmup_epochs = 5
 
 # Outer sign update — 기존 방법과 동일하게 유지 (공정 비교)
-outer_sign_update = true
+outer_sign_update = false
 outer_sign_aggregation = "majority_vote"
 outer_sign_mode = "adaptive_mean"
 outer_sign_error_feedback = false
 hivemind_compression = "sign1bit"
 
-outer_lr = 0.3
+outer_lr = 0.7
 outer_use_nesterov_sgd = true
 outer_lr_scheduler_type = "constant"
 outer_warmup_steps = 0
@@ -79,23 +79,27 @@ gradient_clip_norm = 2.0
 
 minimal_pseudo_grad_stats = true
 
-# ─── HALoS baseline 설정 ─────────────────────────────────────────────────────
-# halos_mode = true: HaLoSOptimizer 사용
-#   - sync barrier 없음 (no wait_for_all_nodes_local_step_complete)
-#   - NO_WAIT allreduce: straggler를 기다리지 않고 outer step 진행
-# halos_gps_delayed_nesterov = true: 공식 run_halos.sh 의 GPS (delayed_nesterov)
-#   - halos_gps_lr = GLR*GMUD = 0.15*2, beta=GBETA, buffer=GMUD
-# LPS·K·α 등은 HvConfig에 보관(논문 스크립트와 동일 수치); 2단 스케줄은 아직 단일 평균 경로
+# ─── HALoS 설정 ──────────────────────────────────────────────────────────────
 halos_mode = true
-halos_async_timeout = 60.0  # allreduce 시 peer 대기 최대 시간 (초)
+halos_async_timeout = 60.0
+
+# GPS (Global Parameter Server) — standalone 서버로 실행
+# 실행: python halos_gps.py --model <model> --port 29600 --lr 0.3 --beta 0.5 --buffer_size 2
+halos_gps_host = "163.152.51.44"
+halos_gps_port = 29600
 halos_gps_delayed_nesterov = true
-halos_gps_lr = 0.3
-halos_gps_beta = 0.5
-halos_gps_buffer_size = 2
+halos_gps_lr = 0.3            # GLR(0.15) * d_g(2) = 0.3
+halos_gps_beta = 0.5          # 글로벌 모멘텀 계수
+halos_gps_buffer_size = 2     # d_g: 모멘텀 갱신 전 버퍼링할 업데이트 수
 halos_gps_c = 0.0
-halos_lps_lr = 3.2
-halos_lps_beta = 0.9
-halos_lps_buffer_size = 16
+halos_gps_ckpt_dir = "/data2tb/gps_ckpts"   # GPS 체크포인트 저장 디렉토리
+halos_gps_ckpt_every = 32                   # GPS step 32회 = 2048 local steps (H=32, K=2)
+
+# LPS (Local Parameter Server) — worker 프로세스 내에서 실행
+# d_l=1 (worker 1개/region일 때), K=2 (GPS sync 주기)
+halos_lps_lr = 0.2            # LLR(0.2) * d_l(1) = 0.2
+halos_lps_beta = 0.9          # 로컬 모멘텀 계수
+halos_lps_buffer_size = 1     # d_l: LPS 버퍼 크기 (1이면 매 step마다 모멘텀)
 halos_lps_c = 0.0
-halos_model_merge_weight = 0.25
-halos_local_updates_accumulation = 32
+halos_model_merge_weight = 0.25           # α: GPS→LPS 모델 병합 가중치
+halos_local_updates_accumulation = 2      # K: GPS sync 전 LPS 업데이트 횟수
