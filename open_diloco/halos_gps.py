@@ -214,6 +214,26 @@ def _load_config_from_toml(path: str) -> dict:
     }
 
 
+def _from_pretrained_args(model_name_or_path: str) -> tuple[str, dict]:
+    """로컬 디렉터리 vs Hub ID에 맞게 `from_pretrained` 인자를 맞춘다.
+
+    Transformers는 `os.path.isdir`이 False이면 문자열을 Hub repo ID로 보내는데,
+    `/mnt/...` 같은 경로는 `validate_repo_id`에서 터진다. 로컬이면 반드시 실제 디렉터리여야 한다.
+    """
+    expanded = os.path.expanduser(model_name_or_path)
+    if os.path.isdir(expanded):
+        return expanded, {"local_files_only": True}
+    looks_like_filesystem_path = os.path.isabs(expanded) or model_name_or_path.startswith(
+        ("./", "../", "~")
+    )
+    if looks_like_filesystem_path:
+        raise FileNotFoundError(
+            f"모델 로컬 경로가 없거나 디렉터리가 아닙니다: {expanded!r}. "
+            "SFS/스토리지 마운트와 `path_model` 경로를 확인하세요."
+        )
+    return model_name_or_path, {}
+
+
 def main():
     pa = argparse.ArgumentParser(description="HALoS Global Parameter Server")
     pa.add_argument("--config", default=None, help="Path to config_halos.toml (CLI args override config values)")
@@ -246,8 +266,9 @@ def main():
         pa.error("--model is required (or set path_model in config toml)")
 
     from transformers import AutoModelForCausalLM
-    log.info(f"Loading base model: {defaults['model']}")
-    mdl = AutoModelForCausalLM.from_pretrained(defaults["model"])
+    model_path, load_kw = _from_pretrained_args(defaults["model"])
+    log.info(f"Loading base model: {model_path}" + (" (local_files_only)" if load_kw else ""))
+    mdl = AutoModelForCausalLM.from_pretrained(model_path, **load_kw)
     params = [p.data for p in mdl.parameters()]
     del mdl
     torch.cuda.empty_cache()
