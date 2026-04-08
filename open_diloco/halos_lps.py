@@ -68,6 +68,10 @@ class LocalParameterServer:
         self._pending: Optional[list[torch.Tensor]] = None
         self._pend_lock = threading.Lock()
 
+        # Single background thread for GPS communication (prevents thread accumulation)
+        self._gps_thread: Optional[threading.Thread] = None
+        self._skipped_sends = 0
+
         log.info(
             f"LPS init: K={K}, α={alpha}, lr={lr}, β={beta}, d_l={buffer_size}, "
             f"GPS={gps_host}:{gps_port}"
@@ -92,12 +96,22 @@ class LocalParameterServer:
         log.info(f"LPS update #{self._n} (K={self.K})")
 
         if self._n % self.K == 0:
-            delta = [s - p.data for s, p in zip(self._merged_snap, self.params)]
-            delta_norm = sum(d.norm().item() ** 2 for d in delta) ** 0.5
-            log.info(f"Sending accumulated delta to GPS (n={self._n}, delta_norm={delta_norm:.4f})")
-            threading.Thread(
-                target=self._gps_exchange, args=(delta,), daemon=True
-            ).start()
+            if self._gps_thread is not None and self._gps_thread.is_alive():
+                self._skipped_sends += 1
+                log.warning(
+                    f"GPS thread still running, skipping send (n={self._n}, "
+                    f"skipped_total={self._skipped_sends})"
+                )
+            else:
+                if self._gps_thread is not None:
+                    self._gps_thread.join(timeout=0)
+                delta = [s - p.data for s, p in zip(self._merged_snap, self.params)]
+                delta_norm = sum(d.norm().item() ** 2 for d in delta) ** 0.5
+                log.info(f"Sending accumulated delta to GPS (n={self._n}, delta_norm={delta_norm:.4f})")
+                self._gps_thread = threading.Thread(
+                    target=self._gps_exchange, args=(delta,), daemon=True
+                )
+                self._gps_thread.start()
 
     def get_model_params(self) -> list[torch.Tensor]:
         """Current LPS model for worker to start a new H-step round."""
