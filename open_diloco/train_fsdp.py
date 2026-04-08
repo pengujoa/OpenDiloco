@@ -18,7 +18,7 @@ import datetime
 from typing import Any, Literal, Dict
 import sys
 
-from pydantic import field_validator, Field
+from pydantic import field_validator, Field, model_validator
 import torch
 import torch.nn as nn
 from typing import List, Union
@@ -384,6 +384,13 @@ class Config(BaseConfig):
     max_steps: int | None = None
     # Lora
     lora: bool | None = False
+
+    @model_validator(mode="after")
+    def align_total_steps_with_max_steps(self) -> "Config":
+        """LR 스케줄러(`total_steps`)가 조기에 끝나지 않도록, 학습 상한(`max_steps`)이 더 크면 맞춘다."""
+        if self.max_steps is not None and self.max_steps > self.total_steps:
+            return self.model_copy(update={"total_steps": self.max_steps})
+        return self
     # Batch size finder
     find_max_batch_size: bool = False  # If True, estimate max batch size using Accelerate and exit
     # Local steps adjustment
