@@ -19,10 +19,10 @@ import wandb
 # 설정
 ENTITY = "cyshin-korea-university"
 PROJECTS = [
-    "motivation_emnlp_4nodes_1345_clean-0",
-    "motivation_emnlp_4nodes_1345_clean-1",
-    "motivation_emnlp_4nodes_1345_clean-2",
-    "motivation_emnlp_4nodes_1345_clean-3",
+    "motivation_emnlp_4nodes_1345-0",
+    "motivation_emnlp_4nodes_1345-1",
+    "motivation_emnlp_4nodes_1345-2",
+    "motivation_emnlp_4nodes_1345-3",
     # "emnlp_finding_ema_alpha-0",
     # "emnlp_finding_ema_alpha-1",
     # "emnlp_finding_ema_alpha-2",
@@ -71,7 +71,7 @@ def fetch_raw_system_metrics_from_wandb(
             continue
 
         for run in runs:
-            if not run.name.startswith("[v]"):
+            if not run.name.startswith("[compression]"):
                 continue
             safe_run_name = run.name.replace("/", "_")
             dir_name = os.path.join(save_dir, f"{entity}_{project}_{safe_run_name}")
@@ -139,7 +139,7 @@ def fetch_raw_training_metrics_from_wandb(
             continue
 
         for run in runs:
-            if not run.name.startswith("[v]"):
+            if not run.name.startswith("[compression]"):
                 continue
             safe_run_name = run.name.replace("/", "_")
             dir_name = os.path.join(save_dir, f"{entity}_{project}_{safe_run_name}")
@@ -186,7 +186,7 @@ def fetch_raw_logs_from_wandb(
             continue
 
         for run in runs:
-            if not run.name.startswith("[v]"):
+            if not run.name.startswith("[compression]"):
                 continue
             safe_run_name = run.name.replace("/", "_")
             dir_name = os.path.join(save_dir, f"{entity}_{project}_{safe_run_name}")
