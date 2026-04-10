@@ -19,19 +19,26 @@ import wandb
 # 설정
 ENTITY = "cyshin-korea-university"
 PROJECTS = [
-    "motivation_emnlp_4nodes_1345-0",
-    "motivation_emnlp_4nodes_1345-1",
-    "motivation_emnlp_4nodes_1345-2",
-    "motivation_emnlp_4nodes_1345-3",
+    # "motivation_emnlp_4nodes_1345-0",
+    # "motivation_emnlp_4nodes_1345-1",
+    # "motivation_emnlp_4nodes_1345-2",
+    # "motivation_emnlp_4nodes_1345-3",
     # "emnlp_finding_ema_alpha-0",
     # "emnlp_finding_ema_alpha-1",
     # "emnlp_finding_ema_alpha-2",
     # "emnlp_finding_ema_alpha-3",
+    "verda_neurips_4nodes-0",
+    "verda_neurips_4nodes-1",
+    "verda_neurips_4nodes-2",
+    "verda_neurips_4nodes-3",
     # 추가 프로젝트 예시:
     # "other_project_name",
 ]
 SYSTEM_METRICS_SAMPLES = 100_000  # raw data에 가깝게 (WandB 서버 상한 있을 수 있음)
 WANDB_LOGS_DIR = "wandb_logs"  # raw data·summary 상위 디렉터리
+
+# WandB run 이름 필터: 아래 접두사로 시작하는 run만 수집 (system / training / logs fetch 공통)
+RUN_NAME_PREFIX = "[compression]"
 
 # 요약용 컬럼명
 UTIL_COL = "gpu"
@@ -71,7 +78,7 @@ def fetch_raw_system_metrics_from_wandb(
             continue
 
         for run in runs:
-            if not run.name.startswith("[compression]"):
+            if not run.name.startswith(RUN_NAME_PREFIX):
                 continue
             safe_run_name = run.name.replace("/", "_")
             dir_name = os.path.join(save_dir, f"{entity}_{project}_{safe_run_name}")
@@ -139,7 +146,7 @@ def fetch_raw_training_metrics_from_wandb(
             continue
 
         for run in runs:
-            if not run.name.startswith("[compression]"):
+            if not run.name.startswith(RUN_NAME_PREFIX):
                 continue
             safe_run_name = run.name.replace("/", "_")
             dir_name = os.path.join(save_dir, f"{entity}_{project}_{safe_run_name}")
@@ -186,7 +193,7 @@ def fetch_raw_logs_from_wandb(
             continue
 
         for run in runs:
-            if not run.name.startswith("[compression]"):
+            if not run.name.startswith(RUN_NAME_PREFIX):
                 continue
             safe_run_name = run.name.replace("/", "_")
             dir_name = os.path.join(save_dir, f"{entity}_{project}_{safe_run_name}")
